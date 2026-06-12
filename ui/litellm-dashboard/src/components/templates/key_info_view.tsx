@@ -6,7 +6,7 @@ import { formatNumberWithCommas } from "@/utils/dataUtils";
 import { mapEmptyStringToNull } from "@/utils/keyUpdateUtils";
 import { ArrowLeftIcon } from "@heroicons/react/outline";
 import { Badge, Button, Card, Grid, Tab, TabGroup, TabList, TabPanel, TabPanels, Text, Title } from "@tremor/react";
-import { Form, Modal, Tag } from "antd";
+import { Form, Modal, Progress, Tag } from "antd";
 import { KeyInfoHeader } from "./KeyInfoHeader";
 import { useEffect, useState } from "react";
 import { isProxyAdminRole, isUserTeamAdminForSingleTeam, rolesWithWriteAccess } from "../../utils/roles";
@@ -377,6 +377,11 @@ export default function KeyInfoView({
     return `${dateStr} at ${timeStr}`;
   };
 
+  const getBudgetWindowPercent = (spend: number, maxBudget: number | null | undefined) => {
+    if (!maxBudget || maxBudget <= 0) return 0;
+    return Math.min(Math.floor((spend / maxBudget) * 100), 100);
+  };
+
   const canModifyKey =
     isProxyAdminRole(userRole || "") ||
     (teamsData &&
@@ -530,6 +535,41 @@ export default function KeyInfoView({
                   </Text>
                 </div>
               </Card>
+
+              {Array.isArray(currentKeyData.budget_limits) && currentKeyData.budget_limits.length > 0 && (
+                <Card>
+                  <Text>Budget Windows</Text>
+                  <div className="mt-3 space-y-4">
+                    {currentKeyData.budget_limits.map((window) => {
+                      const percent = getBudgetWindowPercent(currentKeyData.spend, window.max_budget);
+                      const hasMaxBudget = typeof window.max_budget === "number" && window.max_budget > 0;
+                      return (
+                        <div
+                          key={`${window.budget_duration}-${window.max_budget}-${window.reset_at ?? ""}`}
+                          data-testid="budget-window-row"
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <Text className="font-medium">{window.budget_duration}</Text>
+                            <Text>{percent}%</Text>
+                          </div>
+                          <Text>
+                            ${formatNumberWithCommas(currentKeyData.spend, 4)} of{" "}
+                            {hasMaxBudget ? `$${formatNumberWithCommas(window.max_budget, 2)}` : "Unlimited"}
+                          </Text>
+                          {(window.reset_in || window.reset_at) && (
+                            <Text className="text-xs text-gray-500">
+                              {window.reset_in
+                                ? `Resets in ${window.reset_in}`
+                                : `Resets at ${formatTimestamp(window.reset_at!)}`}
+                            </Text>
+                          )}
+                          <Progress percent={percent} showInfo={false} size="small" />
+                        </div>
+                      );
+                    })}
+                  </div>
+                </Card>
+              )}
 
               <Card>
                 <Text>Rate Limits</Text>

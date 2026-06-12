@@ -164,4 +164,96 @@ describe("KeyInfoView overview budget display (LIT-2845)", () => {
       expect(screen.getByText(/of Unlimited/)).toBeInTheDocument();
     });
   });
+
+  it("renders a Budget Windows card with per-window spend, percent, and reset countdown when budget_limits are present", async () => {
+    renderWithProviders(
+      <KeyInfoView
+        keyData={{
+          ...MOCK_KEY_DATA,
+          spend: 15,
+          budget_limits: [
+            {
+              budget_duration: "5h",
+              max_budget: 30,
+              reset_at: "2026-06-12T20:00:00+00:00",
+              reset_in_seconds: 191,
+              reset_in: "3m 11s",
+            },
+            {
+              budget_duration: "1w",
+              max_budget: 60,
+              reset_at: "2026-06-15T00:00:00+00:00",
+              reset_in_seconds: 200000,
+              reset_in: "2d 7h 33m 20s",
+            },
+            {
+              budget_duration: "1mo",
+              max_budget: 90,
+              reset_at: "2026-07-01T00:00:00+00:00",
+              reset_in_seconds: 1569791,
+              reset_in: "18d 4h 3m 11s",
+            },
+          ],
+        }}
+        onClose={() => {}}
+        keyId={"test-key-id"}
+        onKeyDataUpdate={() => {}}
+        teams={[]}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Budget Windows")).toBeInTheDocument();
+    });
+
+    expect(screen.getByText("5h")).toBeInTheDocument();
+    expect(screen.getByText("1w")).toBeInTheDocument();
+    expect(screen.getByText("1mo")).toBeInTheDocument();
+
+    expect(screen.getByText(/\$15\.0000 of \$30\.00/)).toBeInTheDocument();
+    expect(screen.getByText(/\$15\.0000 of \$60\.00/)).toBeInTheDocument();
+    expect(screen.getByText(/\$15\.0000 of \$90\.00/)).toBeInTheDocument();
+
+    expect(screen.getByText("50%")).toBeInTheDocument();
+    expect(screen.getByText("25%")).toBeInTheDocument();
+    expect(screen.getByText("16%")).toBeInTheDocument();
+
+    expect(screen.getByText("Resets in 3m 11s")).toBeInTheDocument();
+    expect(screen.getByText("Resets in 2d 7h 33m 20s")).toBeInTheDocument();
+    expect(screen.getByText("Resets in 18d 4h 3m 11s")).toBeInTheDocument();
+
+    expect(screen.getAllByTestId("budget-window-row")).toHaveLength(3);
+  });
+
+  it("does not render the Budget Windows card when budget_limits is undefined or empty", async () => {
+    const { rerender } = renderWithProviders(
+      <KeyInfoView
+        keyData={{ ...MOCK_KEY_DATA }}
+        onClose={() => {}}
+        keyId={"test-key-id"}
+        onKeyDataUpdate={() => {}}
+        teams={[]}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByText("Budget Windows")).not.toBeInTheDocument();
+    });
+    expect(screen.queryByTestId("budget-window-row")).not.toBeInTheDocument();
+
+    rerender(
+      <KeyInfoView
+        keyData={{ ...MOCK_KEY_DATA, budget_limits: [] }}
+        onClose={() => {}}
+        keyId={"test-key-id"}
+        onKeyDataUpdate={() => {}}
+        teams={[]}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByText("Budget Windows")).not.toBeInTheDocument();
+    });
+    expect(screen.queryByTestId("budget-window-row")).not.toBeInTheDocument();
+  });
 });
