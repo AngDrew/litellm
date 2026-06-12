@@ -1023,6 +1023,138 @@ async def test_key_info_returns_object_permission(monkeypatch):
     )
 
 
+def test_add_reset_timing_to_key_info_budget_limits():
+    from datetime import datetime, timezone
+
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _add_reset_timing_to_key_info,
+    )
+
+    now = datetime(2026, 6, 12, 12, 0, 0, tzinfo=timezone.utc)
+    reset_at = datetime(2026, 6, 12, 15, 25, 45, tzinfo=timezone.utc)
+    key_info = {
+        "budget_limits": [
+            {
+                "budget_duration": "5h",
+                "max_budget": 10.0,
+                "reset_at": reset_at.isoformat(),
+            }
+        ]
+    }
+
+    result = _add_reset_timing_to_key_info(key_info, now=now)
+
+    window = result["budget_limits"][0]
+    assert window["reset_in_seconds"] == 3 * 3600 + 25 * 60 + 45
+    assert window["reset_in"] == "3h 25m 45s"
+    assert window["reset_at"] == reset_at.isoformat()
+    assert window["budget_duration"] == "5h"
+    assert window["max_budget"] == 10.0
+
+
+def test_add_reset_timing_to_key_info_budget_limits_as_json_string():
+    from datetime import datetime, timezone
+
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _add_reset_timing_to_key_info,
+    )
+
+    now = datetime(2026, 6, 12, 12, 0, 0, tzinfo=timezone.utc)
+    reset_at = datetime(2026, 6, 12, 12, 1, 0, tzinfo=timezone.utc)
+    key_info = {
+        "budget_limits": json.dumps(
+            [
+                {
+                    "budget_duration": "5h",
+                    "max_budget": 10.0,
+                    "reset_at": reset_at.isoformat(),
+                }
+            ]
+        )
+    }
+
+    result = _add_reset_timing_to_key_info(key_info, now=now)
+
+    assert isinstance(result["budget_limits"], list)
+    window = result["budget_limits"][0]
+    assert window["reset_in_seconds"] == 60
+    assert window["reset_in"] == "1m 0s"
+
+
+def test_add_reset_timing_to_key_info_top_level_budget_reset_at():
+    from datetime import datetime, timezone
+
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _add_reset_timing_to_key_info,
+    )
+
+    now = datetime(2026, 6, 12, 0, 0, 0, tzinfo=timezone.utc)
+    reset_at = datetime(2026, 6, 26, 6, 56, 7, tzinfo=timezone.utc)
+    key_info = {
+        "budget_duration": "1mo",
+        "budget_reset_at": reset_at,
+    }
+
+    result = _add_reset_timing_to_key_info(key_info, now=now)
+
+    assert result["budget_reset_in_seconds"] == 14 * 86400 + 6 * 3600 + 56 * 60 + 7
+    assert result["budget_reset_in"] == "14d 6h 56m 7s"
+    assert result["budget_reset_at"] == reset_at
+
+
+def test_add_reset_timing_clamps_expired_reset_to_zero():
+    from datetime import datetime, timezone
+
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _add_reset_timing_to_key_info,
+    )
+
+    now = datetime(2026, 6, 12, 12, 0, 0, tzinfo=timezone.utc)
+    expired = datetime(2026, 6, 12, 11, 0, 0, tzinfo=timezone.utc)
+    key_info = {
+        "budget_limits": [
+            {
+                "budget_duration": "5h",
+                "max_budget": 10.0,
+                "reset_at": expired.isoformat(),
+            }
+        ],
+        "budget_reset_at": expired,
+    }
+
+    result = _add_reset_timing_to_key_info(key_info, now=now)
+
+    window = result["budget_limits"][0]
+    assert window["reset_in_seconds"] == 0
+    assert window["reset_in"] == "0s"
+    assert result["budget_reset_in_seconds"] == 0
+    assert result["budget_reset_in"] == "0s"
+
+
+def test_add_reset_timing_ignores_missing_or_invalid_reset_at():
+    from datetime import datetime, timezone
+
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _add_reset_timing_to_key_info,
+    )
+
+    now = datetime(2026, 6, 12, 12, 0, 0, tzinfo=timezone.utc)
+    key_info = {
+        "budget_limits": [
+            {"budget_duration": "5h", "max_budget": 10.0},
+            {"budget_duration": "1d", "max_budget": 5.0, "reset_at": "not-a-date"},
+        ]
+    }
+
+    result = _add_reset_timing_to_key_info(key_info, now=now)
+
+    for window in result["budget_limits"]:
+        assert "reset_in_seconds" not in window
+        assert "reset_in" not in window
+    assert "budget_reset_in_seconds" not in result
+    assert "budget_reset_in" not in result
+
+
 @pytest.mark.asyncio
 async def test_get_new_token_with_valid_key(monkeypatch):
     """Test get_new_token function when provided with a valid key that starts with 'sk-'"""

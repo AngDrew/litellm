@@ -3248,6 +3248,84 @@ async def info_key_fn_v2(
         raise handle_exception_on_proxy(e)
 
 
+def _parse_reset_at(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _format_reset_in(total_seconds: int) -> str:
+    if total_seconds <= 0:
+        return "0s"
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m {seconds}s"
+    if hours:
+        return f"{hours}h {minutes}m {seconds}s"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def _reset_timing_fields(reset_at: Any, now: datetime) -> Optional[Tuple[int, str]]:
+    parsed = _parse_reset_at(reset_at)
+    if parsed is None:
+        return None
+    remaining = int(max((parsed - now).total_seconds(), 0))
+    return remaining, _format_reset_in(remaining)
+
+
+def _add_reset_timing_to_key_info(
+    key_info: dict, now: Optional[datetime] = None
+) -> dict:
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    raw_limits = key_info.get("budget_limits")
+    windows: Optional[List[dict]] = None
+    if isinstance(raw_limits, str):
+        try:
+            parsed = json.loads(raw_limits)
+            if isinstance(parsed, list):
+                windows = parsed
+        except (ValueError, TypeError):
+            windows = None
+    elif isinstance(raw_limits, list):
+        windows = raw_limits
+
+    if windows is not None:
+        enriched = []
+        for window in windows:
+            if not isinstance(window, dict):
+                enriched.append(window)
+                continue
+            new_window = dict(window)
+            timing = _reset_timing_fields(new_window.get("reset_at"), now)
+            if timing is not None:
+                new_window["reset_in_seconds"], new_window["reset_in"] = timing
+            enriched.append(new_window)
+        key_info["budget_limits"] = enriched
+
+    top_timing = _reset_timing_fields(key_info.get("budget_reset_at"), now)
+    if top_timing is not None:
+        key_info["budget_reset_in_seconds"], key_info["budget_reset_in"] = top_timing
+
+    return key_info
+
+
 @router.get(
     "/key/info", tags=["key management"], dependencies=[Depends(user_api_key_auth)]
 )
@@ -3324,6 +3402,8 @@ async def info_key_fn(
             # if using pydantic v1
             key_info = key_info.dict()
         key_info.pop("token")
+
+        key_info = _add_reset_timing_to_key_info(key_info)
 
         # Attach object_permission if object_permission_id is set
         key_info = await attach_object_permission_to_dict(key_info, prisma_client)
