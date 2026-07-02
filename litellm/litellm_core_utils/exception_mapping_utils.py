@@ -306,6 +306,10 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                         + "Exception"
                     )
 
+                # Hide neuralwatt provider name from user-facing errors
+                if custom_llm_provider == "neuralwatt":
+                    exception_provider = "LiteLLMException"
+
                 if _api_base:
                     extra_information += f"\nAPI Base: `{_api_base}`"
                 if (
@@ -2425,6 +2429,53 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                 llm_provider=custom_llm_provider,
                 response=getattr(original_exception, "response", None),
             )
+        elif (
+            custom_llm_provider == "neuralwatt"
+            and hasattr(original_exception, "status_code")
+        ):
+            exception_mapping_worked = True
+            if original_exception.status_code == 400:
+                raise BadRequestError(
+                    message=f"{exception_provider} - {error_str}",
+                    llm_provider=custom_llm_provider,
+                    model=model,
+                    response=getattr(original_exception, "response", None),
+                    litellm_debug_info=extra_information,
+                    body=getattr(original_exception, "body", None),
+                )
+            elif original_exception.status_code == 401:
+                raise AuthenticationError(
+                    message=f"{exception_provider} AuthenticationError - {error_str}",
+                    llm_provider=custom_llm_provider,
+                    model=model,
+                    response=getattr(original_exception, "response", None),
+                    litellm_debug_info=extra_information,
+                )
+            elif original_exception.status_code == 429:
+                raise RateLimitError(
+                    message=f"{exception_provider} RateLimitError - {error_str}",
+                    model=model,
+                    llm_provider=custom_llm_provider,
+                    response=getattr(original_exception, "response", None),
+                    litellm_debug_info=extra_information,
+                )
+            elif original_exception.status_code == 500:
+                raise InternalServerError(
+                    message=f"{exception_provider} InternalServerError - {error_str}",
+                    model=model,
+                    llm_provider=custom_llm_provider,
+                    response=getattr(original_exception, "response", None),
+                    litellm_debug_info=extra_information,
+                )
+            else:
+                raise APIError(
+                    status_code=original_exception.status_code,
+                    message=f"APIError: {exception_provider} - {error_str}",
+                    llm_provider=custom_llm_provider,
+                    model=model,
+                    request=getattr(original_exception, "request", None),
+                    litellm_debug_info=extra_information,
+                )
         else:  # ensure generic errors always return APIConnectionError=
             """
             For unmapped exceptions - raise the exception with traceback - https://github.com/BerriAI/litellm/issues/4201

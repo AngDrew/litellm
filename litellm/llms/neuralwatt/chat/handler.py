@@ -101,11 +101,21 @@ class NeuralWattChatCompletion(CustomLLM):
             original_response=response_json,
             additional_args={"complete_input_dict": request_data},
         )
-        return _build_model_response(
+        returned_response = _build_model_response(
             response_json=response_json,
             markup_pct=markup_pct,
             litellm_model=model,
         )
+        _record_neuralwatt_response_cost(
+            logging_obj=logging_obj,
+            response_cost=returned_response._hidden_params["response_cost"],
+        )
+        _record_neuralwatt_spend_metadata(
+            logging_obj=logging_obj,
+            energy=response_json.get("energy"),
+            cost=response_json.get("cost"),
+        )
+        return returned_response
 
     async def acompletion(
         self,
@@ -178,11 +188,21 @@ class NeuralWattChatCompletion(CustomLLM):
             original_response=response_json,
             additional_args={"complete_input_dict": request_data},
         )
-        return _build_model_response(
+        returned_response = _build_model_response(
             response_json=response_json,
             markup_pct=markup_pct,
             litellm_model=model,
         )
+        _record_neuralwatt_response_cost(
+            logging_obj=logging_obj,
+            response_cost=returned_response._hidden_params["response_cost"],
+        )
+        _record_neuralwatt_spend_metadata(
+            logging_obj=logging_obj,
+            energy=response_json.get("energy"),
+            cost=response_json.get("cost"),
+        )
+        return returned_response
 
 
 def _get_upstream_model(model: str) -> str:
@@ -196,7 +216,7 @@ def _get_upstream_optional_params(optional_params: dict) -> dict:
 def _get_chat_completions_url(api_base: Optional[str]) -> str:
     if not api_base:
         raise CustomLLMError(
-            status_code=400, message="api_base is required for neuralwatt"
+            status_code=400, message="api_base is required for this model"
         )
     return api_base.rstrip("/") + "/chat/completions"
 
@@ -205,7 +225,7 @@ def _get_headers(api_key: Optional[str], headers: Optional[dict]) -> dict:
     dynamic_api_key = api_key or get_secret_str("NEURALWATT_API_KEY")
     if not dynamic_api_key:
         raise CustomLLMError(
-            status_code=401, message="api_key is required for neuralwatt"
+            status_code=401, message="api_key is required for this model"
         )
     request_headers = dict(headers or {})
     request_headers["Authorization"] = f"Bearer {dynamic_api_key}"
@@ -234,7 +254,7 @@ def _calculate_user_cost(upstream_cost: Any, markup_pct: Decimal) -> float:
     except (InvalidOperation, ValueError):
         raise CustomLLMError(
             status_code=502,
-            message="NeuralWatt response missing numeric cost.request_cost_usd",
+            message="Provider response missing numeric cost.request_cost_usd",
         )
     return float(base_cost * (Decimal("1") + (markup_pct / Decimal("100"))))
 
@@ -242,7 +262,7 @@ def _calculate_user_cost(upstream_cost: Any, markup_pct: Decimal) -> float:
 def _sanitize_cost(cost: Any, markup_pct: Decimal) -> Dict[str, Any]:
     if not isinstance(cost, dict) or cost.get("request_cost_usd") is None:
         raise CustomLLMError(
-            status_code=502, message="NeuralWatt response missing cost.request_cost_usd"
+            status_code=502, message="Provider response missing cost.request_cost_usd"
         )
     user_cost = _calculate_user_cost(cost.get("request_cost_usd"), markup_pct)
     return {
@@ -276,6 +296,37 @@ def _apply_neuralwatt_metadata(
     usage["cost_usd"] = sanitized_cost["request_cost_usd"]
     response_json["cost"] = sanitized_cost
     return sanitized_cost["request_cost_usd"]
+
+
+def _record_neuralwatt_spend_metadata(
+    *, logging_obj: Any, energy: Any, cost: Any
+) -> None:
+    if not isinstance(energy, dict) and not isinstance(cost, dict):
+        return
+    model_call_details = getattr(logging_obj, "model_call_details", None)
+    if not isinstance(model_call_details, dict):
+        return
+    litellm_params = model_call_details.setdefault("litellm_params", {})
+    if not isinstance(litellm_params, dict):
+        return
+    metadata = litellm_params.setdefault("metadata", {})
+    if not isinstance(metadata, dict):
+        return
+    spend_logs_metadata = metadata.setdefault("spend_logs_metadata", {})
+    if not isinstance(spend_logs_metadata, dict):
+        return
+    if isinstance(energy, dict):
+        spend_logs_metadata["neuralwatt_energy"] = energy
+    if isinstance(cost, dict):
+        spend_logs_metadata["neuralwatt_cost"] = cost
+
+
+def _record_neuralwatt_response_cost(
+    *, logging_obj: Any, response_cost: Optional[float]
+) -> None:
+    model_call_details = getattr(logging_obj, "model_call_details", None)
+    if isinstance(model_call_details, dict):
+        model_call_details["response_cost"] = response_cost
 
 
 def _build_model_response(
@@ -318,12 +369,15 @@ def _chunk_from_payload(payload: Dict[str, Any]) -> GenericStreamingChunk:
     usage = payload.get("usage")
     choice = payload.get("choices", [{}])[0] if payload.get("choices") else {}
     delta = choice.get("delta") or {}
+    tool_calls = delta.get("tool_calls")
     return {
         "text": delta.get("content") or "",
         "is_finished": choice.get("finish_reason") is not None,
         "finish_reason": choice.get("finish_reason"),
         "usage": usage,
-        "tool_use": None,
+        "tool_use": (
+            tool_calls[0] if isinstance(tool_calls, list) and tool_calls else None
+        ),
     }
 
 
@@ -387,7 +441,10 @@ def _sync_stream(
         upstream_cost = _parse_comment_payload(line, "cost")
         if upstream_cost is not None:
             cost = _sanitize_cost(upstream_cost, markup_pct)
-            logging_obj.model_call_details["response_cost"] = cost["request_cost_usd"]
+            _record_neuralwatt_response_cost(
+                logging_obj=logging_obj,
+                response_cost=cost["request_cost_usd"],
+            )
             if pending_usage_payload is not None:
                 pending_usage_payload["usage"]["cost_usd"] = cost["request_cost_usd"]
                 yield _chunk_from_payload(pending_usage_payload)
@@ -405,11 +462,16 @@ def _sync_stream(
         yield _chunk_from_payload(payload)
     if not cost:
         raise CustomLLMError(
-            status_code=502, message="NeuralWatt stream missing cost.request_cost_usd"
+            status_code=502, message="Provider stream missing cost.request_cost_usd"
         )
     if pending_usage_payload is not None:
         pending_usage_payload["usage"]["cost_usd"] = cost["request_cost_usd"]
         yield _chunk_from_payload(pending_usage_payload)
+    _record_neuralwatt_spend_metadata(
+        logging_obj=logging_obj,
+        energy=energy,
+        cost=cost,
+    )
     for chunk in _final_metadata_chunks(energy=energy, cost=cost):
         yield chunk
 
@@ -445,7 +507,10 @@ async def _async_stream(
         upstream_cost = _parse_comment_payload(line, "cost")
         if upstream_cost is not None:
             cost = _sanitize_cost(upstream_cost, markup_pct)
-            logging_obj.model_call_details["response_cost"] = cost["request_cost_usd"]
+            _record_neuralwatt_response_cost(
+                logging_obj=logging_obj,
+                response_cost=cost["request_cost_usd"],
+            )
             if pending_usage_payload is not None:
                 pending_usage_payload["usage"]["cost_usd"] = cost["request_cost_usd"]
                 yield _chunk_from_payload(pending_usage_payload)
@@ -463,10 +528,15 @@ async def _async_stream(
         yield _chunk_from_payload(payload)
     if not cost:
         raise CustomLLMError(
-            status_code=502, message="NeuralWatt stream missing cost.request_cost_usd"
+            status_code=502, message="Provider stream missing cost.request_cost_usd"
         )
     if pending_usage_payload is not None:
         pending_usage_payload["usage"]["cost_usd"] = cost["request_cost_usd"]
         yield _chunk_from_payload(pending_usage_payload)
+    _record_neuralwatt_spend_metadata(
+        logging_obj=logging_obj,
+        energy=energy,
+        cost=cost,
+    )
     for chunk in _final_metadata_chunks(energy=energy, cost=cost):
         yield chunk

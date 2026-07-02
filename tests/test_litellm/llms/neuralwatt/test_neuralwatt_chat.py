@@ -16,6 +16,7 @@ from litellm.llms.neuralwatt.chat.handler import (
     _get_chat_completions_url,
     _get_markup_pct,
     _get_upstream_model,
+    _record_neuralwatt_spend_metadata,
     _sanitize_cost,
 )
 from litellm.proxy.proxy_server import _serialize_streaming_chunk, async_data_generator
@@ -108,11 +109,39 @@ def test_neuralwatt_completion_maps_request_and_response_metadata():
         "markup_pct": 20.0,
     }
     assert response._hidden_params["response_cost"] == 0.012
+    assert logging.model_call_details["response_cost"] == 0.012
     assert response._hidden_params["additional_headers"] == {
         "X-Energy-Joules": "4.99",
         "X-Energy-Kwh": "1.385e-06",
         "X-Energy-Avg-Power-Watts": "55.3",
         "X-Energy-Duration-Seconds": "0.361",
+    }
+    assert logging.model_call_details["litellm_params"]["metadata"][
+        "spend_logs_metadata"
+    ] == {
+        "neuralwatt_energy": response.energy,
+        "neuralwatt_cost": response.cost,
+    }
+
+
+def test_neuralwatt_records_spend_metadata_without_overwriting_existing_values():
+    logging = MockLogging()
+    logging.model_call_details["litellm_params"] = {
+        "metadata": {"spend_logs_metadata": {"owner": "ops"}}
+    }
+
+    _record_neuralwatt_spend_metadata(
+        logging_obj=logging,
+        energy={"energy_joules": 2.13, "grid_id": "FI"},
+        cost={"request_cost_usd": 3.75e-06},
+    )
+
+    assert logging.model_call_details["litellm_params"]["metadata"][
+        "spend_logs_metadata"
+    ] == {
+        "owner": "ops",
+        "neuralwatt_energy": {"energy_joules": 2.13, "grid_id": "FI"},
+        "neuralwatt_cost": {"request_cost_usd": 3.75e-06},
     }
 
 
@@ -199,6 +228,31 @@ def test_neuralwatt_stream_usage_chunk_gets_cost():
     assert chunk["text"] == ""
 
 
+def test_neuralwatt_stream_preserves_tool_call_delta():
+    payload = {
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_123",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ]
+                },
+                "finish_reason": None,
+            }
+        ]
+    }
+
+    chunk = _chunk_from_payload(payload)
+
+    assert chunk["tool_use"] == payload["choices"][0]["delta"]["tool_calls"][0]
+
+
 def test_neuralwatt_stream_metadata_serializes_comments():
     energy = {"energy_joules": 4.99}
     cost = {"upstream_request_cost_usd": 0.01, "request_cost_usd": 0.012, "markup_pct": 20.0}
@@ -279,6 +333,7 @@ def test_neuralwatt_stream_no_double_sse_prefix():
         'data: {"id":"c3","object":"chat.completion.chunk","created":1,"model":"glm-5.2","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":9,"total_tokens":10}}',
     ]
 
+    logging = _NeuralWattSSELogging()
     stream = _async_stream(
         url="https://api.neuralwatt.test/v1/chat/completions",
         headers={},
@@ -286,13 +341,13 @@ def test_neuralwatt_stream_no_double_sse_prefix():
         timeout=None,
         client=_NeuralWattSSEClient(lines),
         markup_pct=Decimal("0"),
-        logging_obj=_NeuralWattSSELogging(),
+        logging_obj=logging,
     )
     wrapper = CustomStreamWrapper(
         completion_stream=stream,
         model="neuralwatt/glm-5.2",
         custom_llm_provider="neuralwatt",
-        logging_obj=_NeuralWattSSELogging(),
+        logging_obj=logging,
     )
 
     async def collect():
@@ -314,3 +369,14 @@ def test_neuralwatt_stream_no_double_sse_prefix():
     assert "data: event: neuralwatt" not in emitted_str
     assert "event: neuralwatt" not in emitted_str
     assert "data: : cost" not in emitted_str
+    assert wrapper.logging_obj.model_call_details["litellm_params"]["metadata"][
+        "spend_logs_metadata"
+    ] == {
+        "neuralwatt_energy": {"energy_joules": 4.99},
+        "neuralwatt_cost": {
+            "upstream_request_cost_usd": "0.01",
+            "request_cost_usd": 0.01,
+            "markup_pct": 0.0,
+        },
+    }
+    assert wrapper.logging_obj.model_call_details["response_cost"] == 0.01
