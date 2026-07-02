@@ -224,6 +224,19 @@ describe("chat_completion", () => {
     expect(callArgs.mock_testing_fallbacks).toBe(true);
   });
 
+  it("should ignore streamed chunks without choices", async () => {
+    async function* mockStream() {
+      yield { event: "neuralwatt", data: { energy: { energy_joules: 4.99 } } };
+      yield { choices: [{ delta: { content: "Hello" }, index: 0 }], model: "gpt-4" };
+    }
+
+    mockCreate.mockResolvedValue(mockStream());
+
+    await makeOpenAIChatCompletionRequest(mockChatHistory, mockUpdateUI, "gpt-4", "test-token");
+
+    expect(mockUpdateUI).toHaveBeenCalledWith("Hello", "gpt-4");
+  });
+
   it("should not include mock_testing_fallbacks in request body when mockTestFallbacks is false or undefined", async () => {
     await makeOpenAIChatCompletionRequest(
       mockChatHistory,

@@ -330,7 +330,6 @@ def _chunk_from_payload(payload: Dict[str, Any]) -> GenericStreamingChunk:
 def _final_metadata_chunks(
     energy: Dict[str, Any], cost: Dict[str, Any]
 ) -> List[GenericStreamingChunk]:
-    metadata = {"energy": energy, "cost": cost}
     return [
         {
             "text": "",
@@ -351,14 +350,6 @@ def _final_metadata_chunks(
             "provider_specific_fields": {
                 "neuralwatt_sse_comment": f": cost {json.dumps(cost)}"
             },
-        },
-        {
-            "text": "",
-            "is_finished": True,
-            "finish_reason": "stop",
-            "usage": None,
-            "tool_use": None,
-            "provider_specific_fields": {"neuralwatt_sse_event": metadata},
         },
     ]
 

@@ -199,21 +199,21 @@ def test_neuralwatt_stream_usage_chunk_gets_cost():
     assert chunk["text"] == ""
 
 
-def test_neuralwatt_stream_metadata_serializes_comments_and_event():
+def test_neuralwatt_stream_metadata_serializes_comments():
     energy = {"energy_joules": 4.99}
     cost = {"upstream_request_cost_usd": 0.01, "request_cost_usd": 0.012, "markup_pct": 20.0}
-    comments_and_event = _final_metadata_chunks(energy=energy, cost=cost)
+    comments = _final_metadata_chunks(energy=energy, cost=cost)
 
     serialized = []
-    for item in comments_and_event:
+    for item in comments:
         stream = ModelResponseStream()
         stream.choices = [StreamingChoices(delta=Delta(content=""))]
         stream.choices[0].delta.provider_specific_fields = item["provider_specific_fields"]
         serialized.append(_serialize_streaming_chunk(stream))
 
+    assert len(serialized) == 2
     assert serialized[0] == ': energy {"energy_joules": 4.99}\n\n'
     assert serialized[1].startswith(': cost {"upstream_request_cost_usd": 0.01')
-    assert serialized[2].startswith("event: neuralwatt\ndata: ")
 
 
 class _NeuralWattSSELogging:
@@ -266,9 +266,9 @@ class _NeuralWattSSEClient:
 
 def test_neuralwatt_stream_no_double_sse_prefix():
     """
-    NeuralWatt emits SSE comments and a custom event after the normal OpenAI
-    stream. Those lines must pass through the proxy unchanged; wrapping them
-    with an extra `data:` prefix makes OpenAI clients try to parse
+    NeuralWatt emits SSE comments after the normal OpenAI stream. Those lines
+    must pass through the proxy unchanged; wrapping them with an extra `data:`
+    prefix makes OpenAI clients try to parse
     `: energy {...}` as JSON and fail.
     """
     lines = [
@@ -310,7 +310,7 @@ def test_neuralwatt_stream_no_double_sse_prefix():
     )
 
     assert ": energy" in emitted_str
-    assert "event: neuralwatt" in emitted_str
     assert "data: : energy" not in emitted_str
     assert "data: event: neuralwatt" not in emitted_str
+    assert "event: neuralwatt" not in emitted_str
     assert "data: : cost" not in emitted_str

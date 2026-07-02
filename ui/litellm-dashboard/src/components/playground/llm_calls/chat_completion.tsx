@@ -137,14 +137,15 @@ export async function makeOpenAIChatCompletionRequest(
       console.log("Stream chunk:", chunk);
 
       // Process content and measure time to first token
-      const delta = chunk.choices[0]?.delta as any;
+      const choice = chunk.choices?.[0];
+      const delta = choice?.delta as any;
 
       // Debug what's in the delta
-      console.log("Delta content:", chunk.choices[0]?.delta?.content);
+      console.log("Delta content:", delta?.content);
       console.log("Delta reasoning content:", delta?.reasoning_content);
 
       // Measure time to first token for either content or reasoning_content
-      if (!firstTokenReceived && (chunk.choices[0]?.delta?.content || (delta && delta.reasoning_content))) {
+      if (!firstTokenReceived && (delta?.content || delta?.reasoning_content)) {
         firstTokenReceived = true;
         timeToFirstToken = Date.now() - startTime;
         console.log("First token received! Time:", timeToFirstToken, "ms");
@@ -157,8 +158,8 @@ export async function makeOpenAIChatCompletionRequest(
       }
 
       // Process content
-      if (chunk.choices[0]?.delta?.content) {
-        const content = chunk.choices[0].delta.content;
+      if (delta?.content) {
+        const content = delta.content;
         updateUI(content, chunk.model);
         fullResponseContent += content;
       }
