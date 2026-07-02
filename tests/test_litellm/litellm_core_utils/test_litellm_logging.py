@@ -2284,6 +2284,58 @@ async def test_async_success_handler_preserves_response_cost_for_pass_through_en
     assert slo["response_cost"] > 0
 
 
+@pytest.mark.asyncio
+async def test_async_streaming_success_handler_preserves_provider_response_cost():
+    """Provider-calculated stream cost must not be overwritten by price map calc."""
+    from datetime import datetime
+    from unittest.mock import patch
+
+    from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+    from litellm.types.utils import ModelResponse, Usage
+
+    logging_obj = LiteLLMLoggingObj(
+        model="neuralwatt/kimi-k2.7-code",
+        messages=[{"role": "user", "content": "test"}],
+        stream=True,
+        call_type="acompletion",
+        start_time=datetime.now(),
+        litellm_call_id="test-call-id-stream-cost",
+        function_id="test-function-id-stream-cost",
+    )
+    logging_obj.model_call_details = {
+        "litellm_params": {"metadata": {}, "proxy_server_request": {}},
+        "litellm_call_id": "test-call-id-stream-cost",
+        "response_cost": 0.012,
+        "custom_llm_provider": "neuralwatt",
+        "stream": True,
+    }
+    result = ModelResponse(
+        id="test-stream-response",
+        model="neuralwatt/kimi-k2.7-code",
+        usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+    )
+
+    with patch.object(
+        logging_obj, "get_combined_callback_list", return_value=[]
+    ), patch.object(
+        logging_obj,
+        "_response_cost_calculator",
+        side_effect=AssertionError("should not recalculate"),
+    ):
+        await logging_obj.async_success_handler(
+            result=result,
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+            cache_hit=False,
+        )
+
+    assert logging_obj.model_call_details["response_cost"] == 0.012
+    assert (
+        logging_obj.model_call_details["standard_logging_object"]["response_cost"]
+        == 0.012
+    )
+
+
 def test_process_hidden_params_recalculates_cost_after_failure_handler_zero():
     """
     Regression: PR #21844 preserved response_cost=0 set by failure_handler on failed

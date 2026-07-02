@@ -1987,7 +1987,8 @@ class Logging(LiteLLMLoggingBaseClass):
                     standard_logging_object
                 )
             else:
-                self.model_call_details["response_cost"] = None
+                if self.model_call_details.get("response_cost") is None:
+                    self.model_call_details["response_cost"] = None
 
             result = self._transform_usage_objects(result=result)
 
@@ -2663,7 +2664,7 @@ class Logging(LiteLLMLoggingBaseClass):
             try:
                 if self.model_call_details.get("cache_hit", False) is True:
                     self.model_call_details["response_cost"] = 0.0
-                else:
+                elif self.model_call_details.get("response_cost") is None:
                     # check if base_model set on azure
                     _get_base_model_from_metadata(
                         model_call_details=self.model_call_details

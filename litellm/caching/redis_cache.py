@@ -256,7 +256,8 @@ class RedisCache(BaseCache):
         """Setup async and sync health pings for Redis."""
         # ASYNC HEALTH PING
         try:
-            _ = asyncio.get_running_loop().create_task(self.ping())
+            task = asyncio.get_running_loop().create_task(self.ping())
+            task.add_done_callback(self._consume_background_ping_exception)
         except Exception as e:
             if "no running event loop" in str(e):
                 verbose_logger.debug(
@@ -278,6 +279,13 @@ class RedisCache(BaseCache):
                 "Error connecting to Sync Redis client", extra={"error": str(e)}
             )
             self._handle_sync_ping_error(e)
+
+    @staticmethod
+    def _consume_background_ping_exception(task: asyncio.Task) -> None:
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
 
     def _handle_async_ping_error(self, e: Exception):
         """Handle async ping error with service failure hook."""
