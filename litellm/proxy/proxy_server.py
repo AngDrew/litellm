@@ -6959,6 +6959,20 @@ def _fast_serialize_simple_model_response_stream(
 
 
 def _serialize_streaming_chunk(chunk: BaseModel) -> Union[str, bytes]:
+    provider_specific_fields = getattr(chunk, "provider_specific_fields", None)
+    if provider_specific_fields is None and isinstance(chunk, ModelResponseStream):
+        choices = getattr(chunk, "choices", None)
+        if isinstance(choices, list) and choices:
+            delta = getattr(choices[0], "delta", None)
+            provider_specific_fields = getattr(delta, "provider_specific_fields", None)
+    if isinstance(provider_specific_fields, dict):
+        neuralwatt_comment = provider_specific_fields.get("neuralwatt_sse_comment")
+        if neuralwatt_comment is not None:
+            return str(neuralwatt_comment) + "\n\n"
+        neuralwatt_event = provider_specific_fields.get("neuralwatt_sse_event")
+        if neuralwatt_event is not None:
+            return "event: neuralwatt\ndata: " + json.dumps(neuralwatt_event) + "\n\n"
+
     if isinstance(chunk, ModelResponseStream):
         serialized_chunk = _fast_serialize_simple_model_response_stream(chunk)
         if serialized_chunk is not None:
@@ -7057,6 +7071,9 @@ async def async_data_generator(  # noqa: PLR0915
                 if chunk.startswith(("data:", "event:", ":")):
                     yield chunk if chunk.endswith("\n\n") else chunk + "\n\n"
                     continue
+            elif isinstance(chunk, str) and chunk.startswith(("event:", ":")):
+                yield chunk if chunk.endswith("\n\n") else chunk + "\n\n"
+                continue
             elif isinstance(chunk, str) and chunk.startswith("data: "):
                 error_message = chunk
                 break

@@ -2140,9 +2140,10 @@ class Logging(LiteLLMLoggingBaseClass):
                 self.model_call_details["complete_streaming_response"] = (
                     complete_streaming_response
                 )
-                self.model_call_details["response_cost"] = (
-                    self._response_cost_calculator(result=complete_streaming_response)
-                )
+                if self.model_call_details.get("response_cost") is None:
+                    self.model_call_details["response_cost"] = (
+                        self._response_cost_calculator(result=complete_streaming_response)
+                    )
                 self._merge_hidden_params_from_response_into_metadata(
                     complete_streaming_response
                 )

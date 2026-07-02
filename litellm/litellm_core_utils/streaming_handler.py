@@ -1156,7 +1156,10 @@ class CustomStreamWrapper:
                 )  # check if chunk is a generic streaming chunk
             ) or (
                 self.custom_llm_provider
-                and self.custom_llm_provider in litellm._custom_providers
+                and (
+                    self.custom_llm_provider in litellm._custom_providers
+                    or self.custom_llm_provider == "neuralwatt"
+                )
             ):
                 if self.received_finish_reason is not None:
                     _chunk_has_content = isinstance(chunk, dict) and (

@@ -213,6 +213,7 @@ from .llms.heroku.chat.transformation import HerokuChatConfig
 from .llms.huggingface.embedding.handler import HuggingFaceEmbedding
 from .llms.lemonade.chat.transformation import LemonadeChatConfig
 from .llms.nlp_cloud.chat.handler import completion as nlp_cloud_chat_completion
+from .llms.neuralwatt.chat.handler import NeuralWattChatCompletion
 from .llms.oci.chat.transformation import OCIChatConfig
 from .llms.ollama.completion import handler as ollama
 from .llms.oobabooga.chat import oobabooga
@@ -283,6 +284,7 @@ openai_audio_transcriptions = OpenAIAudioTranscription()
 nvidia_riva_audio_transcriptions = NvidiaRivaAudioTranscription()
 openai_image_variations = OpenAIImageVariationsHandler()
 groq_chat_completions = GroqChatCompletion()
+neuralwatt_chat_completions = NeuralWattChatCompletion()
 sap_gen_ai_hub_chat_completions = GenAIHubOrchestration()
 sap_gen_ai_hub_emb = GenAIHubOrchestration()
 azure_ai_embedding = AzureAIEmbedding()
@@ -2352,6 +2354,25 @@ def completion(  # type: ignore # noqa: PLR0915
                 encoding=_get_encoding(),
                 api_key=api_key,
                 logging_obj=logging,  # model call logging done inside the class as we make need to modify I/O to fit aleph alpha's requirements
+                client=client,
+            )
+        elif custom_llm_provider == "neuralwatt":
+            api_key = api_key or get_secret("NEURALWATT_API_KEY")
+            response = neuralwatt_chat_completions.completion(
+                model=model,
+                messages=messages,
+                acompletion=acompletion,
+                api_base=api_base,
+                model_response=model_response,
+                optional_params=optional_params,
+                litellm_params=litellm_params,
+                custom_prompt_dict=custom_prompt_dict,
+                timeout=timeout,
+                headers=headers,
+                encoding=_get_encoding(),
+                api_key=api_key,
+                logging_obj=logging,
+                print_verbose=print_verbose,
                 client=client,
             )
         elif custom_llm_provider == "bedrock_mantle":
