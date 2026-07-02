@@ -1,3 +1,4 @@
+import asyncio
 from decimal import Decimal
 import json
 
@@ -8,6 +9,7 @@ from litellm.llms.custom_llm import CustomLLMError
 from litellm.llms.neuralwatt.chat.handler import (
     NeuralWattChatCompletion,
     _apply_neuralwatt_metadata,
+    _async_stream,
     _chunk_from_payload,
     _energy_headers,
     _final_metadata_chunks,
@@ -16,8 +18,10 @@ from litellm.llms.neuralwatt.chat.handler import (
     _get_upstream_model,
     _sanitize_cost,
 )
-from litellm.proxy.proxy_server import _serialize_streaming_chunk
+from litellm.proxy.proxy_server import _serialize_streaming_chunk, async_data_generator
+from litellm.proxy._types import UserAPIKeyAuth
 from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
+from litellm.utils import CustomStreamWrapper
 
 
 class MockLogging:
@@ -210,3 +214,103 @@ def test_neuralwatt_stream_metadata_serializes_comments_and_event():
     assert serialized[0] == ': energy {"energy_joules": 4.99}\n\n'
     assert serialized[1].startswith(': cost {"upstream_request_cost_usd": 0.01')
     assert serialized[2].startswith("event: neuralwatt\ndata: ")
+
+
+class _NeuralWattSSELogging:
+    def __init__(self):
+        self.model_call_details = {}
+        self._llm_caching_handler = None
+        self.completion_start_time = None
+
+    def pre_call(self, *args, **kwargs):
+        pass
+
+    def post_call(self, *args, **kwargs):
+        pass
+
+    def _update_completion_start_time(self, completion_start_time):
+        self.completion_start_time = completion_start_time
+
+    def failure_handler(self, *args, **kwargs):
+        pass
+
+    async def async_success_handler(self, *args, **kwargs):
+        pass
+
+
+class _NeuralWattSSEClient:
+    def __init__(self, lines):
+        self._lines = lines
+
+    async def post(self, **kwargs):
+        return self
+
+    @property
+    def status_code(self):
+        return 200
+
+    @property
+    def text(self):
+        return ""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+
+def test_neuralwatt_stream_no_double_sse_prefix():
+    """
+    NeuralWatt emits SSE comments and a custom event after the normal OpenAI
+    stream. Those lines must pass through the proxy unchanged; wrapping them
+    with an extra `data:` prefix makes OpenAI clients try to parse
+    `: energy {...}` as JSON and fail.
+    """
+    lines = [
+        'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"glm-5.2","choices":[{"index":0,"delta":{"content":"Hello!"}}]}',
+        'data: {"id":"c2","object":"chat.completion.chunk","created":1,"model":"glm-5.2","choices":[{"index":0,"delta":{"content":" How can I assist you today?"}}]}',
+        ': energy {"energy_joules": 4.99}',
+        ': cost {"request_cost_usd": "0.01"}',
+        'data: {"id":"c3","object":"chat.completion.chunk","created":1,"model":"glm-5.2","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":9,"total_tokens":10}}',
+    ]
+
+    stream = _async_stream(
+        url="https://api.neuralwatt.test/v1/chat/completions",
+        headers={},
+        request_data={"model": "glm-5.2", "stream": True},
+        timeout=None,
+        client=_NeuralWattSSEClient(lines),
+        markup_pct=Decimal("0"),
+        logging_obj=_NeuralWattSSELogging(),
+    )
+    wrapper = CustomStreamWrapper(
+        completion_stream=stream,
+        model="neuralwatt/glm-5.2",
+        custom_llm_provider="neuralwatt",
+        logging_obj=_NeuralWattSSELogging(),
+    )
+
+    async def collect():
+        out = []
+        async for line in async_data_generator(
+            wrapper, UserAPIKeyAuth(), {"litellm_call_id": "abc"}
+        ):
+            out.append(line)
+        return out
+
+    emitted = asyncio.run(collect())
+    emitted_str = "".join(
+        chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+        for chunk in emitted
+    )
+
+    assert ": energy" in emitted_str
+    assert "event: neuralwatt" in emitted_str
+    assert "data: : energy" not in emitted_str
+    assert "data: event: neuralwatt" not in emitted_str
+    assert "data: : cost" not in emitted_str

@@ -7062,6 +7062,15 @@ async def async_data_generator(  # noqa: PLR0915
 
             if isinstance(chunk, BaseModel):
                 chunk = _serialize_streaming_chunk(chunk)
+                # Providers such as NeuralWatt attach provider-specific fields that
+                # _serialize_streaming_chunk turns into already-formatted SSE lines
+                # (e.g. SSE comments or custom events). Pass those through unchanged
+                # instead of wrapping them with another "data:" prefix.
+                if isinstance(chunk, str) and chunk.startswith(
+                    ("data:", "event:", ":")
+                ):
+                    yield chunk if chunk.endswith("\n\n") else chunk + "\n\n"
+                    continue
             elif isinstance(chunk, bytes):
                 # Some upstream streaming iterators (e.g. AsyncGoogleGenAIGenerateContentStreamingIterator
                 # for /v1beta/.../streamGenerateContent) yield raw SSE bytes from Gemini.
