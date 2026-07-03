@@ -3,6 +3,14 @@ import re
 import traceback
 from typing import Any, Optional
 
+
+def _scrub_provider_name(text: Any) -> Any:
+    # ponytail: hide upstream provider name from any user-facing error text.
+    # Generic so future provider names are covered by the same hook.
+    if not isinstance(text, str):
+        return text
+    return re.sub(r"(?i)neuralwatt", "provider", text)
+
 import httpx
 
 import litellm
@@ -248,6 +256,10 @@ def exception_type(  # type: ignore  # noqa: PLR0915
         return original_exception
     exception_mapping_worked = False
     exception_provider = custom_llm_provider
+    _hide_provider = (
+        isinstance(custom_llm_provider, str)
+        and custom_llm_provider.lower() == "neuralwatt"
+    )
     if litellm.suppress_debug_info is False:
         print()  # noqa
         print(  # noqa
@@ -267,6 +279,9 @@ def exception_type(  # type: ignore  # noqa: PLR0915
             if _ENABLE_SECRET_REDACTION
             else str(original_exception)
         )
+        if _hide_provider:
+            # ponytail: scrub provider name from upstream exception text/urls
+            error_str = _scrub_provider_name(error_str)
         if model:
             if hasattr(original_exception, "message"):
                 error_str = (
@@ -274,6 +289,8 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                     if _ENABLE_SECRET_REDACTION
                     else str(original_exception.message)
                 )
+                if _hide_provider:
+                    error_str = _scrub_provider_name(error_str)
             if isinstance(original_exception, BaseException):
                 exception_type = type(original_exception).__name__
             else:
@@ -294,7 +311,12 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                 _metadata = extra_kwargs.get("metadata", {}) or {}
                 _model_group = _metadata.get("model_group")
                 _deployment = _metadata.get("deployment")
-                extra_information = f"\nModel: {model}"
+                if _hide_provider:
+                    # ponytail: hide provider name + base url from debug info
+                    _shown_model = _scrub_provider_name(model)
+                else:
+                    _shown_model = model
+                extra_information = f"\nModel: {_shown_model}"
 
                 if (
                     isinstance(custom_llm_provider, str)
@@ -306,9 +328,10 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                         + "Exception"
                     )
 
-                # Hide neuralwatt provider name from user-facing errors
-                if custom_llm_provider == "neuralwatt":
+                # Hide provider name from user-facing errors
+                if _hide_provider:
                     exception_provider = "LiteLLMException"
+                    _api_base = _scrub_provider_name(_api_base)
 
                 if _api_base:
                     extra_information += f"\nAPI Base: `{_api_base}`"
@@ -391,6 +414,8 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                         "openai.OpenAIError",
                         "{}.{}Error".format(custom_llm_provider, custom_llm_provider),
                     )
+                    if _hide_provider:
+                        message = _scrub_provider_name(message)
                 if custom_llm_provider == "openai":
                     exception_provider = "OpenAI" + "Exception"
                 else:
@@ -2491,8 +2516,12 @@ def exception_type(  # type: ignore  # noqa: PLR0915
             else:
                 raise APIConnectionError(
                     message="{}\n{}".format(
-                        str(original_exception),
-                        _redact_string(traceback.format_exc()),
+                        _scrub_provider_name(str(original_exception))
+                        if _hide_provider
+                        else str(original_exception),
+                        _scrub_provider_name(_redact_string(traceback.format_exc()))
+                        if _hide_provider
+                        else _redact_string(traceback.format_exc()),
                     ),
                     llm_provider=custom_llm_provider,
                     model=model,
@@ -2522,8 +2551,12 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                     raise e  # it's already mapped
             raised_exc = APIConnectionError(
                 message="{}\n{}".format(
-                    original_exception,
-                    _redact_string(traceback.format_exc()),
+                    _scrub_provider_name(str(original_exception))
+                    if _hide_provider
+                    else original_exception,
+                    _scrub_provider_name(_redact_string(traceback.format_exc()))
+                    if _hide_provider
+                    else _redact_string(traceback.format_exc()),
                 ),
                 llm_provider="",
                 model="",
