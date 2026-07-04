@@ -2484,6 +2484,14 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                     response=getattr(original_exception, "response", None),
                     litellm_debug_info=extra_information,
                 )
+            elif original_exception.status_code == 503:
+                raise ServiceUnavailableError(
+                    message=f"{exception_provider} ServiceUnavailableError - {error_str}",
+                    model=model,
+                    llm_provider=custom_llm_provider,
+                    response=getattr(original_exception, "response", None),
+                    litellm_debug_info=extra_information,
+                )
             elif original_exception.status_code == 500:
                 raise InternalServerError(
                     message=f"{exception_provider} InternalServerError - {error_str}",
