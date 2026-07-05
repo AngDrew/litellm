@@ -226,6 +226,60 @@ general_settings:
         accept: application/json
       forward_headers: True
 
+tokenin_plans:
+  - id: small
+    name: Small
+    kind: fixed
+    rpm_limit: 10
+    max_parallel_requests: 1
+    max_budget: 1.25
+    budget_duration: 7d
+    weekly_value: 1.25
+    monthly_value: 5
+  - id: medium
+    name: Medium
+    kind: fixed
+    rpm_limit: 20
+    max_parallel_requests: 1
+    max_budget: 2.5
+    budget_duration: 7d
+    weekly_value: 2.5
+    monthly_value: 10
+  - id: large
+    name: Large
+    kind: fixed
+    rpm_limit: 30
+    max_parallel_requests: 2
+    max_budget: 5
+    budget_duration: 7d
+    weekly_value: 5
+    monthly_value: 20
+  - id: xt_large
+    name: XT Large
+    kind: fixed
+    rpm_limit: 40
+    max_parallel_requests: 3
+    max_budget: 12.5
+    budget_duration: 7d
+    weekly_value: 12.5
+    monthly_value: 50
+  - id: super
+    name: Super
+    kind: fixed
+    rpm_limit: 20
+    max_parallel_requests: 5
+    max_budget: 25
+    budget_duration: 7d
+    weekly_value: 25
+    monthly_value: 100
+  - id: payg
+    name: Pay As You Go
+    kind: payg
+    rpm_limit: 20
+    max_parallel_requests: 1
+    max_budget: 0
+    budget_duration: null
+
 # environment_variables:
   # settings for using redis caching
   # REDIS_HOST: redis-16337.c322.us-east-1-2.ec2.cloud.redislabs.com
