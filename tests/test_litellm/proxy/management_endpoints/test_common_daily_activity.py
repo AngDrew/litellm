@@ -231,6 +231,130 @@ async def test_get_daily_activity_aggregated_with_endpoint_breakdown():
 
 
 @pytest.mark.asyncio
+async def test_get_daily_activity_aggregated_masks_providers_for_user_endpoint():
+    """Test mask_providers strips provider names from model keys and provider breakdown."""
+    mock_prisma = MagicMock()
+    mock_prisma.db = MagicMock()
+
+    base = {
+        "api_key": None,
+        "model_group": None,
+        "mcp_namespaced_tool_name": None,
+        "endpoint": None,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "failed_requests": 0,
+        "successful_requests": 0,
+    }
+    mock_rows = [
+        # (date, model) rollup rows for two provider-prefixed model names
+        {
+            **base,
+            "date": "2024-01-01",
+            "model": "openai/gpt-4o",
+            "custom_llm_provider": "openai",
+            "group_level": 47,
+            "spend": 10.0,
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "api_requests": 1,
+        },
+        {
+            **base,
+            "date": "2024-01-01",
+            "model": "azure/gpt-4o",
+            "custom_llm_provider": "azure",
+            "group_level": 47,
+            "spend": 5.0,
+            "prompt_tokens": 50,
+            "completion_tokens": 25,
+            "api_requests": 1,
+        },
+        # (date, custom_llm_provider) rollup rows
+        {
+            **base,
+            "date": "2024-01-01",
+            "model": None,
+            "custom_llm_provider": "openai",
+            "group_level": 59,
+            "spend": 10.0,
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "api_requests": 1,
+        },
+        {
+            **base,
+            "date": "2024-01-01",
+            "model": None,
+            "custom_llm_provider": "azure",
+            "group_level": 59,
+            "spend": 5.0,
+            "prompt_tokens": 50,
+            "completion_tokens": 25,
+            "api_requests": 1,
+        },
+        # (date) per-date totals
+        {
+            **base,
+            "date": "2024-01-01",
+            "model": None,
+            "custom_llm_provider": None,
+            "group_level": 63,
+            "spend": 15.0,
+            "prompt_tokens": 150,
+            "completion_tokens": 75,
+            "api_requests": 2,
+        },
+        # () grand total
+        {
+            **base,
+            "date": None,
+            "model": None,
+            "custom_llm_provider": None,
+            "group_level": 127,
+            "spend": 15.0,
+            "prompt_tokens": 150,
+            "completion_tokens": 75,
+            "api_requests": 2,
+        },
+    ]
+
+    mock_prisma.db.query_raw = AsyncMock(return_value=mock_rows)
+    mock_prisma.db.litellm_verificationtoken = MagicMock()
+    mock_prisma.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
+
+    result = await get_daily_activity_aggregated(
+        prisma_client=mock_prisma,
+        table_name="litellm_dailyuserspend",
+        entity_id_field="user_id",
+        entity_id=None,
+        entity_metadata_field=None,
+        start_date="2024-01-01",
+        end_date="2024-01-01",
+        model=None,
+        api_key=None,
+        mask_providers=True,
+    )
+
+    assert len(result.results) == 1
+    daily_data = result.results[0]
+    assert daily_data.date.strftime("%Y-%m-%d") == "2024-01-01"
+
+    # Provider names are removed
+    assert daily_data.breakdown.providers == {}
+
+    # Model keys have provider prefix stripped and metrics are merged
+    assert "openai/gpt-4o" not in daily_data.breakdown.models
+    assert "azure/gpt-4o" not in daily_data.breakdown.models
+    assert "gpt-4o" in daily_data.breakdown.models
+    gpt4o = daily_data.breakdown.models["gpt-4o"]
+    assert gpt4o.metrics.spend == 15.0
+    assert gpt4o.metrics.prompt_tokens == 150
+    assert gpt4o.metrics.completion_tokens == 75
+    assert gpt4o.metrics.api_requests == 2
+
+
+@pytest.mark.asyncio
 async def test_get_api_key_metadata_returns_active_key_metadata():
     """Test that get_api_key_metadata should return metadata for active keys."""
     mock_prisma = MagicMock()

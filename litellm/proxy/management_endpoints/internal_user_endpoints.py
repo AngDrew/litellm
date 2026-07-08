@@ -2779,6 +2779,7 @@ async def get_user_daily_activity_aggregated(
             model=model,
             api_key=api_key,
             timezone_offset_minutes=timezone,
+            mask_providers=True,
         )
 
     except HTTPException:

@@ -1889,6 +1889,7 @@ async def test_get_user_daily_activity_aggregated_admin_global_view(monkeypatch)
         model="gpt-4",
         api_key=None,
         timezone_offset_minutes=480,
+        mask_providers=True,
     )
 
 

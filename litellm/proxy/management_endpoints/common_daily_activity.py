@@ -961,6 +961,44 @@ async def get_daily_activity(
         )
 
 
+def _strip_provider_prefix_from_model(model: Optional[str]) -> Optional[str]:
+    if model and "/" in model:
+        return model.split("/")[-1]
+    return model
+
+
+def _mask_provider_in_breakdown(
+    breakdown: BreakdownMetrics,
+) -> BreakdownMetrics:
+    """Remove provider names from a DailySpendData breakdown.
+
+    Strips provider prefixes from model keys (e.g. "openai/gpt-4o" ->
+    "gpt-4o") and removes the provider breakdown entirely. Collides metrics
+    for model keys that become identical after stripping.
+    """
+    masked_models: Dict[str, MetricWithMetadata] = {}
+    for raw_model, metric_with_meta in breakdown.models.items():
+        stripped_model = _strip_provider_prefix_from_model(raw_model) or raw_model
+        existing = masked_models.get(stripped_model)
+        if existing is None:
+            masked_models[stripped_model] = metric_with_meta
+        else:
+            existing.metrics.spend += metric_with_meta.metrics.spend
+            existing.metrics.prompt_tokens += metric_with_meta.metrics.prompt_tokens
+            existing.metrics.completion_tokens += metric_with_meta.metrics.completion_tokens
+            existing.metrics.total_tokens += metric_with_meta.metrics.total_tokens
+            existing.metrics.cache_read_input_tokens += metric_with_meta.metrics.cache_read_input_tokens
+            existing.metrics.cache_creation_input_tokens += metric_with_meta.metrics.cache_creation_input_tokens
+            existing.metrics.api_requests += metric_with_meta.metrics.api_requests
+            existing.metrics.successful_requests += metric_with_meta.metrics.successful_requests
+            existing.metrics.failed_requests += metric_with_meta.metrics.failed_requests
+            existing.api_key_breakdown.update(metric_with_meta.api_key_breakdown)
+
+    breakdown.models = masked_models
+    breakdown.providers = {}
+    return breakdown
+
+
 async def get_daily_activity_aggregated(
     prisma_client: Optional[PrismaClient],
     table_name: str,
@@ -973,6 +1011,7 @@ async def get_daily_activity_aggregated(
     api_key: Optional[str],
     exclude_entity_ids: Optional[List[str]] = None,
     timezone_offset_minutes: Optional[int] = None,
+    mask_providers: bool = False,
 ) -> SpendAnalyticsPaginatedResponse:
     """Aggregated variant that returns the full result set (no pagination).
 
@@ -1020,6 +1059,10 @@ async def get_daily_activity_aggregated(
             prisma_client=prisma_client,
             records=records,
         )
+
+        if mask_providers:
+            for daily_spend_data in aggregated["results"]:
+                _mask_provider_in_breakdown(daily_spend_data.breakdown)
 
         return SpendAnalyticsPaginatedResponse(
             results=aggregated["results"],
