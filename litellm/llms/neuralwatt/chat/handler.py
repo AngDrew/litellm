@@ -221,9 +221,19 @@ def _get_upstream_request_data(upstream_model: str, messages: list, optional_par
     upstream_params["stream"] = True
     return {
         "model": upstream_model,
-        "messages": messages,
+        "messages": _translate_developer_role_to_system_role(messages),
         **upstream_params,
     }
+
+
+def _translate_developer_role_to_system_role(messages: list) -> list:
+    translated = []
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "developer":
+            translated.append({**m, "role": "system"})
+        else:
+            translated.append(m)
+    return translated
 
 
 def _get_chat_completions_url(api_base: Optional[str]) -> str:

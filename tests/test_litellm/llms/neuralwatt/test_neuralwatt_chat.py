@@ -187,7 +187,10 @@ def test_neuralwatt_validates_markup_pct():
 def test_neuralwatt_forces_stream_and_usage_without_clobbering_stream_options():
     request_data = _get_upstream_request_data(
         upstream_model="glm-5.2",
-        messages=[{"role": "user", "content": "hello"}],
+        messages=[
+            {"role": "developer", "content": "follow instructions"},
+            {"role": "user", "content": "hello"},
+        ],
         optional_params={
             "stream": False,
             "stream_options": {"include_usage": False, "foo": "bar"},
@@ -197,7 +200,10 @@ def test_neuralwatt_forces_stream_and_usage_without_clobbering_stream_options():
 
     assert request_data == {
         "model": "glm-5.2",
-        "messages": [{"role": "user", "content": "hello"}],
+        "messages": [
+            {"role": "system", "content": "follow instructions"},
+            {"role": "user", "content": "hello"},
+        ],
         "stream": True,
         "stream_options": {"include_usage": True, "foo": "bar"},
     }
