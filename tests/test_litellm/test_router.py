@@ -2141,6 +2141,34 @@ async def test_async_function_with_fallbacks_common_utils():
         )
 
 
+@pytest.mark.asyncio
+async def test_fallback_errors_do_not_expose_configured_models():
+    router = litellm.Router(model_list=[])
+    fallbacks = [{"private-primary": ["private-fallback-a", "private-fallback-b"]}]
+    error = litellm.BadRequestError(
+        message="provider rejected request",
+        model="public-model",
+        llm_provider="openai",
+    )
+
+    with pytest.raises(litellm.BadRequestError) as exc_info:
+        await router.async_function_with_fallbacks_common_utils(
+            e=error,
+            disable_fallbacks=False,
+            fallbacks=fallbacks,
+            context_window_fallbacks=None,
+            content_policy_fallbacks=None,
+            model_group="public-model",
+            args=(),
+            kwargs={"model": "public-model"},
+        )
+
+    error_message = str(exc_info.value)
+    assert "private-primary" not in error_message
+    assert "private-fallback-a" not in error_message
+    assert "private-fallback-b" not in error_message
+
+
 def test_should_include_deployment():
     """Test that Router.should_include_deployment returns the correct response"""
     router = litellm.Router(

@@ -6337,7 +6337,6 @@ class Router:
         original_exception = e
         fallback_model_group = None
         original_model_group: Optional[str] = kwargs.get("model")  # type: ignore
-        fallback_failure_exception_str = ""
 
         if disable_fallbacks is True or original_model_group is None:
             raise e
@@ -6495,8 +6494,6 @@ class Router:
                             error_message
                         )
                     )
-
-                    e.message += "\n{}".format(error_message)
             elif isinstance(e, litellm.ContentPolicyViolationError):
                 if content_policy_fallbacks is not None:
                     content_policy_fallback_model_group: Optional[List[str]] = (
@@ -6530,8 +6527,6 @@ class Router:
                             error_message
                         )
                     )
-
-                    e.message += "\n{}".format(error_message)
             if fallbacks is not None and model_group is not None:
                 verbose_router_logger.debug(f"inside model fallbacks: {fallbacks}")
                 (
@@ -6549,8 +6544,6 @@ class Router:
                     verbose_router_logger.info(
                         f"No fallback model group found for original model_group={model_group}. Fallbacks={fallbacks}"
                     )
-                    if hasattr(original_exception, "message"):
-                        original_exception.message += f"No fallback model group found for original model_group={model_group}. Fallbacks={fallbacks}"  # type: ignore
                     raise original_exception
 
                 input_kwargs.update(
@@ -6578,21 +6571,6 @@ class Router:
                     ),
                 )
             )
-            fallback_failure_exception_str = str(new_exception)
-
-        if hasattr(original_exception, "message"):
-            # add the available fallbacks to the exception
-            original_exception.message += ". Received Model Group={}\nAvailable Model Group Fallbacks={}".format(  # type: ignore
-                model_group,
-                fallback_model_group,
-            )
-            if len(fallback_failure_exception_str) > 0:
-                original_exception.message += (  # type: ignore
-                    "\nError doing the fallback: {}".format(
-                        fallback_failure_exception_str
-                    )
-                )
-
         raise original_exception
 
     @tracer.wrap()
