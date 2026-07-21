@@ -48,6 +48,16 @@ def initialize_callbacks_on_proxy(  # noqa: PLR0915
     )
     from litellm.proxy.proxy_server import prisma_client
 
+    configured_callback_params = litellm_settings.get("callback_specific_params", {})
+    if not isinstance(configured_callback_params, dict):
+        raise TypeError(
+            "litellm_settings.callback_specific_params must be a dictionary"
+        )
+    callback_specific_params = {
+        **configured_callback_params,
+        **callback_specific_params,
+    }
+
     verbose_proxy_logger.debug(
         f"{blue_color_code}initializing callbacks={value} on proxy{reset_color_code}"
     )
@@ -333,12 +343,23 @@ def initialize_callbacks_on_proxy(  # noqa: PLR0915
                 verbose_proxy_logger.debug(
                     f"{blue_color_code} attempting to import custom calback={callback} {reset_color_code}"
                 )
-                imported_list.append(
-                    get_instance_fn(
-                        value=callback,
-                        config_file_path=config_file_path,
-                    )
+                imported_callback = get_instance_fn(
+                    value=callback,
+                    config_file_path=config_file_path,
                 )
+                if isinstance(imported_callback, type) and issubclass(
+                    imported_callback, CustomLogger
+                ):
+                    params_key = getattr(
+                        imported_callback, "callback_specific_params_key", None
+                    )
+                    params = callback_specific_params.get(params_key, {})
+                    if not isinstance(params, dict):
+                        raise TypeError(
+                            f"callback_specific_params.{params_key} must be a dictionary"
+                        )
+                    imported_callback = imported_callback(**params)
+                imported_list.append(imported_callback)
         if isinstance(litellm.callbacks, list):
             litellm.callbacks.extend(imported_list)
         else:

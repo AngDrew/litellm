@@ -155,6 +155,11 @@ litellm_settings:
   success_callback: ["prometheus"]
   callbacks:
     - callbacks.tiered_pricing.TieredPricingCallback
+    - "litellm.proxy.hooks.tokenin.concurrency_queue.TokeninConcurrencyQueue"
+  callback_specific_params:
+    tokenin_concurrency_queue:
+      max_wait_seconds: 300
+      enabled: true
   # max_budget: 100 
   # budget_duration: 30d
   num_retries: 5
