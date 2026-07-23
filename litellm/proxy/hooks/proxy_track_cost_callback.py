@@ -214,8 +214,10 @@ class _ProxyDBLogger(CustomLogger):
             response_cost = (
                 sl_object.get("response_cost", None)
                 if sl_object is not None
-                else kwargs.get("response_cost", None)
+                else None
             )
+            if response_cost is None:
+                response_cost = kwargs.get("response_cost", None)
             tags = _get_request_tags_for_cost_tracking(
                 sl_object=sl_object,
                 metadata=metadata,

@@ -165,12 +165,22 @@ def get_spend_logs_id(
 ) -> Optional[str]:
     if call_type == "aretrieve_batch" or call_type == "acreate_file":
         # Generate a hash from the response object
-        id: Optional[str] = generate_hash_from_response(response_obj)
-    else:
-        id = cast(Optional[str], response_obj.get("id")) or cast(
-            Optional[str], kwargs.get("litellm_call_id")
+        return generate_hash_from_response(response_obj)
+
+    provider_request_id = cast(Optional[str], response_obj.get("id"))
+    litellm_call_id = cast(Optional[str], kwargs.get("litellm_call_id"))
+    if litellm_call_id is None:
+        litellm_call_id = cast(
+            Optional[str], (kwargs.get("litellm_params") or {}).get("litellm_call_id")
         )
-    return id
+
+    # SpendLogs.request_id is a primary key. Some OpenAI-compatible servers
+    # return a static response id, so provider_request_id alone drops later
+    # successful requests through create_many(skip_duplicates=True). Include
+    # LiteLLM's per-request ID while retaining the upstream ID for correlation.
+    if provider_request_id is not None and litellm_call_id is not None:
+        return f"{litellm_call_id}_{provider_request_id}"
+    return provider_request_id or litellm_call_id
 
 
 def _extract_usage_for_ocr_call(response_obj: Any, response_obj_dict: dict) -> dict:

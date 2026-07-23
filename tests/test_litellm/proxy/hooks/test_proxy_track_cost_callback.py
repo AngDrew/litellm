@@ -563,6 +563,37 @@ async def test_update_database_and_spend_counters_preserves_counter_exception_wh
 
 
 @pytest.mark.asyncio
+async def test_track_cost_callback_uses_kwargs_cost_when_standard_payload_cost_is_none():
+    """Persist cost calculated after the standard logging payload was built."""
+    logger = _ProxyDBLogger()
+    kwargs = {
+        "model": "openai/test-model",
+        "call_type": "acompletion",
+        "litellm_params": {"metadata": {"user_api_key": "test-api-key"}},
+        "standard_logging_object": {
+            "response_cost": None,
+            "response_cost_failure_debug_info": "stale payload",
+        },
+        "response_cost": 0.25,
+        "stream": False,
+    }
+
+    with patch(
+        "litellm.proxy.hooks.proxy_track_cost_callback._update_database_and_spend_counters",
+        new_callable=AsyncMock,
+    ) as mock_update:
+        await logger._PROXY_track_cost_callback(
+            kwargs=kwargs,
+            completion_response=None,
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+        )
+
+    mock_update.assert_awaited_once()
+    assert mock_update.await_args.kwargs["response_cost"] == 0.25
+
+
+@pytest.mark.asyncio
 async def test_track_cost_callback_skips_when_no_standard_logging_object():
     """
     Reproduces the bug where _PROXY_track_cost_callback raises

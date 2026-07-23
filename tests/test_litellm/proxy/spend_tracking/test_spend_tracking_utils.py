@@ -35,6 +35,7 @@ from litellm.proxy.spend_tracking.spend_tracking_utils import (
     _sanitize_request_body_for_spend_logs_payload,
     _should_store_prompts_and_responses_in_spend_logs,
     get_logging_payload,
+    get_spend_logs_id,
 )
 from litellm.types.utils import (
     StandardLoggingHiddenParams,
@@ -42,6 +43,23 @@ from litellm.types.utils import (
     StandardLoggingModelInformation,
     StandardLoggingPayload,
 )
+
+
+def test_get_spend_logs_id_is_unique_when_provider_reuses_response_id():
+    """Use LiteLLM's per-request ID when an OpenAI-compatible server reuses IDs."""
+    first_request_id = get_spend_logs_id(
+        call_type="acompletion",
+        response_obj={"id": "static-provider-response-id"},
+        kwargs={"litellm_call_id": "first-litellm-call-id"},
+    )
+    second_request_id = get_spend_logs_id(
+        call_type="acompletion",
+        response_obj={"id": "static-provider-response-id"},
+        kwargs={"litellm_call_id": "second-litellm-call-id"},
+    )
+
+    assert first_request_id == "first-litellm-call-id_static-provider-response-id"
+    assert second_request_id != first_request_id
 
 
 def test_sanitize_request_body_for_spend_logs_payload_basic():
