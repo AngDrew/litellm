@@ -1,5 +1,4 @@
 import asyncio
-import sys
 import time
 import weakref
 from typing import Any, Dict, Optional, Protocol, Tuple
@@ -30,6 +29,7 @@ class TokeninConcurrencyQueue(CustomLogger):
     callback_specific_params_key = "tokenin_concurrency_queue"
     _semaphores: weakref.WeakValueDictionary[str, asyncio.Semaphore] = weakref.WeakValueDictionary()
     _semaphore_lock = asyncio.Lock()
+    _active_slots: Dict[str, Tuple[str, asyncio.Semaphore]] = {}
 
     def __init__(
         self,
@@ -42,7 +42,6 @@ class TokeninConcurrencyQueue(CustomLogger):
         self.max_wait_seconds = max_wait_seconds
         self.enabled = enabled
         self._time_provider = time_provider or time
-        self._active_slots: Dict[str, Tuple[str, asyncio.Semaphore]] = {}
 
     async def async_pre_call_hook(
         self,
@@ -89,7 +88,6 @@ class TokeninConcurrencyQueue(CustomLogger):
 
         try:
             self._record_slot(data=data, api_key=api_key, semaphore=semaphore)
-            user_api_key_dict.max_parallel_requests = sys.maxsize
         except Exception:
             semaphore.release()
             raise
@@ -155,7 +153,7 @@ class TokeninConcurrencyQueue(CustomLogger):
             data["metadata"] = metadata
 
         slot_id = uuid4().hex
-        self._active_slots[slot_id] = (api_key, semaphore)
+        type(self)._active_slots[slot_id] = (api_key, semaphore)
         metadata[_SLOT_METADATA_KEY] = slot_id
 
     def _release_slot(self, event_data: dict) -> None:
@@ -167,7 +165,7 @@ class TokeninConcurrencyQueue(CustomLogger):
         if not isinstance(slot_id, str):
             return
 
-        active_slot = self._active_slots.pop(slot_id, None)
+        active_slot = type(self)._active_slots.pop(slot_id, None)
         if active_slot is None:
             verbose_proxy_logger.debug("TokeninConcurrencyQueue: semaphore slot already released")
             return
@@ -175,6 +173,14 @@ class TokeninConcurrencyQueue(CustomLogger):
         api_key, semaphore = active_slot
         semaphore.release()
         verbose_proxy_logger.debug("TokeninConcurrencyQueue: semaphore released key=%s", api_key[:8])
+
+    @classmethod
+    def request_has_active_slot(cls, data: dict) -> bool:
+        metadata = data.get("metadata")
+        if not isinstance(metadata, dict):
+            return False
+        slot_id = metadata.get(_SLOT_METADATA_KEY)
+        return isinstance(slot_id, str) and slot_id in cls._active_slots
 
     @staticmethod
     def _metadata_from_event(event_data: dict) -> Optional[dict]:

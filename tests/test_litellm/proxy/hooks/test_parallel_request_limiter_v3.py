@@ -17,10 +17,44 @@ from litellm import Router
 from litellm.caching.caching import DualCache
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
+    TOKENIN_QUEUE_OWNS_MPR_KEY,
     _PROXY_MaxParallelRequestsHandler_v3 as _PROXY_MaxParallelRequestsHandler,
 )
+from litellm.proxy.hooks.tokenin.concurrency_queue import TokeninConcurrencyQueue
 from litellm.proxy.utils import InternalUsageCache, ProxyLogging, hash_token
 from litellm.types.utils import ModelResponse, Usage
+
+
+@pytest.mark.asyncio
+async def test_tokenin_queue_owns_mpr_without_mutating_cached_auth() -> None:
+    api_key = hash_token("sk-tokenin-queue")
+    user = UserAPIKeyAuth(api_key=api_key, max_parallel_requests=1)
+    queue = TokeninConcurrencyQueue()
+    data: Dict[str, Any] = {}
+    await queue.async_pre_call_hook(user, None, data, "acompletion")
+
+    cache = DualCache()
+    limiter = _PROXY_MaxParallelRequestsHandler(InternalUsageCache(cache))
+    await limiter.async_pre_call_hook(user, cache, data, "acompletion")
+
+    assert user.max_parallel_requests == 1
+    assert data["metadata"][TOKENIN_QUEUE_OWNS_MPR_KEY] is True
+    mpr_key = limiter.create_rate_limit_keys(
+        key="api_key", value=api_key, rate_limit_type="max_parallel_requests"
+    )
+    assert await cache.async_get_cache(mpr_key) is None
+    operations = limiter._build_success_event_pipeline_operations(
+        kwargs={
+            "standard_logging_object": {"metadata": {"user_api_key_hash": api_key}},
+            "litellm_params": {"metadata": data["metadata"]},
+        },
+        response_obj=None,
+        rate_limit_type="total",
+    )
+    assert all(operation.key != mpr_key for operation in operations)
+    await queue.async_log_success_event(
+        {"litellm_params": {"metadata": data["metadata"]}}, None, None, None
+    )
 
 
 class TimeController:

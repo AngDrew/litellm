@@ -472,6 +472,7 @@ class Router:
         self.cache = DualCache(
             redis_cache=redis_cache, in_memory_cache=InMemoryCache()
         )  # use a dual cache (Redis+In-Memory) for tracking cooldowns, usage, etc.
+        self._deployment_capacity_changed = asyncio.Event()
 
         ### SCHEDULER ###
         self.scheduler = Scheduler(
@@ -2119,6 +2120,7 @@ class Router:
         model_response: CustomStreamWrapper,
         messages: List[Dict[str, str]],
         initial_kwargs: dict,
+        on_close: Optional[Callable[[], None]] = None,
     ) -> CustomStreamWrapper:
         """
         Helper to iterate over a streaming response.
@@ -2255,6 +2257,8 @@ class Router:
                                 "stream_with_fallbacks: error closing fallback_response: %s",
                                 e,
                             )
+                if on_close is not None:
+                    on_close()
 
         return FallbackStreamWrapper(stream_with_fallbacks())
 
@@ -2442,6 +2446,7 @@ class Router:
         self,
         response: "BaseResponsesAPIStreamingIterator",
         initial_kwargs: Dict[str, Any],
+        on_close: Optional[Callable[[], None]] = None,
     ) -> "BaseResponsesAPIStreamingIterator":
         """
         Wrap a Responses-API streaming iterator so MidStreamFallbackError
@@ -2637,6 +2642,15 @@ class Router:
                                 "stream_with_fallbacks(aresponses): error closing fallback: %s",
                                 exc,
                             )
+                        fallback_release = getattr(
+                            fallback_response,
+                            "_litellm_router_deployment_slot_release",
+                            None,
+                        )
+                        if fallback_release is not None:
+                            fallback_release()
+                if on_close is not None:
+                    on_close()
 
         return FallbackResponsesStreamWrapper(stream_with_fallbacks())
 
@@ -2892,66 +2906,59 @@ class Router:
             logging_obj: Optional[LiteLLMLogging] = kwargs.get(
                 "litellm_logging_obj", None
             )
-
             rpm_semaphore = self._get_client(
                 deployment=deployment,
                 kwargs=kwargs,
                 client_type="max_parallel_requests",
             )
-            if rpm_semaphore is not None and isinstance(
-                rpm_semaphore, asyncio.Semaphore
-            ):
-                async with rpm_semaphore:
-                    """
-                    - Check rpm limits before making the call
-                    - If allowed, increment the rpm limit (allows global value to be updated, concurrency-safe)
-                    """
-                    await self.async_routing_strategy_pre_call_checks(
-                        deployment=deployment,
-                        logging_obj=logging_obj,
-                        parent_otel_span=parent_otel_span,
-                    )
-                    response = await _response
-            else:
+            holds_deployment_slot = isinstance(rpm_semaphore, asyncio.Semaphore)
+            release_deployment_slot = holds_deployment_slot
+
+            if holds_deployment_slot:
+                await rpm_semaphore.acquire()
+            try:
                 await self.async_routing_strategy_pre_call_checks(
                     deployment=deployment,
                     logging_obj=logging_obj,
                     parent_otel_span=parent_otel_span,
                 )
-
                 response = await _response
 
-            ## CHECK CONTENT FILTER ERROR ##
-            if isinstance(response, ModelResponse):
-                _should_raise = self._should_raise_content_policy_error(
-                    model=model, response=response, kwargs=kwargs
+                ## CHECK CONTENT FILTER ERROR ##
+                if isinstance(response, ModelResponse):
+                    _should_raise = self._should_raise_content_policy_error(
+                        model=model, response=response, kwargs=kwargs
+                    )
+                    if _should_raise:
+                        raise litellm.ContentPolicyViolationError(
+                            message="Response output was blocked.",
+                            model=model,
+                            llm_provider="",
+                        )
+
+                self.success_calls[model_name] += 1
+                verbose_router_logger.info(
+                    f"litellm.acompletion(model={model_name})\033[32m 200 OK\033[0m"
                 )
-                if _should_raise:
-                    raise litellm.ContentPolicyViolationError(
-                        message="Response output was blocked.",
-                        model=model,
-                        llm_provider="",
+                self._track_deployment_metrics(
+                    deployment=deployment,
+                    response=response,
+                    parent_otel_span=parent_otel_span,
+                )
+
+                if isinstance(response, CustomStreamWrapper):
+                    release_deployment_slot = False
+                    return await self._acompletion_streaming_iterator(
+                        model_response=response,
+                        messages=messages,
+                        initial_kwargs=input_kwargs_for_streaming_fallback,
+                        on_close=rpm_semaphore.release if holds_deployment_slot else None,
                     )
 
-            self.success_calls[model_name] += 1
-            verbose_router_logger.info(
-                f"litellm.acompletion(model={model_name})\033[32m 200 OK\033[0m"
-            )
-            # debug how often this deployment picked
-            self._track_deployment_metrics(
-                deployment=deployment,
-                response=response,
-                parent_otel_span=parent_otel_span,
-            )
-
-            if isinstance(response, CustomStreamWrapper):
-                return await self._acompletion_streaming_iterator(
-                    model_response=response,
-                    messages=messages,
-                    initial_kwargs=input_kwargs_for_streaming_fallback,
-                )
-
-            return response
+                return response
+            finally:
+                if holds_deployment_slot and release_deployment_slot:
+                    rpm_semaphore.release()
         except litellm.Timeout as e:
             deployment_request_timeout_param = _timeout_debug_deployment_dict.get(
                 "litellm_params", {}
@@ -4653,31 +4660,39 @@ class Router:
                 kwargs=kwargs,
                 client_type="max_parallel_requests",
             )
+            holds_deployment_slot = isinstance(rpm_semaphore, asyncio.Semaphore)
+            release_deployment_slot = holds_deployment_slot
 
-            if rpm_semaphore is not None and isinstance(
-                rpm_semaphore, asyncio.Semaphore
-            ):
-                async with rpm_semaphore:
-                    """
-                    - Check rpm limits before making the call
-                    - If allowed, increment the rpm limit (allows global value to be updated, concurrency-safe)
-                    """
-                    await self.async_routing_strategy_pre_call_checks(
-                        deployment=deployment, parent_otel_span=parent_otel_span
-                    )
-                    response = await response  # type: ignore
-            else:
+            if holds_deployment_slot:
+                await rpm_semaphore.acquire()
+            try:
                 await self.async_routing_strategy_pre_call_checks(
                     deployment=deployment, parent_otel_span=parent_otel_span
                 )
                 response = await response  # type: ignore
 
-            self.success_calls[model_name] += 1
-            verbose_router_logger.info(
-                f"ageneric_api_call_with_fallbacks(model={model_name})\033[32m 200 OK\033[0m"
-            )
+                self.success_calls[model_name] += 1
+                verbose_router_logger.info(
+                    f"ageneric_api_call_with_fallbacks(model={model_name})\033[32m 200 OK\033[0m"
+                )
 
-            return response
+                from litellm.responses.streaming_iterator import (
+                    BaseResponsesAPIStreamingIterator,
+                )
+
+                if holds_deployment_slot and isinstance(
+                    response, BaseResponsesAPIStreamingIterator
+                ):
+                    release_deployment_slot = False
+                    setattr(
+                        response,
+                        "_litellm_router_deployment_slot_release",
+                        rpm_semaphore.release,
+                    )
+                return response
+            finally:
+                if holds_deployment_slot and release_deployment_slot:
+                    rpm_semaphore.release()
         except Exception as e:
             verbose_router_logger.info(
                 f"ageneric_api_call_with_fallbacks(model={model})\033[31m Exception {str(e)}\033[0m"
@@ -4735,10 +4750,19 @@ class Router:
         if kwargs.get("stream") and isinstance(
             response, BaseResponsesAPIStreamingIterator
         ):
-            return await self._aresponses_streaming_iterator(
-                response=response,
-                initial_kwargs=fallback_kwargs,
+            release_deployment_slot = getattr(
+                response, "_litellm_router_deployment_slot_release", None
             )
+            try:
+                return await self._aresponses_streaming_iterator(
+                    response=response,
+                    initial_kwargs=fallback_kwargs,
+                    on_close=release_deployment_slot,
+                )
+            except Exception:
+                if release_deployment_slot is not None:
+                    release_deployment_slot()
+                raise
         return response
 
     def _generic_api_call_with_fallbacks(
@@ -10892,6 +10916,40 @@ class Router:
 
         return healthy_deployments
 
+    async def _select_available_simple_shuffle_deployment(
+        self,
+        healthy_deployments: List[Dict],
+        model: str,
+        request_kwargs: Dict,
+    ) -> Dict:
+        """Weighted-select a deployment with free MPR capacity.
+
+        Selection and the following ``async with`` acquisition run without an
+        intervening await, so a free semaphore cannot be claimed by another
+        task between this check and acquisition. If every capped deployment is
+        full, wait for any release, then rebuild candidates and weights.
+        """
+        while True:
+            self._deployment_capacity_changed.clear()
+            available_deployments = []
+            for deployment in healthy_deployments:
+                semaphore = self._get_client(
+                    deployment=deployment,
+                    kwargs=request_kwargs,
+                    client_type="max_parallel_requests",
+                )
+                if semaphore is None or not semaphore.locked():
+                    available_deployments.append(deployment)
+
+            if available_deployments:
+                return simple_shuffle(
+                    llm_router_instance=self,
+                    healthy_deployments=available_deployments,
+                    model=model,
+                )
+
+            await self._deployment_capacity_changed.wait()
+
     async def async_get_available_deployment(
         self,
         model: str,
@@ -10963,10 +11021,10 @@ class Router:
 
             start_time = time.time()
             if strategy == "simple-shuffle":
-                return simple_shuffle(
-                    llm_router_instance=self,
+                return await self._select_available_simple_shuffle_deployment(
                     healthy_deployments=healthy_deployments,
                     model=model,
+                    request_kwargs=request_kwargs,
                 )
             deployment = await self._select_deployment_async(
                 strategy=strategy,

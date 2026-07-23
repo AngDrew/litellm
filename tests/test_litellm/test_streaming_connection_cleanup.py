@@ -236,6 +236,56 @@ async def test_stream_with_fallbacks_closes_stream_on_generator_close():
 
 
 @pytest.mark.asyncio
+async def test_stream_with_fallbacks_releases_deployment_slot_on_error():
+    from litellm.router import Router
+
+    released = 0
+
+    class FailingStream(CustomStreamWrapper):
+        def __init__(self):
+            super().__init__(
+                completion_stream=None,
+                model="test-model",
+                logging_obj=MagicMock(),
+                custom_llm_provider="openai",
+            )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise RuntimeError("stream failed")
+
+        async def aclose(self):
+            return None
+
+    router = Router(
+        model_list=[
+            {
+                "model_name": "test-model",
+                "litellm_params": {"model": "openai/test", "api_key": "fake"},
+            }
+        ]
+    )
+
+    def release_slot() -> None:
+        nonlocal released
+        released += 1
+
+    result = await router._acompletion_streaming_iterator(
+        model_response=FailingStream(),
+        messages=[{"role": "user", "content": "hi"}],
+        initial_kwargs={"model": "test-model"},
+        on_close=release_slot,
+    )
+    with pytest.raises(RuntimeError, match="stream failed"):
+        async for _ in result:
+            pass
+
+    assert released == 1
+
+
+@pytest.mark.asyncio
 async def test_stream_with_fallbacks_closes_stream_on_normal_completion():
     """stream_with_fallbacks must aclose() model_response even on normal completion."""
     from litellm.router import Router

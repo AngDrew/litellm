@@ -230,6 +230,7 @@ TPM_RESERVED_SCOPES_KEY = "_litellm_tpm_reserved_scopes"
 # does not double-refund.
 TPM_RESERVATION_RELEASED_KEY = "_litellm_tpm_reservation_released"
 RATE_LIMIT_DESCRIPTORS_KEY = "_litellm_rate_limit_descriptors"
+TOKENIN_QUEUE_OWNS_MPR_KEY = "_litellm_tokenin_queue_owns_mpr"
 # Stash keys live ONLY in metadata channels — never at the top level of the
 # request body. Top-level keys are forwarded as body params to upstream
 # providers, which reject unknown fields with 400/429 errors.
@@ -239,6 +240,7 @@ _LITELLM_STASH_KEYS: Tuple[str, ...] = (
     TPM_RESERVED_SCOPES_KEY,
     TPM_RESERVATION_RELEASED_KEY,
     RATE_LIMIT_DESCRIPTORS_KEY,
+    TOKENIN_QUEUE_OWNS_MPR_KEY,
 )
 
 
@@ -1533,6 +1535,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         rpm_limit_type: Optional[str],
         tpm_limit_type: Optional[str],
         model_has_failures: bool,
+        skip_api_key_max_parallel_requests: bool = False,
     ) -> List[RateLimitDescriptor]:
         """
         Create all rate limit descriptors for the request.
@@ -1568,7 +1571,11 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                             limit_type=tpm_limit_type,
                             model_has_failures=model_has_failures,
                         ),
-                        "max_parallel_requests": user_api_key_dict.max_parallel_requests,
+                        "max_parallel_requests": (
+                            None
+                            if skip_api_key_max_parallel_requests
+                            else user_api_key_dict.max_parallel_requests
+                        ),
                         "window_size": self.window_size,
                     },
                 )
@@ -1933,12 +1940,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         """
         verbose_proxy_logger.debug("Inside Rate Limit Pre-Call Hook")
 
-        # Reject caller-supplied stash values before any read/write. Otherwise
-        # a client can inject ``_litellm_rate_limit_descriptors`` /
-        # ``_litellm_tpm_reserved_tokens`` in body ``metadata`` and have
-        # ``async_post_call_failure_hook`` refund TPM counters against scopes
-        # they name (e.g. another tenant's api_key).
-        self._strip_stash_keys_from_all_channels(data)
+        tokenin_queue_admitted = self._prepare_tokenin_queue_admission(data)
 
         #########################################################
         # Check if the call type has a specific rate limiter
@@ -1976,13 +1978,15 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 parent_otel_span=user_api_key_dict.parent_otel_span,
             )
 
-        # Create rate limit descriptors
+        # Tokenin owns key MPR admission when it has an active request-local
+        # slot. Keep RPM/TPM enforcement here; only avoid duplicate key MPR.
         descriptors = self._create_rate_limit_descriptors(
             user_api_key_dict=user_api_key_dict,
             data=data,
             rpm_limit_type=rpm_limit_type,
             tpm_limit_type=tpm_limit_type,
             model_has_failures=model_has_failures,
+            skip_api_key_max_parallel_requests=tokenin_queue_admitted,
         )
 
         # Add team model rate limits from team_metadata
@@ -2143,6 +2147,18 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         # top-level (stale cache hit, router pass, test fixture) before the
         # body is forwarded to the provider.
         self._strip_stash_keys_from_top_level(data)
+
+    def _prepare_tokenin_queue_admission(self, data: dict) -> bool:
+        """Trust Tokenin MPR bypass only for its active request-local slot."""
+        from litellm.proxy.hooks.tokenin.concurrency_queue import (
+            TokeninConcurrencyQueue,
+        )
+
+        admitted = TokeninConcurrencyQueue.request_has_active_slot(data)
+        self._strip_stash_keys_from_all_channels(data)
+        if admitted:
+            data.setdefault("metadata", {})[TOKENIN_QUEUE_OWNS_MPR_KEY] = True
+        return admitted
 
     @staticmethod
     def _strip_stash_keys_from_top_level(data: Any) -> None:
@@ -2664,8 +2680,8 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
 
         pipeline_operations: List[RedisPipelineIncrementOperation] = []
 
-        # max_parallel_requests is its own counter (api-key only) — always decrement.
-        if user_api_key:
+        # Tokenin-admitted requests never incremented this counter.
+        if user_api_key and not self._tokenin_queue_owns_mpr(kwargs):
             pipeline_operations.append(
                 RedisPipelineIncrementOperation(
                     key=self.create_rate_limit_keys(
@@ -2710,6 +2726,12 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         )
 
         return pipeline_operations
+
+    @staticmethod
+    def _tokenin_queue_owns_mpr(kwargs: Any) -> bool:
+        litellm_params = kwargs.get("litellm_params") or {}
+        metadata = litellm_params.get("metadata") or {}
+        return metadata.get(TOKENIN_QUEUE_OWNS_MPR_KEY) is True
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
         """
@@ -2767,7 +2789,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
 
             pipeline_operations: List[RedisPipelineIncrementOperation] = []
 
-            if user_api_key:
+            if user_api_key and not self._tokenin_queue_owns_mpr(kwargs):
                 pipeline_operations.append(
                     RedisPipelineIncrementOperation(
                         key=self.create_rate_limit_keys(

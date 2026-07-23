@@ -11,6 +11,18 @@ else:
     LitellmRouter = Any
 
 
+class DeploymentCapacitySemaphore(asyncio.Semaphore):
+    """Semaphore that wakes capacity-aware router selection on release."""
+
+    def __init__(self, value: int, availability_event: asyncio.Event):
+        super().__init__(value)
+        self._availability_event = availability_event
+
+    def release(self) -> None:
+        super().release()
+        self._availability_event.set()
+
+
 class InitalizeCachedClient:
     @staticmethod
     def set_max_parallel_requests_client(
@@ -28,7 +40,10 @@ class InitalizeCachedClient:
             default_max_parallel_requests=litellm_router_instance.default_max_parallel_requests,
         )
         if calculated_max_parallel_requests:
-            semaphore = asyncio.Semaphore(calculated_max_parallel_requests)
+            semaphore = DeploymentCapacitySemaphore(
+                calculated_max_parallel_requests,
+                litellm_router_instance._deployment_capacity_changed,
+            )
             cache_key = f"{model_id}_max_parallel_requests_client"
             litellm_router_instance.cache.set_cache(
                 key=cache_key,

@@ -1871,6 +1871,11 @@ async def test_aresponses_streaming_iterator_fallback():
         MagicMock(type="response.output_text.delta"),
         MagicMock(type="response.completed"),
     ]
+    released = 0
+
+    def release_slot() -> None:
+        nonlocal released
+        released += 1
 
     with patch.object(
         router,
@@ -1885,12 +1890,14 @@ async def test_aresponses_streaming_iterator_fallback():
                 "input": "Hi",
                 "original_generic_function": litellm.aresponses,
             },
+            on_close=release_slot,
         )
         assert isinstance(wrapped, BaseResponsesAPIStreamingIterator)
         assert wrapped._hidden_params.get("model_id") == "src-deployment-1"
         collected = [c async for c in wrapped]
 
     assert len(collected) == 3  # 1 primary chunk + 2 fallback chunks
+    assert released == 1
     call_kwargs = mock_fallback_utils.call_args.kwargs
     fbk = call_kwargs["kwargs"]
     # Bound methods compare equal when they share the same instance + __func__.

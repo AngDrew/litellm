@@ -1,5 +1,4 @@
 import asyncio
-import sys
 from typing import Any, Dict, Optional
 
 import pytest
@@ -50,22 +49,28 @@ async def test_request_passes_under_limit() -> None:
     result = await hook.async_pre_call_hook(user, None, data, "acompletion")
 
     assert result is data
-    assert user.max_parallel_requests == sys.maxsize
+    assert user.max_parallel_requests == 1
+    assert hook.request_has_active_slot(data)
     assert time_provider.calls == 2
     await _release_success(hook, data)
 
 
 @pytest.mark.asyncio
-async def test_second_request_waits_until_first_finishes() -> None:
+async def test_cached_key_limit_remains_global_across_models() -> None:
     hook = TokeninConcurrencyQueue(max_wait_seconds=1)
-    first_data: Dict[str, Any] = {}
-    second_data: Dict[str, Any] = {}
-    await hook.async_pre_call_hook(_user("waiting-key"), None, first_data, "acompletion")
+    cached_user = _user("waiting-key")
+    completed_data: Dict[str, Any] = {"model": "first-model"}
+    await hook.async_pre_call_hook(cached_user, None, completed_data, "acompletion")
+    await _release_success(hook, completed_data)
 
+    first_data: Dict[str, Any] = {"model": "first-model"}
+    second_data: Dict[str, Any] = {"model": "other-model"}
+    await hook.async_pre_call_hook(cached_user, None, first_data, "acompletion")
     second_request = asyncio.create_task(
-        hook.async_pre_call_hook(_user("waiting-key"), None, second_data, "acompletion")
+        hook.async_pre_call_hook(cached_user, None, second_data, "acompletion")
     )
     await asyncio.sleep(0)
+    assert cached_user.max_parallel_requests == 1
     assert not second_request.done()
 
     await _release_success(hook, first_data)
@@ -128,6 +133,30 @@ async def test_streaming_request_releases_slot_when_stream_fails() -> None:
     next_data: Dict[str, Any] = {}
     await asyncio.wait_for(
         hook.async_pre_call_hook(_user("failed-stream-key"), None, next_data, "acompletion"),
+        timeout=0.1,
+    )
+    await _release_success(hook, next_data)
+
+
+@pytest.mark.asyncio
+async def test_stream_cancellation_releases_slot() -> None:
+    hook = TokeninConcurrencyQueue(max_wait_seconds=1)
+    stream_data: Dict[str, Any] = {"stream": True}
+    await hook.async_pre_call_hook(_user("cancelled-stream-key"), None, stream_data, "acompletion")
+
+    async def stream():
+        yield "first"
+        await asyncio.Event().wait()
+
+    iterator = hook.async_post_call_streaming_iterator_hook(
+        _user("cancelled-stream-key"), stream(), stream_data
+    )
+    assert await anext(iterator) == "first"
+    await iterator.aclose()
+
+    next_data: Dict[str, Any] = {}
+    await asyncio.wait_for(
+        hook.async_pre_call_hook(_user("cancelled-stream-key"), None, next_data, "acompletion"),
         timeout=0.1,
     )
     await _release_success(hook, next_data)
