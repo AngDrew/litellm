@@ -967,3 +967,229 @@ async def test_model_group_affinity_config_overrides_global():
     )
     # All deployments returned (user-key affinity disabled for this group)
     assert len(filtered) == 2
+
+
+def _build_capacity_router():
+    """
+    Router with two deployments of the same model group "m", each capped at
+    max_parallel_requests=1.
+    """
+    return litellm.Router(
+        model_list=[
+            {
+                "model_name": "m",
+                "litellm_params": {
+                    "model": "openai/gpt-4a",
+                    "api_key": "mock-key-1",
+                    "max_parallel_requests": 1,
+                },
+                "model_info": {"id": "a"},
+            },
+            {
+                "model_name": "m",
+                "litellm_params": {
+                    "model": "openai/gpt-4b",
+                    "api_key": "mock-key-2",
+                    "max_parallel_requests": 1,
+                },
+                "model_info": {"id": "b"},
+            },
+        ]
+    )
+
+
+async def _saturate_deployment(router, deployment):
+    semaphore = router._get_client(
+        deployment=deployment, kwargs={}, client_type="max_parallel_requests"
+    )
+    assert semaphore is not None
+    await semaphore.acquire()
+    return semaphore
+
+
+@pytest.mark.asyncio
+async def test_user_key_affinity_falls_through_when_pinned_at_capacity():
+    """
+    When the affinity-pinned deployment has all max_parallel_requests slots taken,
+    the filter should fall through to all healthy deployments so another deployment
+    with free capacity can serve the request.
+    """
+    router = _build_capacity_router()
+    depl_a = router.model_list[0]
+    depl_b = router.model_list[1]
+
+    check = DeploymentAffinityCheck(
+        cache=router.cache,
+        ttl_seconds=900,
+        enable_user_key_affinity=True,
+        enable_responses_api_affinity=False,
+        router=router,
+    )
+
+    await check.cache.async_set_cache(
+        check.get_affinity_cache_key("m", "keyhash"),
+        {"model_id": "a"},
+    )
+
+    # Saturate deployment a's only slot
+    await _saturate_deployment(router, depl_a)
+
+    filtered = await check.async_filter_deployments(
+        model="m",
+        healthy_deployments=[depl_a, depl_b],
+        messages=None,
+        request_kwargs={"metadata": {"user_api_key_hash": "keyhash"}},
+    )
+
+    assert filtered == [depl_a, depl_b]
+
+
+@pytest.mark.asyncio
+async def test_user_key_affinity_pins_when_capacity_available():
+    """
+    With the pinned deployment at free capacity, the hard pin behavior is unchanged.
+    """
+    router = _build_capacity_router()
+    depl_a = router.model_list[0]
+    depl_b = router.model_list[1]
+
+    check = DeploymentAffinityCheck(
+        cache=router.cache,
+        ttl_seconds=900,
+        enable_user_key_affinity=True,
+        enable_responses_api_affinity=False,
+        router=router,
+    )
+
+    await check.cache.async_set_cache(
+        check.get_affinity_cache_key("m", "keyhash"),
+        {"model_id": "a"},
+    )
+
+    # No slots held — pinned deployment has free capacity
+    filtered = await check.async_filter_deployments(
+        model="m",
+        healthy_deployments=[depl_a, depl_b],
+        messages=None,
+        request_kwargs={"metadata": {"user_api_key_hash": "keyhash"}},
+    )
+
+    assert filtered == [depl_a]
+
+
+@pytest.mark.asyncio
+async def test_user_key_affinity_hard_pins_without_router():
+    """
+    Backwards compat: without a router reference, capacity is unknown and the
+    previous hard-pin behavior is preserved (even when the deployment is saturated).
+    """
+    router = _build_capacity_router()
+    depl_a = router.model_list[0]
+    depl_b = router.model_list[1]
+
+    check = DeploymentAffinityCheck(
+        cache=router.cache,
+        ttl_seconds=900,
+        enable_user_key_affinity=True,
+        enable_responses_api_affinity=False,
+        # NOTE: no router= passed
+    )
+
+    await check.cache.async_set_cache(
+        check.get_affinity_cache_key("m", "keyhash"),
+        {"model_id": "a"},
+    )
+
+    await _saturate_deployment(router, depl_a)
+
+    filtered = await check.async_filter_deployments(
+        model="m",
+        healthy_deployments=[depl_a, depl_b],
+        messages=None,
+        request_kwargs={"metadata": {"user_api_key_hash": "keyhash"}},
+    )
+
+    assert filtered == [depl_a]
+
+
+@pytest.mark.asyncio
+async def test_router_acompletion_falls_through_when_pinned_deployment_at_capacity():
+    """
+    Router-level: with the affinity-pinned deployment saturated, the request is
+    served by the other deployment (proving the affinity filter fell through to
+    all healthy deployments instead of hard-pinning).
+    """
+    mock_response = litellm.ModelResponse(
+        id="chatcmpl-mock-capacity",
+        choices=[
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "Hello"},
+            }
+        ],
+        created=1700000000,
+        model="m",
+        usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    )
+
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "m",
+                "litellm_params": {
+                    "model": "openai/gpt-4a",
+                    "api_key": "mock-key-1",
+                    "max_parallel_requests": 1,
+                },
+                "model_info": {"id": "a"},
+            },
+            {
+                "model_name": "m",
+                "litellm_params": {
+                    "model": "openai/gpt-4b",
+                    "api_key": "mock-key-2",
+                    "max_parallel_requests": 1,
+                },
+                "model_info": {"id": "b"},
+            },
+        ],
+        routing_strategy="simple-shuffle",
+        enable_pre_call_checks=True,
+        optional_pre_call_checks=["deployment_affinity"],
+    )
+
+    # Seed affinity to deployment a
+    await router.cache.async_set_cache(
+        DeploymentAffinityCheck.get_affinity_cache_key("m", "keyhash"),
+        {"model_id": "a"},
+    )
+
+    # Saturate deployment a's only slot
+    await _saturate_deployment(router, router.model_list[0])
+
+    def deterministic_choice(seq):
+        # If the filter fell through, both deployments are available and we force
+        # the strategy to pick deployment b. A hard pin would leave only [a].
+        return seq[1] if len(seq) > 1 else seq[0]
+
+    with (
+        patch(
+            "litellm.acompletion",
+            new_callable=AsyncMock,
+            return_value=mock_response,
+        ) as mock_acompletion,
+        patch(
+            "litellm.router_strategy.simple_shuffle.random.choice",
+            side_effect=deterministic_choice,
+        ),
+    ):
+        response = await router.acompletion(
+            model="m",
+            messages=[{"role": "user", "content": "hi"}],
+            metadata={"user_api_key_hash": "keyhash"},
+        )
+
+    assert response is mock_response
+    assert mock_acompletion.call_count == 1
+    assert mock_acompletion.call_args.kwargs["model"] == "openai/gpt-4b"

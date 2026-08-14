@@ -13,7 +13,7 @@ where routing to a consistent deployment is still beneficial.
 """
 
 import hashlib
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
 
 from typing_extensions import TypedDict
 
@@ -23,6 +23,11 @@ from litellm.integrations.custom_logger import CustomLogger, Span
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.types.llms.openai import AllMessageValues
 from litellm.types.utils import CallTypes
+
+if TYPE_CHECKING:
+    from litellm.router import Router
+else:
+    Router = Any
 
 
 class DeploymentAffinityCacheValue(TypedDict):
@@ -50,6 +55,7 @@ class DeploymentAffinityCheck(CustomLogger):
         enable_responses_api_affinity: bool,
         enable_session_id_affinity: bool = False,
         model_group_affinity_config: Optional[Dict[str, List[str]]] = None,
+        router: Optional["Router"] = None,
     ):
         super().__init__()
         self.cache = cache
@@ -57,6 +63,7 @@ class DeploymentAffinityCheck(CustomLogger):
         self.enable_user_key_affinity = enable_user_key_affinity
         self.enable_responses_api_affinity = enable_responses_api_affinity
         self.enable_session_id_affinity = enable_session_id_affinity
+        self.router = router
         self.model_group_affinity_config: Dict[str, List[str]] = (
             model_group_affinity_config or {}
         )
@@ -298,6 +305,30 @@ class DeploymentAffinityCheck(CustomLogger):
                 return deployment
         return None
 
+    def _has_free_capacity(
+        self, deployment: dict, request_kwargs: Optional[dict]
+    ) -> bool:
+        """True when the pinned deployment has a free max_parallel_requests slot.
+
+        Keep the previous hard-pin behavior when the router is unknown (standalone
+        construction, e.g. existing tests) or the deployment is uncapped."""
+        if self.router is None:
+            return True
+        try:
+            semaphore = self.router._get_client(
+                deployment=deployment,
+                kwargs=request_kwargs or {},
+                client_type="max_parallel_requests",
+            )
+        except Exception as e:
+            verbose_router_logger.debug(
+                "DeploymentAffinityCheck: capacity check failed (%s); keeping hard pin", e
+            )
+            return True
+        if semaphore is None:
+            return True  # uncapped deployment
+        return not semaphore.locked()
+
     async def async_filter_deployments(
         self,
         model: str,
@@ -420,12 +451,19 @@ class DeploymentAffinityCheck(CustomLogger):
             )
             return typed_healthy_deployments
 
+        if self._has_free_capacity(deployment, request_kwargs):
+            verbose_router_logger.debug(
+                "DeploymentAffinityCheck: api-key affinity hit -> deployment=%s user_key=%s",
+                model_id,
+                self._shorten_for_logs(user_key),
+            )
+            return [deployment]
+
         verbose_router_logger.debug(
-            "DeploymentAffinityCheck: api-key affinity hit -> deployment=%s user_key=%s",
+            "DeploymentAffinityCheck: pinned deployment=%s at max_parallel_requests; falling through to all healthy deployments",
             model_id,
-            self._shorten_for_logs(user_key),
         )
-        return [deployment]
+        return typed_healthy_deployments
 
     async def async_pre_call_deployment_hook(
         self, kwargs: Dict[str, Any], call_type: Optional[CallTypes]

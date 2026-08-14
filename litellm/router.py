@@ -739,6 +739,7 @@ class Router:
                 enable_responses_api_affinity=False,
                 enable_session_id_affinity=False,
                 model_group_affinity_config=self.model_group_affinity_config,
+                router=self,
             )
             self.optional_callbacks.append(affinity_callback)
             litellm.logging_callback_manager.add_litellm_callback(affinity_callback)
@@ -1703,6 +1704,7 @@ class Router:
                 existing_affinity_callback.ttl_seconds = (
                     self.deployment_affinity_ttl_seconds
                 )
+                existing_affinity_callback.router = self
                 if self.model_group_affinity_config:
                     existing_affinity_callback.model_group_affinity_config = (
                         self.model_group_affinity_config
@@ -1715,6 +1717,7 @@ class Router:
                     enable_responses_api_affinity=enable_responses_api_affinity,
                     enable_session_id_affinity=enable_session_id_affinity,
                     model_group_affinity_config=self.model_group_affinity_config,
+                    router=self,
                 )
                 self.optional_callbacks.append(affinity_callback)
                 litellm.logging_callback_manager.add_litellm_callback(affinity_callback)
