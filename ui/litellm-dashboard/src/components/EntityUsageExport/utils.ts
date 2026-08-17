@@ -3,23 +3,32 @@ import type { DateRangePickerValue } from "@tremor/react";
 import Papa from "papaparse";
 import type { EntityBreakdown, EntitySpendData, EntityType, ExportMetadata, ExportScope } from "./types";
 
-// Resolve display name for an entity. For teams the teamAliasMap provides
-// a human-readable alias; for every other entity type the entity key itself
-// (tag name, org id, customer id, …) is already the correct label.
 const resolveEntityDisplay = (
   entity: string,
   teamAliasMap: Record<string, string>,
+  entityMetadata?: Record<string, any>,
 ): { id: string; alias: string } => ({
   id: entity,
-  alias: teamAliasMap[entity] || entity,
+  alias:
+    teamAliasMap[entity] ||
+    entityMetadata?.team_alias ||
+    entityMetadata?.user_email ||
+    entityMetadata?.user_alias ||
+    entity,
 });
 
 // Mirrors backend SpendMetrics fields (litellm/types/activity_tracking.py).
 // If the backend adds a field, add it here too.
 const METRIC_KEYS = [
-  "spend", "api_requests", "successful_requests", "failed_requests",
-  "total_tokens", "prompt_tokens", "completion_tokens",
-  "cache_read_input_tokens", "cache_creation_input_tokens",
+  "spend",
+  "api_requests",
+  "successful_requests",
+  "failed_requests",
+  "total_tokens",
+  "prompt_tokens",
+  "completion_tokens",
+  "cache_read_input_tokens",
+  "cache_creation_input_tokens",
 ] as const;
 
 // When breakdown.entities is empty (aggregated endpoint), reconstruct entities
@@ -65,7 +74,7 @@ export const getEntityBreakdown = (
 
   spendData.results.forEach((day) => {
     Object.entries(resolveEntities(day.breakdown)).forEach(([entity, data]: [string, any]) => {
-      const { id, alias } = resolveEntityDisplay(entity, teamAliasMap);
+      const { id, alias } = resolveEntityDisplay(entity, teamAliasMap, data.metadata);
 
       if (!entitySpend[entity]) {
         entitySpend[entity] = {
@@ -110,7 +119,7 @@ export const generateDailyData = (
 
   spendData.results.forEach((day) => {
     Object.entries(resolveEntities(day.breakdown)).forEach(([entity, data]: [string, any]) => {
-      const { id, alias } = resolveEntityDisplay(entity, teamAliasMap);
+      const { id, alias } = resolveEntityDisplay(entity, teamAliasMap, data.metadata);
 
       dailyBreakdown.push({
         Date: day.date,
@@ -123,6 +132,8 @@ export const generateDailyData = (
         "Total Tokens": data.metrics.total_tokens,
         "Prompt Tokens": data.metrics.prompt_tokens || 0,
         "Completion Tokens": data.metrics.completion_tokens || 0,
+        "Cache Read Input Tokens": data.metrics.cache_read_input_tokens || 0,
+        "Cache Creation Input Tokens": data.metrics.cache_creation_input_tokens || 0,
       });
     });
   });
@@ -151,13 +162,15 @@ export const generateDailyWithKeysData = (
         total_tokens: number;
         prompt_tokens: number;
         completion_tokens: number;
+        cache_read_input_tokens: number;
+        cache_creation_input_tokens: number;
       };
     };
   } = {};
 
   spendData.results.forEach((day) => {
     Object.entries(resolveEntities(day.breakdown)).forEach(([entity, data]: [string, any]) => {
-      const { id: entityId, alias: entityAlias } = resolveEntityDisplay(entity, teamAliasMap);
+      const { id: entityId, alias: entityAlias } = resolveEntityDisplay(entity, teamAliasMap, data.metadata);
       const apiKeyBreakdown = data.api_key_breakdown || {};
 
       // Iterate through each API key in the breakdown
@@ -183,6 +196,8 @@ export const generateDailyWithKeysData = (
               total_tokens: keyData.metrics?.total_tokens || 0,
               prompt_tokens: keyData.metrics?.prompt_tokens || 0,
               completion_tokens: keyData.metrics?.completion_tokens || 0,
+              cache_read_input_tokens: keyData.metrics?.cache_read_input_tokens || 0,
+              cache_creation_input_tokens: keyData.metrics?.cache_creation_input_tokens || 0,
             },
           };
         } else {
@@ -194,6 +209,9 @@ export const generateDailyWithKeysData = (
           aggregatedData[uniqueKey].metrics.total_tokens += keyData.metrics?.total_tokens || 0;
           aggregatedData[uniqueKey].metrics.prompt_tokens += keyData.metrics?.prompt_tokens || 0;
           aggregatedData[uniqueKey].metrics.completion_tokens += keyData.metrics?.completion_tokens || 0;
+          aggregatedData[uniqueKey].metrics.cache_read_input_tokens += keyData.metrics?.cache_read_input_tokens || 0;
+          aggregatedData[uniqueKey].metrics.cache_creation_input_tokens +=
+            keyData.metrics?.cache_creation_input_tokens || 0;
         }
       });
     });
@@ -213,6 +231,8 @@ export const generateDailyWithKeysData = (
     "Total Tokens": item.metrics.total_tokens,
     "Prompt Tokens": item.metrics.prompt_tokens,
     "Completion Tokens": item.metrics.completion_tokens,
+    "Cache Read Input Tokens": item.metrics.cache_read_input_tokens,
+    "Cache Creation Input Tokens": item.metrics.cache_creation_input_tokens,
   }));
 
   return dailyKeyBreakdown.sort((a, b) => new Date(a.Date).getTime() - new Date(b.Date).getTime());
@@ -227,16 +247,22 @@ export const generateDailyWithModelsData = (
 
   spendData.results.forEach((day) => {
     const dailyEntityModels: { [key: string]: { [key: string]: any } } = {};
+    const dailyEntityMetadata: { [key: string]: Record<string, any> | undefined } = {};
 
     Object.entries(resolveEntities(day.breakdown)).forEach(([entity, entityData]: [string, any]) => {
       if (!dailyEntityModels[entity]) {
         dailyEntityModels[entity] = {};
       }
+      dailyEntityMetadata[entity] = entityData.metadata;
 
       Object.entries(day.breakdown.models || {}).forEach(([model, modelData]: [string, any]) => {
-        const apiKeyBreakdown = entityData.api_key_breakdown || {};
+        const entityApiKeys = entityData.api_key_breakdown || {};
+        const modelApiKeys = modelData.api_key_breakdown || {};
 
-        Object.entries(apiKeyBreakdown).forEach(([apiKey, apiKeyData]: [string, any]) => {
+        Object.keys(entityApiKeys).forEach((apiKey) => {
+          const keyMetrics = modelApiKeys[apiKey]?.metrics;
+          if (!keyMetrics) return;
+
           if (!dailyEntityModels[entity][model]) {
             dailyEntityModels[entity][model] = {
               spend: 0,
@@ -244,19 +270,27 @@ export const generateDailyWithModelsData = (
               successful: 0,
               failed: 0,
               tokens: 0,
+              promptTokens: 0,
+              completionTokens: 0,
+              cacheReadInputTokens: 0,
+              cacheCreationInputTokens: 0,
             };
           }
-          dailyEntityModels[entity][model].spend += apiKeyData.metrics.spend || 0;
-          dailyEntityModels[entity][model].requests += apiKeyData.metrics.api_requests || 0;
-          dailyEntityModels[entity][model].successful += apiKeyData.metrics.successful_requests || 0;
-          dailyEntityModels[entity][model].failed += apiKeyData.metrics.failed_requests || 0;
-          dailyEntityModels[entity][model].tokens += apiKeyData.metrics.total_tokens || 0;
+          dailyEntityModels[entity][model].spend += keyMetrics.spend || 0;
+          dailyEntityModels[entity][model].requests += keyMetrics.api_requests || 0;
+          dailyEntityModels[entity][model].successful += keyMetrics.successful_requests || 0;
+          dailyEntityModels[entity][model].failed += keyMetrics.failed_requests || 0;
+          dailyEntityModels[entity][model].tokens += keyMetrics.total_tokens || 0;
+          dailyEntityModels[entity][model].promptTokens += keyMetrics.prompt_tokens || 0;
+          dailyEntityModels[entity][model].completionTokens += keyMetrics.completion_tokens || 0;
+          dailyEntityModels[entity][model].cacheReadInputTokens += keyMetrics.cache_read_input_tokens || 0;
+          dailyEntityModels[entity][model].cacheCreationInputTokens += keyMetrics.cache_creation_input_tokens || 0;
         });
       });
     });
 
     Object.entries(dailyEntityModels).forEach(([entity, models]) => {
-      const { id, alias } = resolveEntityDisplay(entity, teamAliasMap);
+      const { id, alias } = resolveEntityDisplay(entity, teamAliasMap, dailyEntityMetadata[entity]);
 
       Object.entries(models).forEach(([model, metrics]: [string, any]) => {
         dailyModelBreakdown.push({
@@ -269,6 +303,10 @@ export const generateDailyWithModelsData = (
           Successful: metrics.successful,
           Failed: metrics.failed,
           "Total Tokens": metrics.tokens,
+          "Prompt Tokens": metrics.promptTokens,
+          "Completion Tokens": metrics.completionTokens,
+          "Cache Read Input Tokens": metrics.cacheReadInputTokens,
+          "Cache Creation Input Tokens": metrics.cacheCreationInputTokens,
         });
       });
     });

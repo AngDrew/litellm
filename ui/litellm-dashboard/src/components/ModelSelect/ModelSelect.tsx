@@ -2,7 +2,7 @@ import { ProxyModel, useAllProxyModels } from "@/app/(dashboard)/hooks/models/us
 import { useOrganization } from "@/app/(dashboard)/hooks/organizations/useOrganizations";
 import { useTeam } from "@/app/(dashboard)/hooks/teams/useTeams";
 import { useCurrentUser } from "@/app/(dashboard)/hooks/users/useCurrentUser";
-import { Select, Skeleton, Tooltip, type SelectProps } from "antd";
+import { Select, Skeleton, Tooltip } from "antd";
 import { Organization, Team } from "../networking";
 import { splitWildcardModels } from "./modelUtils";
 
@@ -16,7 +16,7 @@ const MODEL_SELECT_NO_DEFAULT_MODELS_SPECIAL_VALUE = {
   value: "no-default-models",
 } as const;
 
-const MODEL_SELECT_SPECIAL_VALUES_ARRAY = [
+export const MODEL_SENTINEL_OPTIONS = [
   MODEL_SELECT_ALL_PROXY_MODELS_SPECIAL_VALUE,
   MODEL_SELECT_NO_DEFAULT_MODELS_SPECIAL_VALUE,
 ] as const;
@@ -54,7 +54,10 @@ const contextFilters: Record<ModelSelectProps["context"], (args: FilterContextAr
 
   team: ({ allProxyModels, selectedOrganization, userModels }) => {
     if (selectedOrganization) {
-      if (selectedOrganization.models.includes(MODEL_SELECT_ALL_PROXY_MODELS_SPECIAL_VALUE.value) || selectedOrganization.models.length === 0) {
+      if (
+        selectedOrganization.models.includes(MODEL_SELECT_ALL_PROXY_MODELS_SPECIAL_VALUE.value) ||
+        selectedOrganization.models.length === 0
+      ) {
         return allProxyModels;
       }
       return allProxyModels.filter((model) => selectedOrganization.models.includes(model));
@@ -90,28 +93,24 @@ const filterModels = (
 
 export const ModelSelect = (props: ModelSelectProps) => {
   const { teamID, organizationID, options, context, dataTestId, value = [], onChange, style } = props;
-  const { includeUserModels, showAllTeamModelsOption, showAllProxyModelsOverride, includeSpecialOptions } =
-    options || {};
+  const { showAllProxyModelsOverride, includeSpecialOptions } = options || {};
   const { data: allProxyModels, isLoading: isLoadingAllProxyModels } = useAllProxyModels();
   const { data: team, isLoading: isLoadingTeam } = useTeam(teamID);
   const { data: organization, isLoading: isLoadingOrganization } = useOrganization(organizationID);
   const { data: currentUser, isLoading: isCurrentUserLoading } = useCurrentUser();
 
-  const isSpecialOption = (value: string) => MODEL_SELECT_SPECIAL_VALUES_ARRAY.some((sv) => sv.value === value);
+  const isSpecialOption = (value: string) => MODEL_SENTINEL_OPTIONS.some((sv) => sv.value === value);
   const hasSpecialOptionSelected = value.some(isSpecialOption);
   const isLoading = isLoadingAllProxyModels || isLoadingTeam || isLoadingOrganization || isCurrentUserLoading;
-  const organizationHasAllProxyModels = organization?.models.includes(MODEL_SELECT_ALL_PROXY_MODELS_SPECIAL_VALUE.value) || organization?.models.length === 0;
+  const organizationHasAllProxyModels =
+    organization?.models.includes(MODEL_SELECT_ALL_PROXY_MODELS_SPECIAL_VALUE.value) ||
+    organization?.models.length === 0;
   const shouldShowAllProxyModels =
-    showAllProxyModelsOverride ||
-    (organizationHasAllProxyModels && includeSpecialOptions) || context === "global";
+    showAllProxyModelsOverride || (organizationHasAllProxyModels && includeSpecialOptions) || context === "global";
 
   if (isLoading) {
     return <Skeleton.Input active block />;
   }
-
-  const optionRender: NonNullable<SelectProps["optionRender"]> = (option) => {
-    return <span>{option.label}</span>;
-  };
 
   const handleChange = (values: string[]) => {
     const specialValues = values.filter(isSpecialOption);
@@ -143,53 +142,53 @@ export const ModelSelect = (props: ModelSelectProps) => {
       options={[
         ...(includeSpecialOptions
           ? [
-            {
-              label: <span>Special Options</span>,
-              title: "Special Options",
-              options: [
-                ...(shouldShowAllProxyModels
-                  ? [
-                    {
-                      label: <span>All Proxy Models</span>,
-                      value: MODEL_SELECT_ALL_PROXY_MODELS_SPECIAL_VALUE.value,
-                      disabled:
-                        value.length > 0 &&
-                        value.some(
-                          (v) => isSpecialOption(v) && v !== MODEL_SELECT_ALL_PROXY_MODELS_SPECIAL_VALUE.value,
-                        ),
-                      key: MODEL_SELECT_ALL_PROXY_MODELS_SPECIAL_VALUE.value,
-                    },
-                  ]
-                  : []),
-                {
-                  label: <span>No Default Models</span>,
-                  value: MODEL_SELECT_NO_DEFAULT_MODELS_SPECIAL_VALUE.value,
-                  disabled:
-                    value.length > 0 &&
-                    value.some((v) => isSpecialOption(v) && v !== MODEL_SELECT_NO_DEFAULT_MODELS_SPECIAL_VALUE.value),
-                  key: MODEL_SELECT_NO_DEFAULT_MODELS_SPECIAL_VALUE.value,
-                },
-              ],
-            },
-          ]
+              {
+                label: <span>Special Options</span>,
+                title: "Special Options",
+                options: [
+                  ...(shouldShowAllProxyModels
+                    ? [
+                        {
+                          label: <span>All Proxy Models</span>,
+                          value: MODEL_SELECT_ALL_PROXY_MODELS_SPECIAL_VALUE.value,
+                          disabled:
+                            value.length > 0 &&
+                            value.some(
+                              (v) => isSpecialOption(v) && v !== MODEL_SELECT_ALL_PROXY_MODELS_SPECIAL_VALUE.value,
+                            ),
+                          key: MODEL_SELECT_ALL_PROXY_MODELS_SPECIAL_VALUE.value,
+                        },
+                      ]
+                    : []),
+                  {
+                    label: <span>No Default Models</span>,
+                    value: MODEL_SELECT_NO_DEFAULT_MODELS_SPECIAL_VALUE.value,
+                    disabled:
+                      value.length > 0 &&
+                      value.some((v) => isSpecialOption(v) && v !== MODEL_SELECT_NO_DEFAULT_MODELS_SPECIAL_VALUE.value),
+                    key: MODEL_SELECT_NO_DEFAULT_MODELS_SPECIAL_VALUE.value,
+                  },
+                ],
+              },
+            ]
           : []),
         ...(wildcard.length > 0
           ? [
-            {
-              label: <span>Wildcard Options</span>,
-              title: "Wildcard Options",
-              options: wildcard.map((model) => {
-                const provider = model.replace("/*", "");
-                const capitalizedProvider = provider.charAt(0).toUpperCase() + provider.slice(1);
+              {
+                label: <span>Wildcard Options</span>,
+                title: "Wildcard Options",
+                options: wildcard.map((model) => {
+                  const provider = model.replace("/*", "");
+                  const capitalizedProvider = provider.charAt(0).toUpperCase() + provider.slice(1);
 
-                return {
-                  label: <span>{`All ${capitalizedProvider} models`}</span>,
-                  value: model,
-                  disabled: hasSpecialOptionSelected,
-                };
-              }),
-            },
-          ]
+                  return {
+                    label: <span>{`All ${capitalizedProvider} models`}</span>,
+                    value: model,
+                    disabled: hasSpecialOptionSelected,
+                  };
+                }),
+              },
+            ]
           : []),
         {
           label: <span>Models</span>,

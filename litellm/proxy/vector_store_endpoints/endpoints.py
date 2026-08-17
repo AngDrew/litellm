@@ -1,6 +1,7 @@
-from typing import Any, Dict, Optional
+from typing import Any, Final
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+
 from litellm.integrations.vector_store_integrations.vector_store_pre_call_hook import (
     LiteLLM_ManagedVectorStore,
 )
@@ -16,19 +17,20 @@ from litellm.proxy.vector_store_endpoints.utils import (
     assert_user_can_access_vector_store,
     get_litellm_managed_vector_store,
 )
+from litellm.repositories.table_repositories import ManagedVectorStoreIndexRepository
 from litellm.types.vector_stores import IndexCreateRequest
 
-router = APIRouter()
+router: Final = APIRouter()
 ########################################################
 # OpenAI Compatible Endpoints
 ########################################################
 
 
 async def _update_request_data_with_litellm_managed_vector_store_registry(
-    data: Dict,
+    data: dict,
     vector_store_id: str,
-    user_api_key_dict: Optional[UserAPIKeyAuth] = None,
-) -> Dict:
+    user_api_key_dict: UserAPIKeyAuth | None = None,
+) -> dict:
     """
     Update the request data with the litellm managed vector store registry.
 
@@ -40,8 +42,8 @@ async def _update_request_data_with_litellm_managed_vector_store_registry(
     Raises:
         HTTPException: If user doesn't have access to the vector store
     """
-    vector_store_to_run: Optional[LiteLLM_ManagedVectorStore] = (
-        await get_litellm_managed_vector_store(vector_store_id=vector_store_id)
+    vector_store_to_run: Final[LiteLLM_ManagedVectorStore | None] = await get_litellm_managed_vector_store(
+        vector_store_id=vector_store_id
     )
     if vector_store_to_run is not None:
         if user_api_key_dict is not None:
@@ -54,9 +56,7 @@ async def _update_request_data_with_litellm_managed_vector_store_registry(
             data["custom_llm_provider"] = vector_store_to_run.get("custom_llm_provider")
 
         if "litellm_credential_name" in vector_store_to_run:
-            data["litellm_credential_name"] = vector_store_to_run.get(
-                "litellm_credential_name"
-            )
+            data["litellm_credential_name"] = vector_store_to_run.get("litellm_credential_name")
 
         if "litellm_params" in vector_store_to_run:
             litellm_params = vector_store_to_run.get("litellm_params", {}) or {}
@@ -67,11 +67,11 @@ async def _update_request_data_with_litellm_managed_vector_store_registry(
             # Legacy rows that already carry a resolved (cleartext)
             # ``litellm_embedding_config`` skip the lookup and pass through
             # unchanged so the embed call keeps working.
-            embedding_model = litellm_params.get("litellm_embedding_model")
+            embedding_model: Final = litellm_params.get("litellm_embedding_model")
             if embedding_model and not litellm_params.get("litellm_embedding_config"):
                 from litellm.proxy.proxy_server import prisma_client
 
-                resolved_config = await _resolve_embedding_config(
+                resolved_config: Final = await _resolve_embedding_config(
                     embedding_model=embedding_model, prisma_client=prisma_client
                 )
                 if resolved_config:
@@ -137,7 +137,7 @@ async def vector_store_search(
     # 3. Setting up proper routing
     # 4. Authentication checks
 
-    processor = ProxyBaseLLMRequestProcessing(data=data)
+    processor: Final = ProxyBaseLLMRequestProcessing(data=data)
     try:
         return await processor.base_process_llm_request(
             request=request,
@@ -202,10 +202,10 @@ async def vector_store_create(
         version,
     )
 
-    data = await _read_request_body(request=request)
+    data: Final = await _read_request_body(request=request)
 
     # Check for target_model_names parameter
-    target_model_names = data.pop("target_model_names", None)
+    target_model_names: Final = data.pop("target_model_names", None)
 
     if target_model_names:
         # Use managed vector stores for multi-model support
@@ -220,9 +220,7 @@ async def vector_store_create(
             )
 
         # Get managed vector stores hook
-        managed_vector_stores: Any = proxy_logging_obj.get_proxy_hook(
-            "managed_vector_stores"
-        )
+        managed_vector_stores: Final[Any] = proxy_logging_obj.get_proxy_hook("managed_vector_stores")
         if managed_vector_stores is None:
             raise HTTPException(
                 status_code=500,
@@ -236,7 +234,7 @@ async def vector_store_create(
             )
 
         # Create vector store across multiple models
-        response = await managed_vector_stores.acreate_vector_store(
+        response: Final = await managed_vector_stores.acreate_vector_store(
             create_request=data,
             llm_router=llm_router,
             target_model_names_list=target_model_names_list,
@@ -246,7 +244,7 @@ async def vector_store_create(
 
         return response
 
-    processor = ProxyBaseLLMRequestProcessing(data=data)
+    processor: Final = ProxyBaseLLMRequestProcessing(data=data)
     try:
         return await processor.base_process_llm_request(
             request=request,
@@ -275,12 +273,8 @@ async def vector_store_create(
         )
 
 
-@router.get(
-    "/v1/vector_stores/{vector_store_id}", dependencies=[Depends(user_api_key_auth)]
-)
-@router.get(
-    "/vector_stores/{vector_store_id}", dependencies=[Depends(user_api_key_auth)]
-)
+@router.get("/v1/vector_stores/{vector_store_id}", dependencies=[Depends(user_api_key_auth)])
+@router.get("/vector_stores/{vector_store_id}", dependencies=[Depends(user_api_key_auth)])
 async def vector_store_retrieve(
     request: Request,
     vector_store_id: str,
@@ -313,7 +307,7 @@ async def vector_store_retrieve(
         data=data, vector_store_id=vector_store_id, user_api_key_dict=user_api_key_dict
     )
 
-    processor = ProxyBaseLLMRequestProcessing(data=data)
+    processor: Final = ProxyBaseLLMRequestProcessing(data=data)
     try:
         return await processor.base_process_llm_request(
             request=request,
@@ -347,10 +341,10 @@ async def vector_store_retrieve(
 async def vector_store_list(
     request: Request,
     fastapi_response: Response,
-    after: Optional[str] = None,
-    before: Optional[str] = None,
-    limit: Optional[int] = 20,
-    order: Optional[str] = "desc",
+    after: str | None = None,
+    before: str | None = None,
+    limit: int | None = 20,
+    order: str | None = "desc",
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
 ):
     """
@@ -373,7 +367,7 @@ async def vector_store_list(
         version,
     )
 
-    data: dict = {}
+    data: Final[dict] = {}
     if after is not None:
         data["after"] = after
     if before is not None:
@@ -383,7 +377,7 @@ async def vector_store_list(
     if order is not None:
         data["order"] = order
 
-    processor = ProxyBaseLLMRequestProcessing(data=data)
+    processor: Final = ProxyBaseLLMRequestProcessing(data=data)
     try:
         return await processor.base_process_llm_request(
             request=request,
@@ -412,12 +406,8 @@ async def vector_store_list(
         )
 
 
-@router.post(
-    "/v1/vector_stores/{vector_store_id}", dependencies=[Depends(user_api_key_auth)]
-)
-@router.post(
-    "/vector_stores/{vector_store_id}", dependencies=[Depends(user_api_key_auth)]
-)
+@router.post("/v1/vector_stores/{vector_store_id}", dependencies=[Depends(user_api_key_auth)])
+@router.post("/vector_stores/{vector_store_id}", dependencies=[Depends(user_api_key_auth)])
 async def vector_store_update(
     request: Request,
     vector_store_id: str,
@@ -453,7 +443,7 @@ async def vector_store_update(
         data=data, vector_store_id=vector_store_id, user_api_key_dict=user_api_key_dict
     )
 
-    processor = ProxyBaseLLMRequestProcessing(data=data)
+    processor: Final = ProxyBaseLLMRequestProcessing(data=data)
     try:
         return await processor.base_process_llm_request(
             request=request,
@@ -482,12 +472,8 @@ async def vector_store_update(
         )
 
 
-@router.delete(
-    "/v1/vector_stores/{vector_store_id}", dependencies=[Depends(user_api_key_auth)]
-)
-@router.delete(
-    "/vector_stores/{vector_store_id}", dependencies=[Depends(user_api_key_auth)]
-)
+@router.delete("/v1/vector_stores/{vector_store_id}", dependencies=[Depends(user_api_key_auth)])
+@router.delete("/vector_stores/{vector_store_id}", dependencies=[Depends(user_api_key_auth)])
 async def vector_store_delete(
     request: Request,
     vector_store_id: str,
@@ -520,7 +506,7 @@ async def vector_store_delete(
         data=data, vector_store_id=vector_store_id, user_api_key_dict=user_api_key_dict
     )
 
-    processor = ProxyBaseLLMRequestProcessing(data=data)
+    processor: Final = ProxyBaseLLMRequestProcessing(data=data)
     try:
         return await processor.base_process_llm_request(
             request=request,
@@ -587,10 +573,8 @@ async def index_create(
             detail=CommonProxyErrors.db_not_connected_error.value,
         )
     ## 1. check if index already exists
-    existing_index = (
-        await prisma_client.db.litellm_managedvectorstoreindextable.find_unique(
-            where={"index_name": index_create_request.index_name}
-        )
+    existing_index: Final = await ManagedVectorStoreIndexRepository(prisma_client).table.find_unique(
+        where={"index_name": index_create_request.index_name}
     )
 
     ## 2. set created_by and updated_by
@@ -602,11 +586,9 @@ async def index_create(
         )
 
     ## 2. create index
-    index_data = index_create_request.model_dump(exclude_none=True)
+    index_data: Final = index_create_request.model_dump(exclude_none=True)
     index_data["created_by"] = user_api_key_dict.user_id
     index_data["updated_by"] = user_api_key_dict.user_id
-    new_index = await prisma_client.db.litellm_managedvectorstoreindextable.create(
-        data=jsonify_object(index_data)
-    )
+    new_index = await ManagedVectorStoreIndexRepository(prisma_client).table.create(data=jsonify_object(index_data))
 
     return new_index.model_dump()

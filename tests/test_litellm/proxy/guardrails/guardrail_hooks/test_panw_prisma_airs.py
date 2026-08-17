@@ -1697,6 +1697,34 @@ class TestPanwAirsApplyGuardrail:
             )
 
     @pytest.mark.asyncio
+    async def test_apply_guardrail_warns_when_tool_results_scope_leaves_nothing_scannable(self, handler):
+        """scan_only_tool_results hands PANW a tool-role-only payload, but PANW's role
+        filter only scans user/system/developer rows: the silent no-op must warn."""
+        handler.scan_only_tool_results = True
+        inputs: GenericGuardrailAPIInputs = {
+            "texts": ["TOOL-RESULT"],
+            "structured_messages": [{"role": "tool", "tool_call_id": "call_1", "content": "TOOL-RESULT"}],
+        }
+        request_data = {"litellm_call_id": "test-call-id", "model": "gpt-4"}
+
+        with (
+            patch.object(handler, "_call_panw_api", new_callable=AsyncMock) as mock_api,
+            patch(
+                "litellm.proxy.guardrails.guardrail_hooks.panw_prisma_airs.panw_prisma_airs.verbose_proxy_logger.warning"
+            ) as mock_warning,
+        ):
+            result = await handler.apply_guardrail(
+                inputs=inputs,
+                request_data=request_data,
+                input_type="request",
+            )
+
+        mock_api.assert_not_called()
+        assert result["texts"] == ["TOOL-RESULT"]
+        warning_text = " ".join(str(arg) for c in mock_warning.call_args_list for arg in c.args)
+        assert "scan_only_tool_results" in warning_text
+
+    @pytest.mark.asyncio
     async def test_apply_guardrail_block(self, handler):
         """Test block action raises HTTPException(400)."""
         inputs: GenericGuardrailAPIInputs = {"texts": ["Malicious content"]}
@@ -5373,6 +5401,94 @@ class TestPanwAirsDualScanIndependence:
             assert te["metadata"]["tool_invoked"] == "file_reader"
             assert te["input"] == '{"path": "/etc/shadow"}'
             assert mcp_call.get("content") is None
+
+
+class TestPanwAirsTimeoutCoercion:
+    """Regression tests for string-valued timeout handling.
+
+    Before the fix, a string `timeout` (which is what the dashboard UI persists
+    and what raw YAML preserves if quoted) survived into httpx, which raised
+    `TypeError: '<=' not supported between instances of 'str' and 'int'`. The
+    broad except in apply_guardrail swallowed it and the proxy returned a
+    misleading 500 'Security scan failed - request blocked for safety'.
+    """
+
+    def test_handler_coerces_string_timeout_to_float(self):
+        handler = make_handler(timeout="30")
+        assert handler.timeout == 30.0
+        assert isinstance(handler.timeout, float)
+
+    def test_handler_accepts_int_timeout(self):
+        handler = make_handler(timeout=15)
+        assert handler.timeout == 15.0
+
+    def test_handler_accepts_float_timeout(self):
+        handler = make_handler(timeout=7.5)
+        assert handler.timeout == 7.5
+
+    def test_handler_none_timeout_falls_back_to_default(self):
+        handler = make_handler(timeout=None)
+        assert handler.timeout == 10.0
+
+    def test_handler_omitted_timeout_uses_default(self):
+        handler = make_handler()
+        assert handler.timeout == 10.0
+
+    def test_litellm_params_coerces_string_timeout(self):
+        """Boundary validation: the Pydantic model itself should normalize
+        string timeouts before any handler reads the value via model_dump()."""
+        params = LitellmParams(
+            guardrail="panw_prisma_airs",
+            mode="pre_call",
+            api_key="test_key",
+            profile_name="test_profile",
+            timeout="30",
+        )
+        assert params.timeout == 30.0
+        assert isinstance(params.timeout, float)
+
+    def test_litellm_params_rejects_garbage_timeout(self):
+        with pytest.raises(ValueError):
+            LitellmParams(
+                guardrail="panw_prisma_airs",
+                mode="pre_call",
+                api_key="test_key",
+                profile_name="test_profile",
+                timeout="not-a-number",
+            )
+
+    def test_litellm_params_empty_string_timeout_becomes_none(self):
+        """Empty-string timeout (which the dashboard form can send) should
+        be coerced to None, not crash, and not produce float('')."""
+        params = LitellmParams(
+            guardrail="panw_prisma_airs",
+            mode="pre_call",
+            api_key="test_key",
+            profile_name="test_profile",
+            timeout="",
+        )
+        assert params.timeout is None
+
+    def test_legacy_initializer_handles_unset_timeout(self):
+        """Regression guard: with timeout now a declared Optional[float] = None
+        on BaseLitellmParams, the legacy panw initializer at
+        guardrail_initializers.py:220 must not crash on float(None) when the
+        caller omits timeout entirely."""
+        from litellm.proxy.guardrails.guardrail_initializers import (
+            initialize_panw_prisma_airs,
+        )
+
+        params = LitellmParams(
+            guardrail="panw_prisma_airs",
+            mode="pre_call",
+            api_key="test_key",
+            profile_name="test_profile",
+            # timeout intentionally omitted - field defaults to None
+        )
+        guardrail_config = {"guardrail_name": "test_legacy"}
+        handler = initialize_panw_prisma_airs(params, guardrail_config)
+        # Default fallback applied, not crashed on float(None)
+        assert handler.timeout == 10.0
 
 
 if __name__ == "__main__":

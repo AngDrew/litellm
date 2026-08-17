@@ -24,7 +24,6 @@ const ModelConnectionTest: React.FC<ModelConnectionTestProps> = ({
   onTestComplete,
 }) => {
   const [error, setError] = React.useState<Error | string | null>(null);
-  const [rawRequest, setRawRequest] = React.useState<any>(null);
   const [rawResponse, setRawResponse] = React.useState<any>(null);
   const [isLoading, setIsLoading] = React.useState<boolean>(true);
   const [isSuccess, setIsSuccess] = React.useState<boolean>(false);
@@ -34,7 +33,6 @@ const ModelConnectionTest: React.FC<ModelConnectionTestProps> = ({
     setIsLoading(true);
     setShowDetails(false);
     setError(null);
-    setRawRequest(null);
     setRawResponse(null);
     setIsSuccess(false);
 
@@ -42,20 +40,16 @@ const ModelConnectionTest: React.FC<ModelConnectionTestProps> = ({
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     try {
-      console.log("Testing connection with form values:", formValues);
       const result = await prepareModelAddRequest(formValues, accessToken, null);
 
       if (!result) {
-        console.log("No result from prepareModelAddRequest");
         setError("Failed to prepare model data. Please check your form inputs.");
         setIsSuccess(false);
         setIsLoading(false);
         return;
       }
 
-      console.log("Result from prepareModelAddRequest:", result);
-
-      const { litellmParamsObj, modelInfoObj, modelName: returnedModelName } = result[0];
+      const { litellmParamsObj, modelInfoObj } = result[0];
 
       const response = await testConnectionRequest(accessToken, litellmParamsObj, modelInfoObj, modelInfoObj?.mode);
       if (response.status === "success") {
@@ -65,7 +59,6 @@ const ModelConnectionTest: React.FC<ModelConnectionTestProps> = ({
       } else {
         const errorMessage = response.result?.error || response.message || "Unknown error";
         setError(errorMessage);
-        setRawRequest(litellmParamsObj);
         setRawResponse(response.result?.raw_request_typed_dict);
         setIsSuccess(false);
       }
@@ -181,7 +174,11 @@ ${formattedBody}
               <path d="M512 64C264.6 64 64 264.6 64 512s200.6 448 448 448 448-200.6 448-448S759.4 64 512 64zm193.5 301.7l-210.6 292a31.8 31.8 0 01-51.7 0L318.5 484.9c-3.8-5.3 0-12.7 6.5-12.7h46.9c10.2 0 19.9 4.9 25.9 13.3l71.2 98.8 157.2-218c6-8.3 15.6-13.3 25.9-13.3H699c6.5 0 10.3 7.4 6.5 12.7z"></path>
             </svg>
           </div>
-          <Text data-testid="connection-success-msg" type="success" style={{ fontSize: "18px", fontWeight: 500, marginLeft: "10px" }}>
+          <Text
+            data-testid="connection-success-msg"
+            type="success"
+            style={{ fontSize: "18px", fontWeight: 500, marginLeft: "10px" }}
+          >
             Connection to {modelName} successful!
           </Text>
         </div>

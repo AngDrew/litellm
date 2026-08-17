@@ -2,8 +2,20 @@ import { InfoCircleOutlined, UserAddOutlined } from "@ant-design/icons";
 import { useQueryClient } from "@tanstack/react-query";
 import { useOrganizations } from "@/app/(dashboard)/hooks/organizations/useOrganizations";
 import { Accordion, AccordionBody, AccordionHeader, SelectItem, TextInput } from "@tremor/react";
-import { Alert, Button, Checkbox, Form, Input, Modal, Select, Select as Select2, Space, Tooltip, Typography } from "antd";
-import React, { useEffect, useMemo, useState } from "react";
+import {
+  Alert,
+  Button,
+  Checkbox,
+  Form,
+  Input,
+  Modal,
+  Select,
+  Select as Select2,
+  Space,
+  Tooltip,
+  Typography,
+} from "antd";
+import React, { useEffect, useState } from "react";
 import BulkCreateUsers from "./bulk_create_users_button";
 import TeamDropdown from "./common_components/team_dropdown";
 import { getModelDisplayName } from "./key_team_helpers/fetch_available_models_team_key";
@@ -17,7 +29,7 @@ import {
 } from "./networking";
 import OnboardingModal, { InvitationLink } from "./onboarding_link";
 const { Option } = Select;
-const { Text, Link, Title } = Typography;
+const { Text, Link } = Typography;
 // Helper function to generate UUID compatible across all environments
 const generateUUID = (): string => {
   if (typeof crypto !== "undefined" && crypto.randomUUID) {
@@ -68,11 +80,6 @@ export const CreateUserButton: React.FC<CreateuserProps> = ({
   const { data: organizations = [] } = useOrganizations();
 
   // Derive teams from the user's organizations, falling back to the teams prop
-  const availableTeams = useMemo(() => {
-    const orgTeams = organizations.flatMap((org) => org.teams || []);
-    if (orgTeams.length > 0) return orgTeams;
-    return teams || [];
-  }, [organizations, teams]);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -225,11 +232,7 @@ export const CreateUserButton: React.FC<CreateuserProps> = ({
           <Input.TextArea rows={4} placeholder="Enter metadata as JSON" />
         </Form.Item>
 
-        <Form.Item
-          label="Send invitation email"
-          name="send_invite_email"
-          valuePropName="checked"
-        >
+        <Form.Item label="Send invitation email" name="send_invite_email" valuePropName="checked">
           <Checkbox />
         </Form.Item>
 
@@ -335,11 +338,7 @@ export const CreateUserButton: React.FC<CreateuserProps> = ({
           <Form.Item label="Metadata" name="metadata">
             <Input.TextArea rows={4} placeholder="Enter metadata as JSON" />
           </Form.Item>
-          <Form.Item
-            label="Send invitation email"
-            name="send_invite_email"
-            valuePropName="checked"
-          >
+          <Form.Item label="Send invitation email" name="send_invite_email" valuePropName="checked">
             <Checkbox />
           </Form.Item>
           <Accordion>

@@ -12,11 +12,9 @@ export const rolesWithWriteAccess = ["Internal User", "Admin", "proxy_admin"];
 // other pages whose primary purpose is configuration/management read-only.
 // Per the Admin Viewer principle: read parity with Proxy Admin, no writes,
 // no cost-incurring actions (Playground stays gated by `rolesWithWriteAccess`).
-export const rolesAllowedToViewWriteScopedPages = [
-  ...rolesWithWriteAccess,
-  "Admin Viewer",
-  "proxy_admin_viewer",
-];
+export const rolesAllowedToViewWriteScopedPages = [...rolesWithWriteAccess, "Admin Viewer", "proxy_admin_viewer"];
+export const viewOnlyRoles = ["Admin Viewer", "Internal Viewer"];
+export const isViewOnlyRole = (role: string): boolean => viewOnlyRoles.includes(role);
 
 // Helper function to check if a role is in all_admin_roles
 export const isAdminRole = (role: string): boolean => {
@@ -50,8 +48,6 @@ export const formatUserRole = (userRole: string): string => {
       return "App Owner";
     case "demo_app_owner":
       return "App Owner";
-    case "app_admin":
-      return "Admin";
     case "proxy_admin":
       return "Admin";
     case "proxy_admin_viewer":
@@ -69,3 +65,15 @@ export const formatUserRole = (userRole: string): string => {
       return "Unknown Role";
   }
 };
+
+const viewOnlyRawRoles = ["proxy_admin_viewer", "internal_user_viewer", "internal_viewer"];
+
+export const effectiveSessionRole = (rawUserRole?: string): string => {
+  if (rawUserRole?.toLowerCase() === "proxy_admin_viewer") {
+    return "Admin";
+  }
+  return formatUserRole(rawUserRole ?? "");
+};
+
+export const isViewOnlySessionRole = (rawUserRole?: string): boolean =>
+  viewOnlyRawRoles.includes(rawUserRole?.toLowerCase() ?? "");

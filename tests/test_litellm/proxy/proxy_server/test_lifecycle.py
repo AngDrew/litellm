@@ -9,7 +9,6 @@ Pins covered:
 - ``initialize``
 - ``load_from_azure_key_vault``
 - ``cost_tracking``
-- ``check_request_disconnection``
 - ``_resolve_typed_dict_type``
 - ``_resolve_pydantic_type``
 - ``get_litellm_model_info``
@@ -21,21 +20,22 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import os
 from typing import List, Optional, Union
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 from typing_extensions import TypedDict
 
 import litellm.proxy.proxy_server as ps
 from litellm.proxy.proxy_server import (
+    ProxyStartupEvent,
     _initialize_shared_aiohttp_session,
     _resolve_pydantic_type,
     _resolve_typed_dict_type,
-    check_request_disconnection,
     cleanup_router_config_variables,
     cost_tracking,
     get_litellm_model_info,
@@ -126,6 +126,66 @@ async def test_proxy_shutdown_event_disconnects_prisma_and_resets(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_proxy_shutdown_drains_gateway_requests_before_disconnecting(monkeypatch):
+    """
+    The gateway request fold lives in memory, so shutdown drains it to the database.
+
+    That drain has to happen while prisma is still connected: a write attempted
+    after ``disconnect()`` raises ClientNotConnectedError, the flush swallows it
+    and merges the counts back onto an accumulator the process is about to
+    discard, and the final interval is lost silently on every restart. Ordering is
+    the whole behavior here, so assert the order rather than that both ran.
+    """
+    calls: list = []  # mutable-ok: records call order, which is the assertion
+
+    fake_prisma = MagicMock()
+    fake_prisma.disconnect = AsyncMock(side_effect=lambda: calls.append("disconnect"))
+    monkeypatch.setattr(ps, "prisma_client", fake_prisma, raising=False)
+
+    async def _record_flush(client, accumulator):
+        calls.append("flush")
+        assert client is fake_prisma
+
+    monkeypatch.setattr(ps, "flush_gateway_requests", _record_flush, raising=False)
+
+    fake_jwt = MagicMock()
+    fake_jwt.close = AsyncMock()
+    monkeypatch.setattr(ps, "jwt_handler", fake_jwt, raising=False)
+    monkeypatch.setattr(ps, "db_writer_client", None, raising=False)
+
+    import litellm
+
+    monkeypatch.setattr(litellm, "cache", None, raising=False)
+    monkeypatch.setattr(litellm, "success_callback", [], raising=False)
+
+    await proxy_shutdown_event()
+
+    assert calls == ["flush", "disconnect"]
+
+
+@pytest.mark.asyncio
+async def test_proxy_shutdown_skips_gateway_flush_without_a_database(monkeypatch):
+    """No prisma client means nothing to drain to, and no attempt is made."""
+    flush = AsyncMock()
+    monkeypatch.setattr(ps, "flush_gateway_requests", flush, raising=False)
+    monkeypatch.setattr(ps, "prisma_client", None, raising=False)
+
+    fake_jwt = MagicMock()
+    fake_jwt.close = AsyncMock()
+    monkeypatch.setattr(ps, "jwt_handler", fake_jwt, raising=False)
+    monkeypatch.setattr(ps, "db_writer_client", None, raising=False)
+
+    import litellm
+
+    monkeypatch.setattr(litellm, "cache", None, raising=False)
+    monkeypatch.setattr(litellm, "success_callback", [], raising=False)
+
+    await proxy_shutdown_event()
+
+    assert flush.await_count == 0
+
+
+@pytest.mark.asyncio
 async def test_proxy_shutdown_event_prisma_disconnect_raises_error(monkeypatch):
     fake_prisma = MagicMock()
     fake_prisma.disconnect = AsyncMock(side_effect=RuntimeError("db gone"))
@@ -212,6 +272,145 @@ def test_save_worker_config_invalid_no_kwargs_yields_empty(monkeypatch):
 
     save_worker_config()
     assert os.environ["WORKER_CONFIG"] == "{}"
+
+
+# ---------------------------------------------------------------------------
+# _redact_worker_config_for_logging (LIT-4152)
+# ---------------------------------------------------------------------------
+
+
+_LIT4152_SECRETS = (
+    "sk-lit4152-regression-master-key-abcdef1234567890",
+    "leak_password_9090",
+    "sk-lit4152-provider-api-key-abcdef",
+    "postgresql://leak_user:leak_password_9090@leak-host.internal:5432/leak_db",
+)
+
+
+def _lit4152_worker_config_dict():
+    return {
+        "model": "openai/gpt-4o-mini",
+        "config": "/tmp/c.yaml",
+        "master_key": _LIT4152_SECRETS[0],
+        "database_url": _LIT4152_SECRETS[3],
+        "api_key": _LIT4152_SECRETS[2],
+        "telemetry": True,
+    }
+
+
+def test__redact_worker_config_for_logging_dict_masks_all_secret_shapes():
+    """LIT-4152 regression: dict-form worker_config must not embed any raw
+    secret. Covers the segment-matched fields (`master_key`, `api_key`) and the
+    URL-with-credentials field (`database_url`), which the segment masker
+    misses because neither segment matches its sensitive-pattern set.
+    """
+    from litellm.proxy.proxy_server import _redact_worker_config_for_logging
+
+    redacted = _redact_worker_config_for_logging(_lit4152_worker_config_dict())
+    rendered = repr(redacted)
+    for secret in _LIT4152_SECRETS:
+        assert secret not in rendered, f"leak: {secret} in {rendered!r}"
+    assert isinstance(redacted, dict)
+    assert redacted["model"] == "openai/gpt-4o-mini"
+    assert redacted["telemetry"] is True
+
+
+def test__redact_worker_config_for_logging_json_string_round_trips_masked():
+    """Docker/K8s deployments hand the proxy a JSON string via ``WORKER_CONFIG``.
+    Confirm the string path also masks and that the returned value re-parses
+    into a dict with the sensitive fields masked.
+    """
+    from litellm.proxy.proxy_server import _redact_worker_config_for_logging
+
+    payload = json.dumps(_lit4152_worker_config_dict())
+    redacted = _redact_worker_config_for_logging(payload)
+    assert isinstance(redacted, str)
+    for secret in _LIT4152_SECRETS:
+        assert secret not in redacted, f"leak: {secret} in {redacted!r}"
+    parsed = json.loads(redacted)
+    assert parsed["model"] == "openai/gpt-4o-mini"
+
+
+def test__redact_worker_config_for_logging_passthrough_for_none_and_non_json_string():
+    """Non-dict, non-JSON-parseable string is passed through verbatim (nothing
+    to mask) and ``None`` returns ``None``.
+    """
+    from litellm.proxy.proxy_server import _redact_worker_config_for_logging
+
+    assert _redact_worker_config_for_logging(None) is None
+    assert _redact_worker_config_for_logging("/tmp/some_config.yaml") == "/tmp/some_config.yaml"
+
+
+def test__redact_worker_config_for_logging_masks_non_string_url_webhook_values():
+    """The URL/webhook fields the segment masker cannot catch by key name
+    (``alert_to_webhook_url``, ``pass_through_endpoints``,
+    ``database_extra_connection_params``) can hold non-string shapes:
+    ``alert_to_webhook_url`` is typed as ``Optional[Dict]`` and can nest
+    secret query params under keys the segment masker also misses. Confirm
+    the whole value is replaced regardless of shape so a nested webhook or
+    Bearer token under a non-segment-matched key does not slip through.
+    """
+    from litellm.proxy.proxy_server import _redact_worker_config_for_logging
+
+    nested_webhook_secret = "https://hooks.slack.com/services/T0/B0/nested-webhook-secret-xyz"
+    data = {
+        "master_key": "sk-should-be-masked",
+        "alert_to_webhook_url": {"budget_alerts": nested_webhook_secret},
+        "pass_through_endpoints": [
+            {
+                "path": "/upstream",
+                "target": "https://api.provider.com",
+                "headers": {"Authorization": "Bearer nested-token-should-be-gone"},
+            }
+        ],
+        "database_extra_connection_params": {"password": "extra-db-password-abc"},
+    }
+    redacted = _redact_worker_config_for_logging(data)
+    rendered = repr(redacted)
+    for secret in (
+        "sk-should-be-masked",
+        nested_webhook_secret,
+        "nested-token-should-be-gone",
+        "extra-db-password-abc",
+    ):
+        assert secret not in rendered, f"leak: {secret} in {rendered!r}"
+
+
+def test__redact_worker_config_for_logging_masks_nested_secret_fields():
+    """LIT-4152 nested regression: the URL/webhook credential fields the segment
+    masker cannot catch by name (``database_url``,
+    ``database_extra_connection_params``, ``pass_through_endpoints``,
+    ``alert_to_webhook_url``) must be redacted at any depth, not just the top
+    level. A worker_config that nests ``general_settings`` under a parent key
+    must not leak a nested ``database_url`` or webhook secret; the earlier
+    top-level-only redaction would have passed these through raw.
+    """
+    from litellm.proxy.proxy_server import _redact_worker_config_for_logging
+
+    nested_db_url = "postgresql://nested_user:nested_pw_4152@nested-host:5432/db"
+    nested_webhook = "https://hooks.slack.com/services/T0/B0/nested-4152-webhook"
+    nested_extra_pw = "nested-extra-conn-pw-4152"
+    nested_bearer = "Bearer nested-passthrough-token-4152"
+    data = {
+        "config": {
+            "general_settings": {
+                "database_url": nested_db_url,
+                "database_extra_connection_params": {"password": nested_extra_pw},
+                "alert_to_webhook_url": {"budget_alerts": nested_webhook},
+                "pass_through_endpoints": [
+                    {"path": "/up", "headers": {"Authorization": nested_bearer}}
+                ],
+            }
+        }
+    }
+    redacted = _redact_worker_config_for_logging(data)
+    rendered = repr(redacted)
+    for secret in (nested_db_url, nested_webhook, nested_extra_pw, nested_bearer):
+        assert secret not in rendered, f"nested leak: {secret} in {rendered!r}"
+
+    inner = redacted["config"]["general_settings"]
+    assert inner["database_url"] == "REDACTED"
+    assert inner["pass_through_endpoints"] == "REDACTED"
 
 
 # ---------------------------------------------------------------------------
@@ -322,62 +521,6 @@ def test_cost_tracking_no_op_when_prisma_missing(monkeypatch):
 
     assert litellm.callbacks == []
     assert litellm._async_success_callback == []
-
-
-# ---------------------------------------------------------------------------
-# check_request_disconnection
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_check_request_disconnection_cancels_task_and_raises_499(monkeypatch):
-    monkeypatch.setattr(ps.asyncio, "sleep", AsyncMock(return_value=None))
-
-    request = MagicMock()
-    request.is_disconnected = AsyncMock(return_value=True)
-    task = MagicMock()
-
-    raised_status = None
-    try:
-        await check_request_disconnection(request=request, llm_api_call_task=task)
-    except HTTPException as exc:
-        raised_status = exc.status_code
-
-    observed = {
-        "raised_status": raised_status,
-        "cancel_called": task.cancel.called,
-        "is_async": inspect.iscoroutinefunction(check_request_disconnection),
-    }
-    assert normalize(observed) == {
-        "raised_status": 499,
-        "cancel_called": True,
-        "is_async": True,
-    }
-
-
-@pytest.mark.asyncio
-async def test_check_request_disconnection_invalid_when_connected_times_out(monkeypatch):
-    """With a connected request the function loops for up to 10 minutes —
-    wrap in wait_for and assert it times out. Patch ``asyncio.sleep`` so the
-    loop spins without real wall-clock waits."""
-    import litellm.proxy.proxy_server as ps
-
-    request = MagicMock()
-    request.is_disconnected = AsyncMock(return_value=False)
-    task = MagicMock()
-
-    _real_sleep = asyncio.sleep
-
-    async def _instant_sleep(_seconds):
-        await _real_sleep(0)
-
-    monkeypatch.setattr(ps.asyncio, "sleep", _instant_sleep)
-
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(
-            check_request_disconnection(request=request, llm_api_call_task=task),
-            timeout=0.05,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -562,3 +705,75 @@ async def test_proxy_startup_event_invalid_missing_app_arg_raises():
         # no arguments — the decorator preserves the missing-arg TypeError.
         async with proxy_startup_event():  # type: ignore[call-arg]
             pass
+
+
+def test_otel_global_provider_published_after_callback_init():
+    """The OTel V2 global-provider publish must run after callback
+    initialization in ``proxy_startup_event``.
+
+    Regression for the orphan span: a preset (arize, langfuse, …) builds its
+    single folded logger during ``_initialize_startup_logging``. Publishing the
+    global ``TracerProvider`` before that ran found no logger and built a second
+    generic one whose provider became the global, so the FastAPI server span and
+    the preset's gen-ai spans exported through different providers and the LLM
+    span was orphaned. The publish (``publish_global_otel_v2_provider``) must
+    therefore appear after ``_initialize_startup_logging`` in the lifespan source.
+    """
+    wrapped = getattr(proxy_startup_event, "__wrapped__", proxy_startup_event)
+    source = inspect.getsource(wrapped)
+    init_pos = source.find("_initialize_startup_logging(")
+    publish_pos = source.find("publish_global_otel_v2_provider(")
+    assert init_pos != -1, "callback init call not found in proxy_startup_event"
+    assert publish_pos != -1, "OTEL global publish not found in proxy_startup_event"
+    assert init_pos < publish_pos, (
+        "OTEL global provider is published before callbacks are initialized; a "
+        "preset logger will not exist yet and a second generic logger will own "
+        "the global provider, orphaning gen-ai spans"
+    )
+
+
+def test_startup_warns_for_global_budget_without_database(caplog):
+    with caplog.at_level(logging.WARNING, logger="LiteLLM Proxy"):
+        ProxyStartupEvent._warn_budget_without_db(max_budget=100.0, prisma_client=None)
+
+    assert "litellm.max_budget=100.0" in caplog.text
+    assert "will NOT be enforced" in caplog.text
+    assert "requests will never be blocked" in caplog.text
+
+
+def test_startup_does_not_warn_for_global_budget_with_database(caplog):
+    with caplog.at_level(logging.WARNING, logger="LiteLLM Proxy"):
+        ProxyStartupEvent._warn_budget_without_db(max_budget=100.0, prisma_client=MagicMock())
+
+    assert "litellm.max_budget" not in caplog.text
+
+
+@pytest.mark.parametrize("max_budget", [0, None])
+def test_startup_does_not_warn_without_global_budget(caplog, max_budget):
+    with caplog.at_level(logging.WARNING, logger="LiteLLM Proxy"):
+        ProxyStartupEvent._warn_budget_without_db(max_budget=max_budget, prisma_client=None)
+
+    assert "litellm.max_budget" not in caplog.text
+
+
+def test_proxy_startup_event_warns_for_global_budget_without_database():
+    """Pin the lifespan call that prevents silent DB-less budgets.
+
+    The call must follow Prisma setup so DB-backed deployments do not false-positive.
+    Direct ``_warn_budget_without_db`` tests cover the warning behavior itself.
+    """
+    wrapped = getattr(proxy_startup_event, "__wrapped__", proxy_startup_event)
+    source = inspect.getsource(wrapped)
+    budget_check_pos = source.find("if prisma_client is not None and litellm.max_budget > 0:")
+    warn_pos = source.find("_warn_budget_without_db(")
+    next_startup_section_pos = source.find(
+        "await ProxyStartupEvent.initialize_scheduled_background_jobs(",
+        budget_check_pos,
+    )
+
+    assert budget_check_pos != -1, "global budget startup block not found"
+    assert warn_pos != -1, "DB-less budget warning call not found"
+    assert next_startup_section_pos != -1, "startup section after budget block not found"
+    assert budget_check_pos < warn_pos < next_startup_section_pos, (
+        "DB-less budget warning must run after Prisma setup and the DB-backed budget block"
+    )

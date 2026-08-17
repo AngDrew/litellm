@@ -1,6 +1,14 @@
 import React, { useState, useEffect } from "react";
 import { Button, Popconfirm, Modal, InputNumber, Space, Typography, Tag, Card, Tooltip, Divider } from "antd";
-import { ReloadOutlined, ClockCircleOutlined, StopOutlined, CloudOutlined, DatabaseOutlined, InfoCircleOutlined, WarningOutlined } from "@ant-design/icons";
+import {
+  ReloadOutlined,
+  ClockCircleOutlined,
+  StopOutlined,
+  CloudOutlined,
+  DatabaseOutlined,
+  InfoCircleOutlined,
+  WarningOutlined,
+} from "@ant-design/icons";
 import {
   reloadModelCostMap,
   scheduleModelCostMapReload,
@@ -52,9 +60,7 @@ const PriceDataReload: React.FC<PriceDataReloadProps> = ({
   const [showScheduleModal, setShowScheduleModal] = useState(false);
   const [hours, setHours] = useState<number>(6);
   const [reloadStatus, setReloadStatus] = useState<ReloadStatus | null>(null);
-  const [loadingStatus, setLoadingStatus] = useState(false);
   const [sourceInfo, setSourceInfo] = useState<CostMapSourceInfo | null>(null);
-  const [loadingSource, setLoadingSource] = useState(false);
 
   // Fetch status on component mount and periodically
   useEffect(() => {
@@ -73,11 +79,8 @@ const PriceDataReload: React.FC<PriceDataReloadProps> = ({
   const fetchReloadStatus = async () => {
     if (!accessToken) return;
 
-    setLoadingStatus(true);
     try {
-      console.log("Fetching reload status...");
       const status = await getModelCostMapReloadStatus(accessToken);
-      console.log("Received status:", status);
       setReloadStatus(status);
     } catch (error) {
       console.error("Failed to fetch reload status:", error);
@@ -88,22 +91,17 @@ const PriceDataReload: React.FC<PriceDataReloadProps> = ({
         last_run: null,
         next_run: null,
       });
-    } finally {
-      setLoadingStatus(false);
     }
   };
 
   const fetchSourceInfo = async () => {
     if (!accessToken) return;
 
-    setLoadingSource(true);
     try {
       const info = await getModelCostMapSource(accessToken);
       setSourceInfo(info);
     } catch (error) {
       console.error("Failed to fetch cost map source info:", error);
-    } finally {
-      setLoadingSource(false);
     }
   };
 

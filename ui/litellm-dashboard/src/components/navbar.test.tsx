@@ -1,5 +1,5 @@
 import userEvent from "@testing-library/user-event";
-import React, { useState } from "react";
+import React from "react";
 import { describe, expect, it, vi } from "vitest";
 import { renderWithProviders, screen, waitFor } from "../../tests/test-utils";
 import Navbar from "./navbar";
@@ -72,7 +72,10 @@ vi.mock("./Navbar/UserDropdown/UserDropdown", async (importOriginal) => {
 });
 
 vi.mock("@/utils/proxyUtils", () => ({
-  fetchProxySettings: vi.fn(),
+  fetchProxySettings: vi.fn().mockResolvedValue({
+    PROXY_BASE_URL: "",
+    PROXY_LOGOUT_URL: "https://example.com/logout",
+  }),
 }));
 
 // Mock CommunityEngagementButtons component
@@ -137,8 +140,6 @@ Object.defineProperty(window, "location", {
 
 describe("Navbar", () => {
   const defaultProps = {
-    proxySettings: {},
-    setProxySettings: vi.fn(),
     accessToken: "test-token",
     isPublicPage: false,
   };
@@ -149,6 +150,12 @@ describe("Navbar", () => {
     expect(screen.getByRole("button", { name: /^notifications$/i })).toBeInTheDocument();
     expect(screen.getByText("Docs")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /open account menu/i })).toBeInTheDocument();
+  });
+
+  it("should link the logo to the UI home route rather than the proxy origin", () => {
+    renderWithProviders(<Navbar {...defaultProps} />);
+
+    expect(screen.getByRole("link", { name: /litellm brand/i })).toHaveAttribute("href", "/ui");
   });
 
   it("should display user information in dropdown", async () => {
@@ -251,7 +258,7 @@ describe("Navbar", () => {
     expect(screen.queryByRole("button", { name: /^notifications$/i })).not.toBeInTheDocument();
   });
 
-  it("should handle hide new features toggle", async () => {
+  it("should handle hide new feature indicators toggle", async () => {
     const user = userEvent.setup();
 
     // Initially disabled
@@ -298,7 +305,9 @@ describe("Navbar", () => {
 
     const cookieUtils = vi.mocked(await import("@/utils/cookieUtils"));
     expect(cookieUtils.clearTokenCookies).toHaveBeenCalled();
-    expect(window.location.href).toBe("");
+    await waitFor(() => {
+      expect(window.location.href).toBe("https://example.com/logout");
+    });
   });
 
   it("should not render dark mode toggle slider", () => {
