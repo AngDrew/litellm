@@ -174,7 +174,7 @@ litellm_settings:
     - "litellm.proxy.hooks.tokenin.concurrency_queue.TokeninConcurrencyQueue"
   callback_specific_params:
     tokenin_concurrency_queue:
-      max_wait_seconds: 300
+      max_wait_seconds: 75
       enabled: true
   # max_budget: 100 
   # budget_duration: 30d

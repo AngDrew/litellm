@@ -33,11 +33,17 @@ class TokeninConcurrencyQueue(CustomLogger):
 
     def __init__(
         self,
-        max_wait_seconds: float = 300,
+        max_wait_seconds: float = 75,
         enabled: bool = True,
         time_provider: Optional[_TimeProvider] = None,
         **kwargs: Any,
     ) -> None:
+        """
+        max_wait_seconds defaults to 75s so a queued request always answers
+        (HTTP 429 with a body) BEFORE the Cloudflare edge / nginx ~100s
+        window. Waiting longer than the edge window turns a clean, retryable
+        429 into an empty 520/524/504 at the edge.
+        """
         super().__init__(**kwargs)
         self.max_wait_seconds = max_wait_seconds
         self.enabled = enabled
