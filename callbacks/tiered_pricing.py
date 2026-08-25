@@ -1,5 +1,6 @@
 import re
 import time
+from typing import Final
 
 from fastapi import HTTPException
 
@@ -132,3 +133,6 @@ class TieredPricingCallback(CustomLogger):
                 value=cost,
                 ttl=duration_seconds,
             )
+
+
+proxy_handler_instance: Final = TieredPricingCallback()

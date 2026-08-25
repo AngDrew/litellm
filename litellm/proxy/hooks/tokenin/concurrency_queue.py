@@ -1,7 +1,7 @@
 import asyncio
 import time
 import weakref
-from typing import Any, Dict, Optional, Protocol, Tuple
+from typing import Any, Dict, Final, Optional, Protocol, Tuple
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -200,3 +200,6 @@ class TokeninConcurrencyQueue(CustomLogger):
         if isinstance(metadata, dict):
             return metadata
         return None
+
+
+proxy_handler_instance: Final = TokeninConcurrencyQueue()

@@ -353,3 +353,22 @@ class TestYamlStorePromptsDbOverride:
         """_yaml_general_settings_keys should be empty on init."""
         proxy_config = ProxyConfig()
         assert proxy_config._yaml_general_settings_keys == set()
+
+
+def test_proxy_server_config_callbacks_resolve_to_instances():
+    from pathlib import Path
+
+    import yaml
+
+    from litellm.integrations.custom_logger import CustomLogger
+    from litellm.proxy.types_utils.utils import get_instance_fn
+
+    config_path = Path(__file__).parents[2] / "proxy_server_config.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    callback_entries = config["litellm_settings"]["callbacks"]
+    callbacks = tuple(get_instance_fn(entry, str(config_path)) for entry in callback_entries)
+
+    assert all(isinstance(callback, CustomLogger) for callback in callbacks)
+    assert type(callbacks[1]).__name__ == "TokeninConcurrencyQueue"
+    assert callbacks[1].max_wait_seconds == 75
+    assert callbacks[1].enabled is True
