@@ -500,6 +500,37 @@ class RateLimitError(openai.RateLimitError):
         return _message
 
 
+class MaxParallelRequestsError(RateLimitError):
+    """
+    Raised by the router when a deployment's ``max_parallel_requests`` /
+    ``provider_max_parallel_requests`` semaphore is saturated and the request
+    would otherwise have to block waiting for a slot.
+
+    The router deliberately does NOT block here: a blocking acquire lets
+    requests pile up behind the cap and silently multiplies effective
+    concurrency. Raising a ``RateLimitError`` subclass instead means the
+    standard fallback machinery diverts the request to another deployment /
+    model group (``default_fallbacks``), and the proxy surfaces a clean 429
+    when no capacity exists anywhere.
+    """
+
+    def __init__(
+        self,
+        message,
+        model,
+        llm_provider="",
+        **kwargs,
+    ):
+        super().__init__(
+            message=message,
+            llm_provider=llm_provider,
+            model=model,
+            category=RateLimitErrorCategory.LITELLM_RATE_LIMIT,
+            rate_limit_type=RateLimitType.CONCURRENT_REQUESTS,
+            **kwargs,
+        )
+
+
 # sub class of rate limit error - meant to give more granularity for error handling context window exceeded errors
 class ContextWindowExceededError(BadRequestError):
     def __init__(
@@ -942,6 +973,7 @@ LITELLM_EXCEPTION_TYPES: Final = [
     Timeout,
     PermissionDeniedError,
     RateLimitError,
+    MaxParallelRequestsError,
     ContextWindowExceededError,
     RejectedRequestError,
     ContentPolicyViolationError,

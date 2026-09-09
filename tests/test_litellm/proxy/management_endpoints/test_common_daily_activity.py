@@ -304,6 +304,7 @@ async def test_get_daily_activity_aggregated_masks_providers_for_user_endpoint()
         "compression_saved_tokens": 0,
         "compression_savings_spend": 0,
         "prompt_caching_savings_spend": 0,
+        "gateway_injected_caching_savings_spend": 0,
         "autorouter_savings_spend": 0,
         "failed_requests": 0,
         "successful_requests": 0,

@@ -1347,6 +1347,7 @@ from .exceptions import (
     RateLimitError,
     RateLimitErrorCategory,
     RateLimitType,
+    MaxParallelRequestsError,
     ServiceUnavailableError,
     BadGatewayError,
     OpenAIError,

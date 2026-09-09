@@ -4806,6 +4806,7 @@ def calculate_max_parallel_requests(
     rpm: int | None,
     tpm: int | None,
     default_max_parallel_requests: int | None,
+    provider_max_parallel_requests: int | None = None,
 ) -> int | None:
     """
     Returns the max parallel requests to send to a deployment.
@@ -4817,12 +4818,14 @@ def calculate_max_parallel_requests(
     - rpm - Optional[int] - requests per minute allowed for that deployment
     - tpm - Optional[int] - tokens per minute allowed for that deployment
     - default_max_parallel_requests - Optional[int] - default_max_parallel_requests allowed for any deployment
+    - provider_max_parallel_requests - Optional[int] - max parallel requests shared across all
+      deployments pointing at the same provider (same api_base + api_key).
 
     Returns:
     - int or None (if all params are None)
 
     Order:
-    max_parallel_requests > rpm > tpm / 6 (azure formula) > default max_parallel_requests
+    provider_max_parallel_requests > max_parallel_requests > rpm > tpm / 6 (azure formula) > default max_parallel_requests
 
     Azure RPM formula:
     6 rpm per 1000 TPM
@@ -4830,6 +4833,8 @@ def calculate_max_parallel_requests(
 
 
     """
+    if provider_max_parallel_requests is not None:
+        return provider_max_parallel_requests
     if max_parallel_requests is not None:
         return max_parallel_requests
     elif rpm is not None:

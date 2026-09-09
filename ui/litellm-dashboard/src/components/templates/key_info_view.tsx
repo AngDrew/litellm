@@ -10,7 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Meter, MeterIndicator, MeterTrack } from "@/components/ui/meter";
+import { Meter, MeterIndicator, MeterTrack } from "@/components/shared/Meter";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { EntityLink } from "@/components/shared/EntityLink";
 import { modelGroupHref, teamDetailHref } from "@/utils/entityLinks";

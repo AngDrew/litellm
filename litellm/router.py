@@ -22,6 +22,7 @@ import traceback
 import weakref
 from collections import defaultdict
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator, Mapping, Sequence
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional, TypeAlias, TypeVar, Union, cast
@@ -794,7 +795,6 @@ class Router:
         self.cache = DualCache(
             redis_cache=redis_cache, in_memory_cache=InMemoryCache()
         )  # use a dual cache (Redis+In-Memory) for tracking cooldowns, usage, etc.
-        self._deployment_capacity_changed = asyncio.Event()
 
         ### SCHEDULER ###
         self.scheduler = Scheduler(polling_interval=polling_interval, redis_cache=redis_cache)
@@ -3233,10 +3233,13 @@ class Router:
             input_kwargs.pop("silent_model", None)
             input_kwargs.pop("include_fallback_errors", None)
 
-            _response: Final = litellm.acompletion(**input_kwargs)
-
             logging_obj: Final[LiteLLMLogging | None] = kwargs.get("litellm_logging_obj", None)
 
+            # Acquire the max_parallel_requests slot BEFORE creating the
+            # response coroutine: on saturation we raise MaxParallelRequestsError
+            # instead of blocking (blocking is what let a saturated provider
+            # absorb unbounded concurrency), and no unawaited coroutine is left
+            # behind. Streaming keeps its slot via on_close below.
             rpm_semaphore: Final = self._get_client(
                 deployment=deployment,
                 kwargs=kwargs,
@@ -3246,7 +3249,13 @@ class Router:
             release_deployment_slot = holds_deployment_slot
 
             if holds_deployment_slot:
-                await rpm_semaphore.acquire()
+                await self._acquire_mpr_slot_or_raise(
+                    rpm_semaphore=rpm_semaphore,
+                    deployment=deployment,
+                    request_kwargs=kwargs,
+                )
+
+            _response: Final = litellm.acompletion(**input_kwargs)
             try:
                 await self.async_routing_strategy_pre_call_checks(
                     deployment=deployment,
@@ -3275,9 +3284,7 @@ class Router:
                     await response.fetch_stream()
 
                 self.success_calls[model_name] += 1
-                verbose_router_logger.info(
-                    "litellm.acompletion(model=%s)\x1b[32m 200 OK\x1b[0m", model_name
-                )
+                verbose_router_logger.info("litellm.acompletion(model=%s)\x1b[32m 200 OK\x1b[0m", model_name)
                 self._track_deployment_metrics(
                     deployment=deployment,
                     response=response,
@@ -4159,16 +4166,6 @@ class Router:
             )
 
             self.total_calls[model_name] += 1
-            response = litellm.aimage_generation(
-                **{
-                    **data,
-                    "prompt": prompt,
-                    "caching": self.cache_responses,
-                    "client": model_client,
-                    **kwargs,
-                }
-            )
-
             ### CONCURRENCY-SAFE RPM CHECKS ###
             rpm_semaphore: Final = self._get_client(
                 deployment=deployment,
@@ -4176,17 +4173,16 @@ class Router:
                 client_type="max_parallel_requests",
             )
 
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
-                async with rpm_semaphore:
-                    """
-                    - Check rpm limits before making the call
-                    - If allowed, increment the rpm limit (allows global value to be updated, concurrency-safe)
-                    """
-                    await self.async_routing_strategy_pre_call_checks(
-                        deployment=deployment, parent_otel_span=parent_otel_span
-                    )
-                    response = await response
-            else:
+            async with self._mpr_capacity_guard(rpm_semaphore, deployment, kwargs):
+                response = litellm.aimage_generation(
+                    **{
+                        **data,
+                        "prompt": prompt,
+                        "caching": self.cache_responses,
+                        "client": model_client,
+                        **kwargs,
+                    }
+                )
                 await self.async_routing_strategy_pre_call_checks(
                     deployment=deployment, parent_otel_span=parent_otel_span
                 )
@@ -4263,16 +4259,6 @@ class Router:
             )
 
             self.total_calls[model_name] += 1
-            response = litellm.atranscription(
-                **{
-                    **data,
-                    "file": file,
-                    "caching": self.cache_responses,
-                    "client": model_client,
-                    **kwargs,
-                }
-            )
-
             ### CONCURRENCY-SAFE RPM CHECKS ###
             rpm_semaphore: Final = self._get_client(
                 deployment=deployment,
@@ -4280,17 +4266,16 @@ class Router:
                 client_type="max_parallel_requests",
             )
 
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
-                async with rpm_semaphore:
-                    """
-                    - Check rpm limits before making the call
-                    - If allowed, increment the rpm limit (allows global value to be updated, concurrency-safe)
-                    """
-                    await self.async_routing_strategy_pre_call_checks(
-                        deployment=deployment, parent_otel_span=parent_otel_span
-                    )
-                    response = await response
-            else:
+            async with self._mpr_capacity_guard(rpm_semaphore, deployment, kwargs):
+                response = litellm.atranscription(
+                    **{
+                        **data,
+                        "file": file,
+                        "caching": self.cache_responses,
+                        "client": model_client,
+                        **kwargs,
+                    }
+                )
                 await self.async_routing_strategy_pre_call_checks(
                     deployment=deployment, parent_otel_span=parent_otel_span
                 )
@@ -4377,16 +4362,6 @@ class Router:
             )
 
             self.total_calls[model_name] += 1
-            response = litellm.aspeech(
-                **{
-                    **data,
-                    "input": input,
-                    "voice": voice,
-                    "client": model_client,
-                    **kwargs,
-                }
-            )
-
             ### CONCURRENCY-SAFE RPM CHECKS ###
             rpm_semaphore: Final = self._get_client(
                 deployment=deployment,
@@ -4394,17 +4369,16 @@ class Router:
                 client_type="max_parallel_requests",
             )
 
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
-                async with rpm_semaphore:
-                    """
-                    - Check rpm limits before making the call
-                    - If allowed, increment the rpm limit (allows global value to be updated, concurrency-safe)
-                    """
-                    await self.async_routing_strategy_pre_call_checks(
-                        deployment=deployment, parent_otel_span=parent_otel_span
-                    )
-                    response = await response
-            else:
+            async with self._mpr_capacity_guard(rpm_semaphore, deployment, kwargs):
+                response = litellm.aspeech(
+                    **{
+                        **data,
+                        "input": input,
+                        "voice": voice,
+                        "client": model_client,
+                        **kwargs,
+                    }
+                )
                 await self.async_routing_strategy_pre_call_checks(
                     deployment=deployment, parent_otel_span=parent_otel_span
                 )
@@ -4570,33 +4544,22 @@ class Router:
             )
             self.total_calls[model_name] += 1
 
-            response = litellm.atext_completion(
-                **{
-                    **data,
-                    "prompt": prompt,
-                    "caching": self.cache_responses,
-                    "client": model_client,
-                    **kwargs,
-                }
-            )
-
             rpm_semaphore: Final = self._get_client(
                 deployment=deployment,
                 kwargs=kwargs,
                 client_type="max_parallel_requests",
             )
 
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
-                async with rpm_semaphore:
-                    """
-                    - Check rpm limits before making the call
-                    - If allowed, increment the rpm limit (allows global value to be updated, concurrency-safe)
-                    """
-                    await self.async_routing_strategy_pre_call_checks(
-                        deployment=deployment, parent_otel_span=parent_otel_span
-                    )
-                    response = await response
-            else:
+            async with self._mpr_capacity_guard(rpm_semaphore, deployment, kwargs):
+                response = litellm.atext_completion(
+                    **{
+                        **data,
+                        "prompt": prompt,
+                        "caching": self.cache_responses,
+                        "client": model_client,
+                        **kwargs,
+                    }
+                )
                 await self.async_routing_strategy_pre_call_checks(
                     deployment=deployment, parent_otel_span=parent_otel_span
                 )
@@ -4660,33 +4623,22 @@ class Router:
             )
             self.total_calls[model_name] += 1
 
-            response = litellm.aadapter_completion(
-                **{
-                    **data,
-                    "adapter_id": adapter_id,
-                    "caching": self.cache_responses,
-                    "client": model_client,
-                    **kwargs,
-                }
-            )
-
             rpm_semaphore: Final = self._get_client(
                 deployment=deployment,
                 kwargs=kwargs,
                 client_type="max_parallel_requests",
             )
 
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
-                async with rpm_semaphore:
-                    """
-                    - Check rpm limits before making the call
-                    - If allowed, increment the rpm limit (allows global value to be updated, concurrency-safe)
-                    """
-                    await self.async_routing_strategy_pre_call_checks(
-                        deployment=deployment, parent_otel_span=parent_otel_span
-                    )
-                    response = await response
-            else:
+            async with self._mpr_capacity_guard(rpm_semaphore, deployment, kwargs):
+                response = litellm.aadapter_completion(
+                    **{
+                        **data,
+                        "adapter_id": adapter_id,
+                        "caching": self.cache_responses,
+                        "client": model_client,
+                        **kwargs,
+                    }
+                )
                 await self.async_routing_strategy_pre_call_checks(
                     deployment=deployment, parent_otel_span=parent_otel_span
                 )
@@ -4929,8 +4881,9 @@ class Router:
             if custom_llm_provider is not None:
                 response_kwargs["custom_llm_provider"] = custom_llm_provider
 
-            response = original_generic_function(**response_kwargs)
-
+            # Acquire the max_parallel_requests slot BEFORE creating the
+            # response coroutine: on saturation we raise MaxParallelRequestsError
+            # instead of blocking, and no unawaited coroutine is left behind.
             rpm_semaphore: Final = self._get_client(
                 deployment=deployment,
                 kwargs=kwargs,
@@ -4940,8 +4893,13 @@ class Router:
             release_deployment_slot = holds_deployment_slot
 
             if holds_deployment_slot:
-                await rpm_semaphore.acquire()
+                await self._acquire_mpr_slot_or_raise(
+                    rpm_semaphore=rpm_semaphore,
+                    deployment=deployment,
+                    request_kwargs=kwargs,
+                )
             try:
+                response = original_generic_function(**response_kwargs)
                 await self.async_routing_strategy_pre_call_checks(
                     deployment=deployment, parent_otel_span=parent_otel_span
                 )
@@ -4957,9 +4915,7 @@ class Router:
                     BaseResponsesAPIStreamingIterator,
                 )
 
-                if holds_deployment_slot and isinstance(
-                    response, BaseResponsesAPIStreamingIterator
-                ):
+                if holds_deployment_slot and isinstance(response, BaseResponsesAPIStreamingIterator):
                     release_deployment_slot = False
                     setattr(
                         response,
@@ -5021,12 +4977,8 @@ class Router:
 
         response: Final = await self._ageneric_api_call_with_fallbacks(original_function=original_function, **kwargs)
 
-        if kwargs.get("stream") and isinstance(
-            response, BaseResponsesAPIStreamingIterator
-        ):
-            release_deployment_slot = getattr(
-                response, "_litellm_router_deployment_slot_release", None
-            )
+        if kwargs.get("stream") and isinstance(response, BaseResponsesAPIStreamingIterator):
+            release_deployment_slot = getattr(response, "_litellm_router_deployment_slot_release", None)
             try:
                 return await self._aresponses_streaming_iterator(
                     response=response,
@@ -5519,16 +5471,6 @@ class Router:
             )
 
             self.total_calls[model_name] += 1
-            response = litellm.aembedding(
-                **{
-                    **data,
-                    "input": input,
-                    "caching": self.cache_responses,
-                    "client": model_client,
-                    **kwargs,
-                }
-            )
-
             ### CONCURRENCY-SAFE RPM CHECKS ###
             rpm_semaphore: Final = self._get_client(
                 deployment=deployment,
@@ -5536,17 +5478,16 @@ class Router:
                 client_type="max_parallel_requests",
             )
 
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
-                async with rpm_semaphore:
-                    """
-                    - Check rpm limits before making the call
-                    - If allowed, increment the rpm limit (allows global value to be updated, concurrency-safe)
-                    """
-                    await self.async_routing_strategy_pre_call_checks(
-                        deployment=deployment, parent_otel_span=parent_otel_span
-                    )
-                    response = await response
-            else:
+            async with self._mpr_capacity_guard(rpm_semaphore, deployment, kwargs):
+                response = litellm.aembedding(
+                    **{
+                        **data,
+                        "input": input,
+                        "caching": self.cache_responses,
+                        "client": model_client,
+                        **kwargs,
+                    }
+                )
                 await self.async_routing_strategy_pre_call_checks(
                     deployment=deployment, parent_otel_span=parent_otel_span
                 )
@@ -5658,33 +5599,22 @@ class Router:
                     "gcs_bucket_name" in data
                 ):  # TODO: Remove this once we have a better way to handle GCS bucket name:  Problem is that we need to pass the gcs_bucket_name to the router for the create_file call but it doesn't show up there
                     kwargs_copy.setdefault("litellm_metadata", {})["gcs_bucket_name"] = data["gcs_bucket_name"]
-                response = litellm.acreate_file(
-                    **{
-                        **data,
-                        "custom_llm_provider": custom_llm_provider,
-                        "caching": self.cache_responses,
-                        "client": model_client,
-                        **kwargs_copy,
-                    }
-                )
-
                 rpm_semaphore: Final = self._get_client(
                     deployment=deployment,
                     kwargs=kwargs_copy,
                     client_type="max_parallel_requests",
                 )
 
-                if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
-                    async with rpm_semaphore:
-                        """
-                        - Check rpm limits before making the call
-                        - If allowed, increment the rpm limit (allows global value to be updated, concurrency-safe)
-                        """
-                        await self.async_routing_strategy_pre_call_checks(
-                            deployment=deployment, parent_otel_span=parent_otel_span
-                        )
-                        response = await response
-                else:
+                async with self._mpr_capacity_guard(rpm_semaphore, deployment, kwargs_copy):
+                    response = litellm.acreate_file(
+                        **{
+                            **data,
+                            "custom_llm_provider": custom_llm_provider,
+                            "caching": self.cache_responses,
+                            "client": model_client,
+                            **kwargs_copy,
+                        }
+                    )
                     await self.async_routing_strategy_pre_call_checks(
                         deployment=deployment, parent_otel_span=parent_otel_span
                     )
@@ -5778,29 +5708,22 @@ class Router:
             )
             custom_llm_provider = custom_llm_provider or inferred_custom_llm_provider
 
-            response = avector_store_create_sdk(
-                **{
-                    **data,
-                    "custom_llm_provider": custom_llm_provider,
-                    "caching": self.cache_responses,
-                    "client": model_client,
-                    **kwargs,
-                }
-            )
-
             rpm_semaphore: Final = self._get_client(
                 deployment=deployment,
                 kwargs=kwargs,
                 client_type="max_parallel_requests",
             )
 
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
-                async with rpm_semaphore:
-                    await self.async_routing_strategy_pre_call_checks(
-                        deployment=deployment, parent_otel_span=parent_otel_span
-                    )
-                    response = await response
-            else:
+            async with self._mpr_capacity_guard(rpm_semaphore, deployment, kwargs):
+                response = avector_store_create_sdk(
+                    **{
+                        **data,
+                        "custom_llm_provider": custom_llm_provider,
+                        "caching": self.cache_responses,
+                        "client": model_client,
+                        **kwargs,
+                    }
+                )
                 await self.async_routing_strategy_pre_call_checks(
                     deployment=deployment, parent_otel_span=parent_otel_span
                 )
@@ -5890,33 +5813,22 @@ class Router:
             )
             custom_llm_provider = custom_llm_provider or inferred_custom_llm_provider
 
-            response = litellm.acreate_batch(
-                **{
-                    **data,
-                    "custom_llm_provider": custom_llm_provider,
-                    "caching": self.cache_responses,
-                    "client": model_client,
-                    **kwargs,
-                }
-            )
-
             rpm_semaphore: Final = self._get_client(
                 deployment=deployment,
                 kwargs=kwargs,
                 client_type="max_parallel_requests",
             )
 
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
-                async with rpm_semaphore:
-                    """
-                    - Check rpm limits before making the call
-                    - If allowed, increment the rpm limit (allows global value to be updated, concurrency-safe)
-                    """
-                    await self.async_routing_strategy_pre_call_checks(
-                        deployment=deployment, parent_otel_span=parent_otel_span
-                    )
-                    response = await response
-            else:
+            async with self._mpr_capacity_guard(rpm_semaphore, deployment, kwargs):
+                response = litellm.acreate_batch(
+                    **{
+                        **data,
+                        "custom_llm_provider": custom_llm_provider,
+                        "caching": self.cache_responses,
+                        "client": model_client,
+                        **kwargs,
+                    }
+                )
                 await self.async_routing_strategy_pre_call_checks(
                     deployment=deployment, parent_otel_span=parent_otel_span
                 )
@@ -6110,33 +6022,22 @@ class Router:
             )
             custom_llm_provider = custom_llm_provider or inferred_custom_llm_provider
 
-            response = litellm.acancel_batch(
-                **{
-                    **data,
-                    "custom_llm_provider": custom_llm_provider,
-                    "caching": self.cache_responses,
-                    "client": model_client,
-                    **kwargs,
-                }
-            )
-
             rpm_semaphore: Final = self._get_client(
                 deployment=deployment,
                 kwargs=kwargs,
                 client_type="max_parallel_requests",
             )
 
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
-                async with rpm_semaphore:
-                    """
-                    - Check rpm limits before making the call
-                    - If allowed, increment the rpm limit (allows global value to be updated, concurrency-safe)
-                    """
-                    await self.async_routing_strategy_pre_call_checks(
-                        deployment=deployment, parent_otel_span=parent_otel_span
-                    )
-                    response = await response
-            else:
+            async with self._mpr_capacity_guard(rpm_semaphore, deployment, kwargs):
+                response = litellm.acancel_batch(
+                    **{
+                        **data,
+                        "custom_llm_provider": custom_llm_provider,
+                        "caching": self.cache_responses,
+                        "client": model_client,
+                        **kwargs,
+                    }
+                )
                 await self.async_routing_strategy_pre_call_checks(
                     deployment=deployment, parent_otel_span=parent_otel_span
                 )
@@ -8026,6 +7927,89 @@ class Router:
         ]
         healthy_deployments = self._filter_blocked_deployments(healthy_deployments)
         return healthy_deployments, _all_deployments
+
+    async def _acquire_mpr_slot_or_raise(
+        self,
+        rpm_semaphore: asyncio.Semaphore | None,
+        deployment: dict,
+        request_kwargs: dict | None,
+    ) -> None:
+        """
+        Non-blocking acquire of a deployment's max_parallel_requests slot.
+
+        The ``locked()`` check and the acquire run back-to-back with no await
+        between them, and ``Semaphore.acquire`` on an unlocked semaphore never
+        yields to the event loop — so a slot freed between the check and the
+        acquire cannot be claimed by another task (mirrors the simple-shuffle
+        gate). On saturation, raise ``MaxParallelRequestsError`` instead of
+        blocking: blocking is what let a saturated provider absorb unbounded
+        concurrency. The caller owns the release (try/finally, or the stream
+        on_close handler).
+        """
+        if rpm_semaphore is None or not isinstance(rpm_semaphore, asyncio.Semaphore):
+            return
+        if rpm_semaphore.locked():
+            deployment_id: Final = (deployment.get("model_info") or {}).get("id")
+            raise litellm.MaxParallelRequestsError(
+                message=(
+                    f"Deployment {deployment_id} is at its max_parallel_requests "
+                    "capacity. Route to another deployment or retry later."
+                ),
+                model=str(deployment.get("model_name") or deployment_id),
+            )
+        await rpm_semaphore.acquire()
+
+    @asynccontextmanager
+    async def _mpr_capacity_guard(
+        self,
+        rpm_semaphore: asyncio.Semaphore | None,
+        deployment: dict,
+        request_kwargs: dict | None,
+    ):
+        """
+        async-with guard replacing the old `async with rpm_semaphore:` at the
+        router call sites. Enters by acquiring the MPR slot without blocking
+        (raising MaxParallelRequestsError when saturated) and releases the
+        slot on exit. Uncapped deployments (None / not a Semaphore) just
+        yield.
+        """
+        if rpm_semaphore is None or not isinstance(rpm_semaphore, asyncio.Semaphore):
+            yield
+            return
+        await self._acquire_mpr_slot_or_raise(
+            rpm_semaphore=rpm_semaphore,
+            deployment=deployment,
+            request_kwargs=request_kwargs,
+        )
+        try:
+            yield
+        finally:
+            rpm_semaphore.release()
+
+    def _filter_mpr_available_deployments(
+        self,
+        healthy_deployments: list[dict],
+        request_kwargs: dict | None,
+    ) -> list[dict]:
+        """
+        Keep only deployments with a free max_parallel_requests slot.
+
+        Steers routing strategies (least-busy, cost-based, ...) away from
+        saturated deployments, mirroring the simple-shuffle gate. Returns an
+        empty list when nothing has capacity so the caller can keep the
+        original list and let the call-time acquire raise
+        MaxParallelRequestsError → fallback.
+        """
+        available: list[dict] = []
+        for deployment in healthy_deployments:
+            semaphore = self._get_client(
+                deployment=deployment,
+                kwargs=request_kwargs or {},
+                client_type="max_parallel_requests",
+            )
+            if not isinstance(semaphore, asyncio.Semaphore) or not semaphore.locked():
+                available.append(deployment)
+        return available
 
     def routing_strategy_pre_call_checks(self, deployment: dict):
         """
@@ -11284,7 +11268,10 @@ class Router:
         model_id: Final = deployment["model_info"]["id"]
         parent_otel_span: Final[Span | None] = _get_parent_otel_span_from_kwargs(kwargs)
         if client_type == "max_parallel_requests":
-            cache_key = f"{model_id}_max_parallel_requests_client"
+            # provider_max_parallel_requests deployments share one semaphore
+            # per provider (same api_base + api_key); the lookup must use the
+            # same key the setter uses or they'd drift.
+            cache_key = InitalizeCachedClient.get_max_parallel_requests_cache_key(deployment)
             client = self.cache.get_cache(key=cache_key, local_only=True, parent_otel_span=parent_otel_span)
             if client is None:
                 InitalizeCachedClient.set_max_parallel_requests_client(litellm_router_instance=self, model=deployment)
@@ -12017,33 +12004,16 @@ class Router:
         model: str,
         request_kwargs: dict,
     ) -> dict:
-        """Weighted-select a deployment with free MPR capacity.
-
-        Selection and the following ``async with`` acquisition run without an
-        intervening await, so a free semaphore cannot be claimed by another
-        task between this check and acquisition. If every capped deployment is
-        full, wait for any release, then rebuild candidates and weights.
-        """
-        while True:
-            self._deployment_capacity_changed.clear()
-            available_deployments = []
-            for deployment in healthy_deployments:
-                semaphore = self._get_client(
-                    deployment=deployment,
-                    kwargs=request_kwargs,
-                    client_type="max_parallel_requests",
-                )
-                if semaphore is None or not semaphore.locked():
-                    available_deployments.append(deployment)
-
-            if available_deployments:
-                return simple_shuffle(
-                    llm_router_instance=self,
-                    healthy_deployments=available_deployments,
-                    model=model,
-                )
-
-            await self._deployment_capacity_changed.wait()
+        """Weighted-select a deployment with free MPR capacity."""
+        available_deployments = self._filter_mpr_available_deployments(
+            healthy_deployments=healthy_deployments,
+            request_kwargs=request_kwargs,
+        )
+        return simple_shuffle(
+            llm_router_instance=self,
+            healthy_deployments=available_deployments or healthy_deployments,
+            model=model,
+        )
 
     @staticmethod
     def _pop_effort_from_nested_carrier(request_kwargs: dict[str, object], carrier: str) -> None:
@@ -12151,6 +12121,20 @@ class Router:
                     model=model,
                     request_kwargs=request_kwargs,
                 )
+            # Steer every other strategy away from saturated deployments: a
+            # deployment whose max_parallel_requests semaphore is full cannot
+            # accept this request, so it shouldn't be selectable (mirrors the
+            # simple-shuffle gate above). If every candidate is saturated, keep
+            # the full list so selection still returns a deployment and the
+            # call-time acquire raises MaxParallelRequestsError, which the
+            # fallback machinery converts into a diversion to another model
+            # group (default_fallbacks).
+            _mpr_available: Final = self._filter_mpr_available_deployments(
+                healthy_deployments=healthy_deployments,
+                request_kwargs=request_kwargs,
+            )
+            if _mpr_available:
+                healthy_deployments = _mpr_available
             deployment: Final = await self._select_deployment_async(
                 strategy=strategy,
                 selector=strategy_selector,
