@@ -1,4 +1,3 @@
-from typing import List, Optional
 
 from pydantic import BaseModel
 
@@ -6,9 +5,8 @@ from litellm._logging import verbose_proxy_logger
 
 DEFAULT_PLAN_ID = "medium"
 
-_FLAT_TEAM_ID = "ac0b4e54-71a7-4e1f-bfaf-32fad13c09e9"
+FLAT_TEAM_ID = "ac0b4e54-71a7-4e1f-bfaf-32fad13c09e9"
 KEY_MODELS = ["all-team-models"]
-KEY_DURATION = "30d"
 
 
 class TokeninPlan(BaseModel):
@@ -18,17 +16,17 @@ class TokeninPlan(BaseModel):
     rpm_limit: int
     max_parallel_requests: int
     max_budget: float
-    budget_duration: Optional[str] = None
-    weekly_value: Optional[float] = None
-    monthly_value: Optional[float] = None
+    budget_duration: str | None = None
+    weekly_value: float | None = None
+    monthly_value: float | None = None
 
 
-def load_plans() -> List[TokeninPlan]:
+def load_plans() -> list[TokeninPlan]:
     from litellm.proxy.proxy_server import proxy_config
 
     config = proxy_config.get_config_state()
     raw = config.get("tokenin_plans") or []
-    plans: List[TokeninPlan] = []
+    plans: list[TokeninPlan] = []
     for entry in raw:
         if not isinstance(entry, dict):
             continue
@@ -39,7 +37,7 @@ def load_plans() -> List[TokeninPlan]:
     return plans
 
 
-def get_plan_by_id(plan_id: Optional[str]) -> TokeninPlan:
+def get_plan_by_id(plan_id: str | None) -> TokeninPlan:
     plans = load_plans()
     if plan_id:
         for p in plans:
@@ -55,11 +53,3 @@ def get_plan_by_id(plan_id: Optional[str]) -> TokeninPlan:
 
 def is_payg(plan: TokeninPlan) -> bool:
     return plan.kind == "payg"
-
-
-def key_duration(plan: TokeninPlan) -> Optional[str]:
-    return None if is_payg(plan) else KEY_DURATION
-
-
-def key_budget_duration(plan: TokeninPlan) -> Optional[str]:
-    return None if is_payg(plan) else plan.budget_duration
