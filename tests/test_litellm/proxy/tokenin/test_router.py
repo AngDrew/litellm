@@ -1,10 +1,9 @@
 """
 Regression tests for the tokenin account wallet.
 
-One wallet per account (the user row's `max_budget`), credited by
-`/tokenin/key/generate` and `/tokenin/key/update` and enforced for the account's
-flat-team keys through `general_settings.apply_user_budget_to_team_keys`. No key
-carries a budget, a budget window, or an expiry of its own.
+Key issuance is repeatable and moves no credit; one dedicated endpoint credits the
+account wallet (the user row's `max_budget`), which every key the account owns spends
+down through `general_settings.apply_user_budget_to_team_keys`.
 """
 
 from datetime import datetime, timezone
@@ -23,8 +22,10 @@ from litellm.proxy.tokenin.plans import TokeninPlan
 from litellm.proxy.tokenin.router import (
     TokeninGenerateRequest,
     TokeninUpdateRequest,
+    TokeninWalletTopupRequest,
     tokenin_generate_key,
     tokenin_update_key,
+    tokenin_wallet_topup,
 )
 
 ACCOUNT_ID: Final = "acct-1"
@@ -149,77 +150,161 @@ def _install(
     return prisma, cache, generated
 
 
-async def test_generate_credits_the_wallet_and_creates_a_budgetless_key(
+async def test_generate_is_repeatable_and_moves_no_credit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     prisma, cache, generated = _install(monkeypatch)
 
-    response: Final = await tokenin_generate_key(
-        data=TokeninGenerateRequest(user_id=ACCOUNT_ID, plan_id="medium", alias="acct-1-key"),
+    first: Final = await tokenin_generate_key(
+        data=TokeninGenerateRequest(user_id=ACCOUNT_ID, alias="acct-1-key-a"),
+    )
+    second: Final = await tokenin_generate_key(
+        data=TokeninGenerateRequest(user_id=ACCOUNT_ID, alias="acct-1-key-b", plan_id="medium"),
     )
 
-    assert prisma.user_table.wallets[ACCOUNT_ID]["max_budget"] == 10.0
-    assert prisma.user_table.increments == [WalletIncrement(user_id=ACCOUNT_ID, amount=10.0)]
-    assert cache.deleted == [ACCOUNT_ID]
-
-    assert [creation["max_budget"] for creation in prisma.user_row_creations] == [0.0]
+    assert prisma.user_table.wallets[ACCOUNT_ID]["max_budget"] == 0.0
+    assert prisma.user_table.increments == []
+    assert cache.deleted == []
+    assert [creation["max_budget"] for creation in prisma.user_row_creations] == [0.0, 0.0]
     for creation in prisma.user_row_creations:
         assert set(creation) <= {"user_id", "max_budget", "models"}
 
-    key_payload: Final = generated[0]
-    assert key_payload["user_id"] == ACCOUNT_ID
-    assert key_payload["team_id"] == FLAT_TEAM_ID
-    assert key_payload["table_name"] == "key"
-    assert key_payload["rpm_limit"] == 120
-    assert key_payload["max_parallel_requests"] == 2
-    for absent in ("key_max_budget", "key_budget_duration", "budget_limits", "duration"):
-        assert absent not in key_payload
+    for key_payload in generated:
+        assert key_payload["user_id"] == ACCOUNT_ID
+        assert key_payload["team_id"] == FLAT_TEAM_ID
+        assert key_payload["models"] == ["all-team-models"]
+        assert key_payload["rpm_limit"] == 120
+        assert key_payload["max_parallel_requests"] == 2
+        assert key_payload["table_name"] == "key"
+        for absent in ("key_max_budget", "key_budget_duration", "budget_limits", "duration"):
+            assert absent not in key_payload
 
-    assert response.expires is None
+    assert [payload["key_alias"] for payload in generated] == ["acct-1-key-a", "acct-1-key-b"]
+    assert first.expires is None
+    assert second.expires is None
 
 
-async def test_fixed_plan_credit_ignores_a_caller_supplied_amount(
+async def test_generate_without_a_plan_uses_the_default_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prisma, _, generated = _install(monkeypatch, plans=(FIXED_PLAN,))
+
+    await tokenin_generate_key(data=TokeninGenerateRequest(user_id=ACCOUNT_ID, alias="acct-1-key"))
+
+    assert generated[0]["rpm_limit"] == 120
+    assert generated[0]["max_parallel_requests"] == 2
+    assert prisma.user_table.wallets[ACCOUNT_ID]["max_budget"] == 0.0
+
+
+async def test_wallet_topup_credits_the_configured_plan_amount_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prisma, cache, generated = _install(monkeypatch)
+
+    topup: Final = await tokenin_wallet_topup(
+        data=TokeninWalletTopupRequest(user_id=ACCOUNT_ID, plan_id="medium"),
+    )
+
+    assert topup.credited == 10.0
+    assert topup.max_budget == 10.0
+    assert topup.user_id == ACCOUNT_ID
+    assert prisma.user_table.increments == [WalletIncrement(user_id=ACCOUNT_ID, amount=10.0)]
+    assert cache.deleted == [ACCOUNT_ID]
+    assert [creation["user_id"] for creation in prisma.user_row_creations] == [ACCOUNT_ID]
+    assert generated == []
+
+
+async def test_wallet_topup_rejects_a_caller_supplied_amount_for_a_fixed_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     prisma, _, _ = _install(monkeypatch)
 
-    await tokenin_generate_key(
-        data=TokeninGenerateRequest(
-            user_id=ACCOUNT_ID,
-            plan_id="medium",
-            alias="acct-1-key",
-            payg_initial_balance=999.0,
-        ),
+    with pytest.raises(HTTPException):
+        await tokenin_wallet_topup(
+            data=TokeninWalletTopupRequest(user_id=ACCOUNT_ID, plan_id="medium", topup_usd=999.0),
+        )
+
+    assert prisma.user_table.increments == []
+    assert prisma.user_table.wallets == {}
+
+
+async def test_wallet_topup_uses_the_paid_amount_only_for_payg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prisma, _, _ = _install(monkeypatch)
+
+    paid: Final = await tokenin_wallet_topup(
+        data=TokeninWalletTopupRequest(user_id=ACCOUNT_ID, plan_id="payg", topup_usd=3.5),
     )
+    assert paid.credited == 3.5
+    assert prisma.user_table.wallets[ACCOUNT_ID]["max_budget"] == 3.5
 
-    assert prisma.user_table.wallets[ACCOUNT_ID]["max_budget"] == 10.0
+    for missing_amount in (None, 0.0, float("inf"), float("nan")):
+        with pytest.raises(HTTPException):
+            await tokenin_wallet_topup(
+                data=TokeninWalletTopupRequest(
+                    user_id=ACCOUNT_ID, plan_id="payg", topup_usd=missing_amount
+                ),
+            )
+
+    assert prisma.user_table.wallets[ACCOUNT_ID]["max_budget"] == 3.5
 
 
-async def test_every_key_of_an_account_shares_the_one_wallet(
+async def test_keys_share_one_wallet_that_only_the_topup_endpoint_moves(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     prisma, _, generated = _install(monkeypatch)
 
-    await tokenin_generate_key(
-        data=TokeninGenerateRequest(user_id=ACCOUNT_ID, plan_id="medium", alias="key-1"),
-    )
-    await tokenin_generate_key(
-        data=TokeninGenerateRequest(user_id=ACCOUNT_ID, plan_id="medium", alias="key-2"),
-    )
-    topup: Final = await tokenin_update_key(
-        data=TokeninUpdateRequest(key="sk-second-key", plan_id="medium", action="extend"),
+    for alias in ("key-1", "key-2", "key-3"):
+        await tokenin_generate_key(
+            data=TokeninGenerateRequest(user_id=ACCOUNT_ID, alias=alias, plan_id="medium"),
+        )
+    topup: Final = await tokenin_wallet_topup(
+        data=TokeninWalletTopupRequest(user_id=ACCOUNT_ID, plan_id="medium"),
     )
 
     assert len(prisma.user_table.wallets) == 1
-    assert prisma.user_table.wallets[ACCOUNT_ID]["max_budget"] == 30.0
-    assert [payload["user_id"] for payload in generated] == [ACCOUNT_ID, ACCOUNT_ID]
+    assert topup.max_budget == 10.0
+    assert prisma.user_table.wallets[ACCOUNT_ID]["max_budget"] == 10.0
+    assert prisma.user_table.increments == [WalletIncrement(user_id=ACCOUNT_ID, amount=10.0)]
+    assert [payload["user_id"] for payload in generated] == [ACCOUNT_ID, ACCOUNT_ID, ACCOUNT_ID]
+    assert len(generated) == 3
+
+
+async def test_key_update_shim_credits_the_wallet_for_legacy_callers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prisma, _, generated = _install(monkeypatch)
+
+    extension: Final = await tokenin_update_key(
+        data=TokeninUpdateRequest(key="sk-existing", plan_id="medium", action="extend"),
+    )
+    topup: Final = await tokenin_update_key(
+        data=TokeninUpdateRequest(key="sk-existing", plan_id="payg", action="payg_topup", topup_usd=2.5),
+    )
+
+    assert generated == []
+
+    assert extension.credited == 10.0
+    assert topup.credited == 2.5
     assert prisma.user_table.increments == [
         WalletIncrement(user_id=ACCOUNT_ID, amount=10.0),
-        WalletIncrement(user_id=ACCOUNT_ID, amount=10.0),
-        WalletIncrement(user_id=ACCOUNT_ID, amount=10.0),
+        WalletIncrement(user_id=ACCOUNT_ID, amount=2.5),
     ]
-    assert topup.credited == 10.0
-    assert topup.max_budget == 30.0
+    assert prisma.user_table.wallets[ACCOUNT_ID]["max_budget"] == 12.5
+
+    with pytest.raises(HTTPException):
+        await tokenin_update_key(
+            data=TokeninUpdateRequest(key="sk-existing", plan_id="medium", action="payg_topup", topup_usd=1.0),
+        )
+    with pytest.raises(HTTPException):
+        await tokenin_update_key(
+            data=TokeninUpdateRequest(key="sk-existing", plan_id="payg", action="extend"),
+        )
+    with pytest.raises(HTTPException):
+        await tokenin_update_key(
+            data=TokeninUpdateRequest(key="sk-existing", plan_id="medium", action="extend", topup_usd=999.0),
+        )
 
 
 async def test_credit_seeds_a_null_ceiling_exactly_once(
@@ -228,41 +313,15 @@ async def test_credit_seeds_a_null_ceiling_exactly_once(
     prisma, _, _ = _install(monkeypatch)
     prisma.user_table.wallets[ACCOUNT_ID] = {"max_budget": None, "spend": 0.0}
 
-    await tokenin_update_key(
-        data=TokeninUpdateRequest(key="sk-key", plan_id="medium", action="extend"),
+    await tokenin_wallet_topup(
+        data=TokeninWalletTopupRequest(user_id=ACCOUNT_ID, plan_id="medium"),
     )
-    await tokenin_update_key(
-        data=TokeninUpdateRequest(key="sk-key", plan_id="medium", action="extend"),
+    await tokenin_wallet_topup(
+        data=TokeninWalletTopupRequest(user_id=ACCOUNT_ID, plan_id="medium"),
     )
 
     assert prisma.user_table.wallets[ACCOUNT_ID]["max_budget"] == 20.0
     assert prisma.user_table.increments == [WalletIncrement(user_id=ACCOUNT_ID, amount=10.0)]
-
-
-async def test_payg_topup_credits_the_paid_amount_and_rejects_other_shapes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    prisma, _, _ = _install(monkeypatch)
-
-    paid: Final = await tokenin_update_key(
-        data=TokeninUpdateRequest(key="sk-payg", plan_id="payg", action="payg_topup", topup_usd=3.5),
-    )
-    assert paid.credited == 3.5
-    assert prisma.user_table.wallets[ACCOUNT_ID]["max_budget"] == 3.5
-
-    with pytest.raises(HTTPException):
-        await tokenin_update_key(
-            data=TokeninUpdateRequest(key="sk-key", plan_id="medium", action="payg_topup", topup_usd=3.5),
-        )
-    with pytest.raises(HTTPException):
-        await tokenin_update_key(
-            data=TokeninUpdateRequest(key="sk-key", plan_id="medium", action="payg_topup"),
-        )
-    with pytest.raises(HTTPException):
-        await tokenin_update_key(
-            data=TokeninUpdateRequest(key="sk-payg", plan_id="payg", action="extend"),
-        )
-    assert prisma.user_table.wallets[ACCOUNT_ID]["max_budget"] == 3.5
 
 
 async def test_an_unlinked_key_cannot_move_credit(monkeypatch: pytest.MonkeyPatch) -> None:

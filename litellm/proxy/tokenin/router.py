@@ -1,14 +1,16 @@
 """
-TOKENIN KEY PROVISIONING
+TOKENIN KEY PROVISIONING AND ACCOUNT WALLET
 
-/tokenin/key/generate
-/tokenin/key/update
+/tokenin/key/generate   issue a key for an account. Repeatable and harmless: it never
+                        moves credit, so a customer can hold any number of keys.
+/tokenin/wallet/topup   add a purchase to the account wallet. Touches no key.
+/tokenin/key/update     compatibility shim for callers still posting key-oriented
+                        purchase intents. It resolves the account from the key, credits
+                        the wallet, and mutates nothing on the key.
 
-Credit lives on the account wallet, never on a key: no key gets a max_budget, a
-budget window, or an expiry. A purchase is one /generate call, which credits the
-account with the plan amount and returns a key. An extension or top-up is one
-/update call against any key the account owns, which the call only uses to resolve
-the account.
+Credit lives on the account wallet (the user row's max_budget), never on a key: no key
+gets a max_budget, a budget window, or an expiry. Enforcement for the account's flat
+-team keys is general_settings.apply_user_budget_to_team_keys.
 """
 
 import math
@@ -39,9 +41,14 @@ router = APIRouter()
 
 class TokeninGenerateRequest(LiteLLMPydanticObjectBase):
     user_id: str
-    plan_id: str
     alias: str
-    payg_initial_balance: float | None = None
+    plan_id: str | None = None
+
+
+class TokeninWalletTopupRequest(LiteLLMPydanticObjectBase):
+    user_id: str
+    plan_id: str
+    topup_usd: float | None = None
 
 
 class TokeninUpdateRequest(LiteLLMPydanticObjectBase):
@@ -52,7 +59,7 @@ class TokeninUpdateRequest(LiteLLMPydanticObjectBase):
 
 
 class TokeninGeneratedKey(LiteLLMPydanticObjectBase):
-    """The key a purchase returns. Expiry and budgets are absent by design: the wallet holds the balance."""
+    """The key a customer is issued. Expiry and budgets are absent by design: the wallet holds the balance."""
 
     token_id: str
     key: str
@@ -63,7 +70,6 @@ class TokeninGeneratedKey(LiteLLMPydanticObjectBase):
 
 
 class TokeninWalletCredit(LiteLLMPydanticObjectBase):
-    action: Literal["extend", "payg_topup"]
     user_id: str
     credited: float
     max_budget: float
@@ -75,16 +81,11 @@ class TokeninWalletCredit(LiteLLMPydanticObjectBase):
     dependencies=[Depends(user_api_key_auth)],
 )
 async def tokenin_generate_key(data: TokeninGenerateRequest) -> TokeninGeneratedKey:
+    """Issue a key that spends from the account wallet. No credit moves here, so this is safe to repeat."""
     prisma_client: Final = _prisma_client_or_500()
-    plan: Final = get_plan_by_id(data.plan_id)
+    limits: Final = get_plan_by_id(data.plan_id)
 
-    purchase_credit: Final = _purchase_credit(plan=plan, payg_initial_balance=data.payg_initial_balance)
-    if purchase_credit > 0:
-        await credit_wallet(prisma_client=prisma_client, user_id=data.user_id, amount=purchase_credit)
-    else:
-        # A pay-as-you-go purchase can arrive before its payment, but its key must still
-        # resolve to a wallet, otherwise the account would be unconstrained until top-up.
-        await ensure_wallet_user(prisma_client=prisma_client, user_id=data.user_id)
+    await ensure_wallet_user(prisma_client=prisma_client, user_id=data.user_id)
 
     response: Final[Mapping[str, object]] = await generate_key_helper_fn(
         request_type="key",
@@ -92,12 +93,32 @@ async def tokenin_generate_key(data: TokeninGenerateRequest) -> TokeninGenerated
         team_id=FLAT_TEAM_ID,
         models=KEY_MODELS,
         key_alias=data.alias,
-        rpm_limit=plan.rpm_limit,
-        max_parallel_requests=plan.max_parallel_requests,
+        rpm_limit=limits.rpm_limit,
+        max_parallel_requests=limits.max_parallel_requests,
         table_name="key",
     )
 
     return TokeninGeneratedKey.model_validate({**response, "key": response.get("token")})
+
+
+@router.post(
+    "/tokenin/wallet/topup",
+    tags=["tokenin"],
+    dependencies=[Depends(user_api_key_auth)],
+)
+async def tokenin_wallet_topup(data: TokeninWalletTopupRequest) -> TokeninWalletCredit:
+    """Credit the account wallet with one purchase. Creates, extends, and mutates no key."""
+    prisma_client: Final = _prisma_client_or_500()
+    plan: Final = get_plan_by_id(data.plan_id)
+
+    credit: Final = _purchase_credit(plan=plan, topup_usd=data.topup_usd)
+    wallet_budget: Final = await credit_wallet(
+        prisma_client=prisma_client,
+        user_id=data.user_id,
+        amount=credit,
+    )
+
+    return TokeninWalletCredit(user_id=data.user_id, credited=credit, max_budget=wallet_budget)
 
 
 @router.post(
@@ -106,6 +127,7 @@ async def tokenin_generate_key(data: TokeninGenerateRequest) -> TokeninGenerated
     dependencies=[Depends(user_api_key_auth)],
 )
 async def tokenin_update_key(data: TokeninUpdateRequest) -> TokeninWalletCredit:
+    """Compatibility shim: `key` only resolves the account. Prefer POST /tokenin/wallet/topup."""
     prisma_client: Final = _prisma_client_or_500()
     plan: Final = get_plan_by_id(data.plan_id)
     existing: Final[LiteLLM_VerificationToken] = await _get_and_validate_existing_key(
@@ -120,44 +142,59 @@ async def tokenin_update_key(data: TokeninUpdateRequest) -> TokeninWalletCredit:
             detail="This key is not linked to an account wallet",
         )
 
-    credit: Final = _topup_amount(plan=plan, action=data.action, topup_usd=data.topup_usd)
-    wallet_budget: Final = await credit_wallet(prisma_client=prisma_client, user_id=user_id, amount=credit)
-
-    return TokeninWalletCredit(
-        action=data.action,
+    credit: Final = _legacy_action_credit(plan=plan, action=data.action, topup_usd=data.topup_usd)
+    wallet_budget: Final = await credit_wallet(
+        prisma_client=prisma_client,
         user_id=user_id,
-        credited=credit,
-        max_budget=wallet_budget,
+        amount=credit,
     )
 
+    return TokeninWalletCredit(user_id=user_id, credited=credit, max_budget=wallet_budget)
 
-def _purchase_credit(plan: TokeninPlan, payg_initial_balance: float | None) -> float:
-    """Wallet credit a purchase of `plan` carries.
 
-    A fixed plan is worth its configured amount. Pay-as-you-go has no catalog price,
-    so its credit is the payment amount the caller supplies.
+def _purchase_credit(plan: TokeninPlan, topup_usd: float | None) -> float:
+    """Credit one purchase carries: the catalog amount for a fixed plan.
+
+    Pay-as-you-go has no catalog price, so its credit is the payment amount the caller
+    supplies, and keeping that amount idempotent stays the platform's responsibility.
     """
-    if not is_payg(plan):
-        return _configured_credit(plan=plan)
-    if payg_initial_balance is None:
-        return 0.0
-    return _positive_amount(value=payg_initial_balance, field="payg_initial_balance")
+    if is_payg(plan):
+        if topup_usd is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"topup_usd is required for the payg plan '{plan.id}'",
+            )
+        return _positive_amount(value=topup_usd, field="topup_usd")
+
+    if topup_usd is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"topup_usd is only valid for payg plans, not '{plan.id}'",
+        )
+    return _configured_credit(plan=plan)
 
 
-def _topup_amount(plan: TokeninPlan, action: str, topup_usd: float | None) -> float:
+def _legacy_action_credit(plan: TokeninPlan, action: str, topup_usd: float | None) -> float:
+    """The shim's `action` only separates a catalog purchase from a pay-as-you-go payment."""
     if action == "extend":
+        if is_payg(plan):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="extend is not valid for payg plans",
+            )
+        if topup_usd is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"topup_usd is only valid for payg plans, not '{plan.id}'",
+            )
         return _configured_credit(plan=plan)
+
     if not is_payg(plan):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="payg_topup is only valid for payg plans",
         )
-    if topup_usd is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="topup_usd must be a positive number",
-        )
-    return _positive_amount(value=topup_usd, field="topup_usd")
+    return _purchase_credit(plan=plan, topup_usd=topup_usd)
 
 
 def _configured_credit(plan: TokeninPlan) -> float:
