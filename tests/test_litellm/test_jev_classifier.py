@@ -1,14 +1,14 @@
-"""The Jev classifier plugin: request shape, verdict mapping, and the decisions call. Offline."""
+"""The Jev classifier plugin: request shape, verdict mapping, and the metered router call. Offline."""
 
 from __future__ import annotations
 
 import json
 
-import httpx
 import pytest
 
 from callbacks.jev_classifier import JevClassifier, build_payload, tier_from_response
 from litellm.types.router import RoutingContext
+from litellm.types.utils import ModelResponse
 
 MESSAGES = [
     {"role": "system", "content": "You are a coding agent."},
@@ -17,6 +17,35 @@ MESSAGES = [
     {"role": "assistant", "content": "I will read the proof again."},
     {"role": "user", "content": "Prove the halting problem is undecidable."},
 ]
+
+ANSWERS = {
+    "model": "typesafe/jev-1.13-20260917",
+    "answers": {
+        "complexity": {"type": "choice", "choice": "COMPLEX", "probabilities": {"COMPLEX": 0.8}, "confidence": 0.8}
+    },
+    "usage": {"input_tokens": 427, "output_tokens": 73, "cost": 0.000017934},
+}
+
+
+class FakeRouter:
+    """Stands in for the proxy router, recording what the classifier asks it for."""
+
+    def __init__(self, answers: dict | None = None) -> None:
+        self.calls: list[dict] = []
+        self._answers = answers or ANSWERS
+
+    async def acompletion(self, **kwargs) -> ModelResponse:
+        self.calls.append(kwargs)
+        return ModelResponse(
+            model=kwargs["model"],
+            choices=[
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": json.dumps(self._answers)},
+                    "finish_reason": "stop",
+                }
+            ],
+        )
 
 
 def test_payload_asks_one_choice_question_over_the_router_tiers():
@@ -46,24 +75,31 @@ def test_verdict_maps_to_the_tier_and_declines_when_unsure():
     assert tier_from_response({}, 0.5) is None
 
 
-async def test_classify_posts_the_decisions_body_and_returns_the_tier(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("OR_API_KEY", "test-key")
-    monkeypatch.setenv("JEV_DECISIONS_URL", "https://example.test/api/alpha/decisions")
-    seen: dict = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["url"] = str(request.url)
-        seen["auth"] = request.headers["authorization"]
-        seen["body"] = json.loads(request.content)
-        return httpx.Response(
-            200, json={"answers": {"complexity": {"type": "choice", "choice": "COMPLEX", "confidence": 0.8}}}
-        )
-
-    classifier = JevClassifier(transport=httpx.MockTransport(handler))
-    context = RoutingContext(raw_messages=[], structured_messages=MESSAGES, candidate_models=[])
+async def test_classify_asks_the_router_so_the_call_is_metered(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("JEV_MODEL", raising=False)
+    router = FakeRouter()
+    classifier = JevClassifier(router=router)
+    context = RoutingContext(
+        raw_messages=[], structured_messages=MESSAGES, candidate_models=[], metadata={"user_api_key": "hashed-key"}
+    )
 
     assert await classifier.classify(context) == "COMPLEX"
-    assert seen["url"] == "https://example.test/api/alpha/decisions"
-    assert seen["auth"] == "Bearer test-key"
-    assert seen["body"]["model"] == "typesafe/jev-1.13"
-    assert seen["body"]["state"]["conversation"][-1]["text"] == "Prove the halting problem is undecidable."
+
+    call = router.calls[0]
+    assert call["model"] == "jev-1.13"  # the priced deployment, not the raw upstream id
+    assert call["timeout"] == 10.0
+    body = json.loads(call["messages"][0]["content"])
+    assert set(body) == {"state", "questions"}  # the provider supplies the model it posts for
+    assert body["state"]["conversation"][-1]["text"] == "Prove the halting problem is undecidable."
+    # the sub-call carries the caller's identity so its spend is attributed to them
+    assert call["metadata"]["user_api_key"] == "hashed-key"
+    assert call["metadata"]["internal_call_origin"] == "autorouter_classifier"
+
+
+async def test_classify_declines_on_low_confidence(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("JEV_MIN_CONFIDENCE", "0.9")
+    unsure = {"model": "typesafe/jev-1.13", "answers": {"complexity": {"choice": "MEDIUM", "confidence": 0.5}}}
+    classifier = JevClassifier(router=FakeRouter(unsure))
+    context = RoutingContext(raw_messages=[], structured_messages=MESSAGES, candidate_models=[], metadata={})
+
+    assert await classifier.classify(context) is None

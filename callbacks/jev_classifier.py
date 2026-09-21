@@ -7,15 +7,19 @@ rather than text to parse. `classifier_type: llm` therefore can never reach it, 
 `classifier_type: custom` is the hook that can: this plugin asks the router's own four tiers as one
 Choice question and returns the option Jev picks.
 
+The call goes through the proxy's own router and `callbacks.jev_provider` rather than straight to
+OpenRouter, so every classification is a normal LiteLLM request: it lands in the spend log, feeds the
+per-tier budgets, and is attributed to the caller that triggered it. A raw HTTP call is invisible to
+all three, which is how a classifier quietly spends money nobody records.
+
     complexity_router_config:
       classifier_type: custom
       classifier_plugin: callbacks.jev_classifier.jev_classifier
-      classifier_plugin_timeout_ms: 15000   # Jev answers in 0.3-0.5s; the HTTP timeout below is smaller
+      classifier_plugin_timeout_ms: 15000   # Jev answers in 0.3-0.5s; the request timeout below is smaller
 
-Environment: `OR_API_KEY`, already exported for the other OpenRouter deployments. Optional overrides:
-`JEV_MODEL` (default `typesafe/jev-1.13`, pinned rather than `~typesafe/jev-latest` so thresholds
-tuned on one version are not silently invalidated by the next), `JEV_MIN_CONFIDENCE` (default 0.5),
-`JEV_DECISIONS_URL`.
+Environment: `JEV_MODEL` names the deployment carrying the decisions provider and its price (default
+`jev-1.13`), and `JEV_MIN_CONFIDENCE` (default 0.5) is the floor under which `classify` declines and
+classifier_fallback decides.
 
 State composition is measured, not arbitrary: user turns plus the caller's system prompt (capped),
 with assistant narration and tool output dropped. Both drops raise Jev's confidence on real agent
@@ -30,22 +34,21 @@ so an unsure Jev costs the classifier call and nothing else.
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping, Sequence
 from typing import Any, Final
 
-import httpx
-
 from litellm import verbose_logger
+from litellm.litellm_core_utils.internal_call_metadata import forwarded_internal_call_metadata
 from litellm.router_strategy.complexity_router.complexity_router import _CLASSIFICATION_TIER_CRITERIA
 from litellm.types.router import RoutingContext
+from litellm.types.utils import AUTOROUTER_CLASSIFIER_CALL_ORIGIN, ModelResponse
 
-DEFAULT_MODEL: Final = "typesafe/jev-1.13"
+# The model_list deployment carrying callbacks.jev_provider and the OpenRouter price for Jev.
+DEFAULT_MODEL: Final = "jev-1.13"
 DEFAULT_MIN_CONFIDENCE: Final = 0.5
-DEFAULT_BASE_URL: Final = "https://openrouter.ai/api/v1"
-# The decisions endpoint sits outside OpenRouter's /api/v1 prefix.
-DECISIONS_PATH: Final = "/alpha/decisions"
-HTTP_TIMEOUT_SECONDS: Final = 10.0
+REQUEST_TIMEOUT_SECONDS: Final = 10.0
 QUESTION: Final = "complexity"
 # ponytail: a fixed window here; the router's classifier_context_* settings only apply to the LLM
 # classifier, so raise these two if the window turns out too small for follow-up turns.
@@ -53,12 +56,13 @@ CONTEXT_TURNS: Final = 4
 CONTEXT_CHARS: Final = 4000
 
 
-def _decisions_url() -> str:
-    explicit = os.environ.get("JEV_DECISIONS_URL")
-    if explicit:
-        return explicit
-    base = os.environ.get("OR_BASE_URL", DEFAULT_BASE_URL).rstrip("/").removesuffix("/v1")
-    return f"{base}{DECISIONS_PATH}"
+def _router() -> Any:
+    """The proxy's router, imported lazily so this module stays importable outside a proxy."""
+    from litellm.proxy.proxy_server import llm_router
+
+    if llm_router is None:
+        raise RuntimeError("the Jev classifier needs the proxy's router to record what it spends")
+    return llm_router
 
 
 def _message_text(message: Mapping[str, Any]) -> str:
@@ -114,7 +118,6 @@ def build_payload(messages: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         state["system_prompt"] = "\n\n".join(system_parts)[:CONTEXT_CHARS]
 
     return {
-        "model": os.environ.get("JEV_MODEL") or DEFAULT_MODEL,
         "state": state,
         "questions": {
             QUESTION: {
@@ -156,35 +159,41 @@ def tier_from_response(body: Mapping[str, Any], min_confidence: float) -> str | 
 class JevClassifier:
     """`ClassifierPlugin`: one Jev decision per request, or None to let classifier_fallback decide."""
 
-    def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
-        self._transport = transport
+    def __init__(self, router: Any = None) -> None:
+        self._router_override = router
 
     async def classify(self, context: RoutingContext) -> str | None:
-        api_key = os.environ.get("OR_API_KEY")
-        if not api_key:
-            raise RuntimeError("OR_API_KEY is not set; the Jev classifier cannot reach OpenRouter")
+        payload: Final = build_payload(context.structured_messages)
+        messages: Final = [{"role": "user", "content": json.dumps(payload)}]
+        metadata: Final = forwarded_internal_call_metadata(context.metadata, AUTOROUTER_CLASSIFIER_CALL_ORIGIN)
 
-        payload = build_payload(context.structured_messages)
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        # ponytail: a client per call; a shared one if classifier volume ever makes the handshake show
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS, transport=self._transport) as client:
-            response = await client.post(_decisions_url(), json=payload, headers=headers)
-            response.raise_for_status()
-            body = response.json()
+        router: Final = self._router_override or _router()
+        response: Final[ModelResponse] = await router.acompletion(
+            model=os.environ.get("JEV_MODEL") or DEFAULT_MODEL,
+            messages=messages,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            metadata=metadata,
+        )
+        answer: Final = json.loads(response.choices[0].message.content)  # pyright: ignore[reportArgumentType]  # the provider hands back the decisions body as JSON
 
-        min_confidence = float(os.environ.get("JEV_MIN_CONFIDENCE") or DEFAULT_MIN_CONFIDENCE)
-        tier = tier_from_response(body, min_confidence)
+        min_confidence: Final = float(os.environ.get("JEV_MIN_CONFIDENCE") or DEFAULT_MIN_CONFIDENCE)
+        tier: Final = tier_from_response(answer, min_confidence)
         if tier is None:
-            answers = body.get("answers")
-            verdict = answers.get(QUESTION) if isinstance(answers, Mapping) else None
             verbose_logger.warning(
                 "Jev classifier declined: choice=%r confidence=%r minimum=%s response_model=%r",
-                verdict.get("choice") if isinstance(verdict, Mapping) else None,
-                verdict.get("confidence") if isinstance(verdict, Mapping) else None,
+                _answered_field(answer, "choice"),
+                _answered_field(answer, "confidence"),
                 min_confidence,
-                body.get("model"),
+                answer.get("model"),
             )
         return tier
+
+
+def _answered_field(answer: Mapping[str, Any], field: str) -> Any:
+    """One field of Jev's answer to this question, for the decline log."""
+    answers: Final = answer.get("answers")
+    verdict: Final = answers.get(QUESTION) if isinstance(answers, Mapping) else None
+    return verdict.get(field) if isinstance(verdict, Mapping) else None
 
 
 jev_classifier: Final = JevClassifier()
