@@ -17,6 +17,12 @@ Environment: `OR_API_KEY`, already exported for the other OpenRouter deployments
 tuned on one version are not silently invalidated by the next), `JEV_MIN_CONFIDENCE` (default 0.5),
 `JEV_DECISIONS_URL`.
 
+State composition is measured, not arbitrary: user turns plus the caller's system prompt (capped),
+with assistant narration and tool output dropped. Both drops raise Jev's confidence on real agent
+traffic — the same seven messages scored 0.21-0.41 with narration kept and 0.55-0.98 without, so
+keeping it put most requests under the confidence floor and routed nearly all traffic to the
+heuristic fallback.
+
 Declining on a low-confidence verdict is the point: Jev's confidence is calibrated across many
 answers, not for one, and the router's heuristic scorer still classifies when this plugin declines,
 so an unsure Jev costs the classifier call and nothing else.
@@ -30,6 +36,7 @@ from typing import Any, Final
 
 import httpx
 
+from litellm import verbose_logger
 from litellm.router_strategy.complexity_router.complexity_router import _CLASSIFICATION_TIER_CRITERIA
 from litellm.types.router import RoutingContext
 
@@ -82,9 +89,13 @@ def _window(turns: Sequence[dict[str, str]]) -> list[dict[str, str]]:
 def build_payload(messages: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """The decisions request: the caller's material as `state`, the tiers as one Choice question.
 
-    Tool output is dropped the way the LLM classifier drops it: it is material the model already
-    read, not a request to grade. The caller's system prompt is sent, as the router sends it to the
-    LLM classifier, because it carries the task constraints the ask is judged against.
+    Only user turns and the caller's system prompt reach Jev. Assistant narration and tool output are
+    dropped the way the LLM classifier drops tool output, and for a measured reason: the agent's own
+    narration is the bulk of an agent conversation, and a four-way tier choice over a conversation
+    padded with it loses the margin below, so nearly every real request declined. The system prompt
+    is sent, as the LLM classifier sends it, because it carries the task constraints the ask is
+    judged against, but it is capped: an agent system prompt runs to tens of thousands of characters
+    and Jev's own guidance is to trim state hard.
     """
     system_parts: list[str] = []
     turns: list[dict[str, str]] = []
@@ -95,12 +106,12 @@ def build_payload(messages: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         role = str(message.get("role") or "user")
         if role == "system":
             system_parts.append(text)
-        elif role != "tool":
+        elif role == "user":
             turns.append({"role": role, "text": text})
 
     state: dict[str, Any] = {"conversation": _window(turns)}
     if system_parts:
-        state["system_prompt"] = "\n\n".join(system_parts)
+        state["system_prompt"] = "\n\n".join(system_parts)[:CONTEXT_CHARS]
 
     return {
         "model": os.environ.get("JEV_MODEL") or DEFAULT_MODEL,
@@ -162,7 +173,18 @@ class JevClassifier:
             body = response.json()
 
         min_confidence = float(os.environ.get("JEV_MIN_CONFIDENCE") or DEFAULT_MIN_CONFIDENCE)
-        return tier_from_response(body, min_confidence)
+        tier = tier_from_response(body, min_confidence)
+        if tier is None:
+            answers = body.get("answers")
+            verdict = answers.get(QUESTION) if isinstance(answers, Mapping) else None
+            verbose_logger.warning(
+                "Jev classifier declined: choice=%r confidence=%r minimum=%s response_model=%r",
+                verdict.get("choice") if isinstance(verdict, Mapping) else None,
+                verdict.get("confidence") if isinstance(verdict, Mapping) else None,
+                min_confidence,
+                body.get("model"),
+            )
+        return tier
 
 
 jev_classifier: Final = JevClassifier()

@@ -14,6 +14,7 @@ MESSAGES = [
     {"role": "system", "content": "You are a coding agent."},
     {"role": "user", "content": "hi"},
     {"role": "tool", "content": "200 pages of build output"},
+    {"role": "assistant", "content": "I will read the proof again."},
     {"role": "user", "content": "Prove the halting problem is undecidable."},
 ]
 
@@ -24,10 +25,16 @@ def test_payload_asks_one_choice_question_over_the_router_tiers():
     assert question["type"] == "choice"
     assert sorted(question["criteria"]) == ["COMPLEX", "MEDIUM", "REASONING", "SIMPLE"]
     assert payload["state"]["system_prompt"] == "You are a coding agent."
+    # tool output and assistant narration are dropped, the ask is the newest user turn
     assert [turn["text"] for turn in payload["state"]["conversation"]] == [
         "hi",
         "Prove the halting problem is undecidable.",
     ]
+
+
+def test_payload_caps_the_system_prompt_an_agent_sends():
+    payload = build_payload([{"role": "system", "content": "x" * 50_000}, MESSAGES[-1]])
+    assert len(payload["state"]["system_prompt"]) == 4000
 
 
 def test_verdict_maps_to_the_tier_and_declines_when_unsure():
