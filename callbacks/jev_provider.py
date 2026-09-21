@@ -17,8 +17,8 @@ message content, so the caller reads typed answers out of it. Wired up in the pr
         - provider: typesafe
           custom_handler: callbacks.jev_provider.handler
 
-and used by a deployment whose `model` is the OpenRouter id sent verbatim (`typesafe/jev-1.13`); the
-provider name matches the id's author prefix deliberately, and the prefix is not stripped here.
+and used by a deployment whose `model` is the author-qualified id (`jev-1.13` with
+`custom_llm_provider: typesafe`), which this provider posts to OpenRouter as `typesafe/jev-1.13`.
 
 Cost: OpenRouter reports the exact charge for each call in `usage.cost`, so that is the recorded
 `response_cost`. The deployment's own `input_cost_per_token`/`output_cost_per_token` price the call
@@ -59,6 +59,19 @@ def decisions_url(api_base: str | None) -> str:
     return f"{base.removesuffix('/v1')}{DECISIONS_PATH}"
 
 
+def openrouter_model(model: str) -> str:
+    """The OpenRouter id for the deployment's model name.
+
+    The provider name is Jev's author prefix, so a deployment written as `jev-1.13` with
+    `custom_llm_provider: typesafe` posts as `typesafe/jev-1.13`. The prefix is added here rather
+    than written into the deployment because LiteLLM registers a deployment's custom pricing under
+    `{custom_llm_provider}/{model}` and looks it up the same way: a model string that already
+    carries the prefix registers as `typesafe/typesafe/jev-1.13`, which the router's own pre-call
+    check then fails to find, logging an error and skipping the context-window guard on every call.
+    """
+    return model if model.startswith(f"{PROVIDER}/") else f"{PROVIDER}/{model}"
+
+
 def decisions_request(messages: list, model: str) -> dict[str, Any]:
     """The decisions body to POST: the caller's JSON plus the model this deployment names."""
     if len(messages) != 1 or not isinstance(messages[0], Mapping):
@@ -72,7 +85,7 @@ def decisions_request(messages: list, model: str) -> dict[str, Any]:
         raise CustomLLMError(status_code=400, message=_TRANSPORT_CONTRACT) from None
     if not isinstance(body, dict) or "state" not in body or "questions" not in body:
         raise CustomLLMError(status_code=400, message=_TRANSPORT_CONTRACT)
-    return {**body, "model": model}
+    return {**body, "model": openrouter_model(model)}
 
 
 def _request_headers(api_key: Any, headers: Mapping[str, Any]) -> dict[str, str]:

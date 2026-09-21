@@ -7,7 +7,7 @@ import json
 import httpx
 import pytest
 
-from callbacks.jev_provider import TypeSafeDecisions, decisions_request, decisions_url
+from callbacks.jev_provider import TypeSafeDecisions, decisions_request, decisions_url, openrouter_model
 from litellm.llms.custom_llm import CustomLLMError
 from litellm.types.utils import ModelResponse
 
@@ -51,6 +51,13 @@ def test_decisions_url_moves_off_the_v1_base_and_honors_an_override(monkeypatch:
     assert decisions_url("https://openrouter.ai/api/v1") == "https://openrouter.ai/api/alpha/decisions"
     monkeypatch.setenv("JEV_DECISIONS_URL", "https://example.test/decisions")
     assert decisions_url("https://openrouter.ai/api/v1") == "https://example.test/decisions"
+
+
+def test_openrouter_model_adds_the_author_prefix_once():
+    # the deployment is named jev-1.13 so LiteLLM registers its price under typesafe/jev-1.13,
+    # which is also the id OpenRouter wants; an already-prefixed name is left alone
+    assert openrouter_model("jev-1.13") == MODEL
+    assert openrouter_model(MODEL) == MODEL
 
 
 def test_decisions_request_carries_the_model_and_rejects_a_conversation():
