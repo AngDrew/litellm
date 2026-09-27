@@ -327,6 +327,16 @@ async def test_managed_admission_scopes_routes_and_requires_the_spend_switch(
     monkeypatch.setenv("TOKENIN_ACCOUNT_SPEND_ENABLED", "true")
     assert await accounts.require_request_admission(client, ACCOUNT, FLAT_TEAM_ID, "/chat/completions") is None
     assert await accounts.require_request_admission(client, ACCOUNT, FLAT_TEAM_ID, "/v1/chat/completions") is None
+    # A live global user-budget guard would deny every managed key, so arming spend on
+    # top of it is refused rather than charging an account nobody can use.
+    from litellm.proxy import proxy_server
+
+    monkeypatch.setattr(proxy_server, "general_settings", {"apply_user_budget_to_team_keys": True})
+    with pytest.raises(HTTPException) as conflicting:
+        await accounts.require_request_admission(client, ACCOUNT, FLAT_TEAM_ID, "/chat/completions")
+    assert conflicting.value.status_code == 503
+    assert "apply_user_budget_to_team_keys" in conflicting.value.detail
+    monkeypatch.setattr(proxy_server, "general_settings", {})
     with pytest.raises(HTTPException) as unsupported:
         await accounts.require_request_admission(client, ACCOUNT, FLAT_TEAM_ID, "/v1/embeddings")
     assert unsupported.value.status_code == 503

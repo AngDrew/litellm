@@ -28,6 +28,13 @@ def account_v2_enabled() -> bool:
     return os.environ.get("TOKENIN_ACCOUNT_V2_ENABLED") == "true"
 
 
+def _global_wallet_enforcement_enabled() -> bool:
+    """Live ``apply_user_budget_to_team_keys`` state. It denies every V2 key, so it conflicts."""
+    from litellm.proxy.proxy_server import general_settings
+
+    return general_settings.get("apply_user_budget_to_team_keys") is True
+
+
 def account_spend_enabled() -> bool:
     """Second switch: records alone must never start charging managed accounts."""
     return account_v2_enabled() and os.environ.get("TOKENIN_ACCOUNT_SPEND_ENABLED") == "true"
@@ -221,6 +228,13 @@ async def require_request_admission(
     if await is_managed_account(prisma_client, user_id):
         if not account_spend_enabled():
             raise HTTPException(status_code=503, detail="Managed account spend is not yet enabled")
+        if _global_wallet_enforcement_enabled():
+            # V2 credit never lands on the user row, so the global user-budget guard would
+            # deny every managed key. Refuse instead of charging an account nobody can use.
+            raise HTTPException(
+                status_code=503,
+                detail="Managed account spend conflicts with apply_user_budget_to_team_keys",
+            )
         if route not in _MANAGED_ADMISSION_ROUTES:
             raise HTTPException(status_code=503, detail="Managed accounts support only chat completions in this phase")
 
