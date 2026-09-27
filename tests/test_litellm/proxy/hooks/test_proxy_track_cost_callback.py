@@ -2116,3 +2116,41 @@ async def test_failure_hook_ignores_requests_without_an_account_hold():
         mock_settle.assert_not_awaited()
         # The seam always calls through; without a hold stamp the helper itself is a no-op.
         assert mock_uncertain.await_args.kwargs["metadata"] is None
+
+
+@pytest.mark.asyncio
+async def test_stream_end_success_settles_account_hold_with_the_actual_cost(monkeypatch):
+    from litellm.proxy import proxy_server
+
+    settle = AsyncMock()
+    monkeypatch.setattr("litellm.proxy.hooks.proxy_track_cost_callback.settle_account_hold", settle)
+    monkeypatch.setattr(proxy_server, "update_cache", MagicMock(), raising=False)
+    monkeypatch.setattr(
+        "litellm.proxy.hooks.proxy_track_cost_callback._update_database_and_spend_counters", AsyncMock()
+    )
+    monkeypatch.setattr(
+        proxy_server,
+        "proxy_logging_obj",
+        MagicMock(
+            db_spend_update_writer=MagicMock(update_database=AsyncMock(return_value="req-1")),
+            slack_alerting_instance=MagicMock(customer_spend_alert=AsyncMock()),
+            failed_tracking_alert=AsyncMock(),
+        ),
+    )
+    monkeypatch.setattr(proxy_server, "increment_spend_counters", AsyncMock())
+    kwargs = {
+        "model": "gpt-4",
+        "stream": True,
+        "complete_streaming_response": MagicMock(),
+        "litellm_params": {
+            "metadata": {
+                "user_api_key_tokenin_account_hold_id": "hold-1",
+                "user_api_key_user_id": "u-1",
+            }
+        },
+        "standard_logging_object": {"response_cost": 0.25},
+        "call_type": "acompletion",
+    }
+    await _ProxyDBLogger()._PROXY_track_cost_callback(kwargs, None, datetime.now(), datetime.now())
+    settle.assert_awaited_once()
+    assert settle.await_args.kwargs["actual_cost"] == pytest.approx(0.25)
