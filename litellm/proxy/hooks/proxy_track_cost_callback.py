@@ -34,6 +34,11 @@ from litellm.proxy.spend_tracking.spend_tracking_utils import (
     _sanitize_error_information_for_spend_logs,
     get_request_model_access_groups,
 )
+from litellm.proxy.tokenin.enforcement import (
+    hold_metadata_from_request_data,
+    mark_account_hold_uncertain,
+    settle_account_hold,
+)
 from litellm.proxy.utils import ProxyUpdateSpend
 from litellm.types.utils import (
     CallTypes,
@@ -217,6 +222,15 @@ class _ProxyDBLogger(CustomLogger):
             org_id=user_api_key_dict.org_id,
         )
 
+        # A partial stream that broke after chunks were delivered has a recovered
+        # cost; anything else is an unknown outcome, so keep the account hold
+        # reserved instead of refunding work the provider may already have billed.
+        hold_metadata: Final = hold_metadata_from_request_data(request_data)
+        if recovered_response_cost > 0:
+            await settle_account_hold(metadata=hold_metadata, actual_cost=recovered_response_cost)
+        else:
+            await mark_account_hold_uncertain(metadata=hold_metadata)
+
     @log_db_metrics
     async def _PROXY_track_cost_callback(
         self,
@@ -257,9 +271,7 @@ class _ProxyDBLogger(CustomLogger):
             key_alias: Final = cast(str | None, metadata.get("user_api_key_alias", None))
             end_user_max_budget: Final = metadata.get("user_api_end_user_max_budget", None)
             sl_object: Final[StandardLoggingPayload | None] = kwargs.get("standard_logging_object", None)
-            response_cost = (
-                sl_object.get("response_cost", None) if sl_object is not None else None
-            )
+            response_cost = sl_object.get("response_cost", None) if sl_object is not None else None
             if response_cost is None:
                 response_cost = kwargs.get("response_cost", None)
             tags: Final = _get_request_tags_for_cost_tracking(
@@ -293,6 +305,9 @@ class _ProxyDBLogger(CustomLogger):
                     end_user_id=end_user_id,
                     call_type=call_type,
                 ):
+                    # Settle the account hold from the known cost before the spend-log
+                    # write, so an account charge never depends on that write succeeding.
+                    await settle_account_hold(metadata=metadata, actual_cost=response_cost)
                     ## UPDATE DATABASE
                     await _update_database_and_spend_counters(
                         proxy_logging_obj=proxy_logging_obj,
@@ -335,6 +350,8 @@ class _ProxyDBLogger(CustomLogger):
                     )
                 elif budget_reservation is not None:
                     await _release_budget_reservation(budget_reservation=budget_reservation)
+                else:
+                    await mark_account_hold_uncertain(metadata=metadata)
             else:
                 if _is_unbilled_interaction_response(completion_response):
                     if BACKGROUND_INTERACTION_COST_POLLING_ENABLED and _is_unbilled_in_progress_interaction(
@@ -350,8 +367,10 @@ class _ProxyDBLogger(CustomLogger):
                         "Released the budget reservation for an interaction create with no usage "
                         "that no poll task will settle"
                     )
+                    await mark_account_hold_uncertain(metadata=metadata)
                     return
                 await _release_budget_reservation(budget_reservation=budget_reservation)
+                await mark_account_hold_uncertain(metadata=metadata)
                 # Non-model call types (health checks, afile_delete) have no model or standard_logging_object.
                 # Use .get() for "stream" to avoid KeyError on health checks.
                 # WS session wrappers (_aresponses_websocket, _arealtime) also reach here with
@@ -381,6 +400,7 @@ class _ProxyDBLogger(CustomLogger):
         except Exception as e:
             error_msg = f"Error in tracking cost callback - {e}\n Traceback:{traceback.format_exc()}"
             model = kwargs.get("model", "")
+            await mark_account_hold_uncertain(metadata=get_litellm_metadata_from_kwargs(kwargs=kwargs))
             metadata = get_litellm_metadata_from_kwargs(kwargs=kwargs)
             litellm_metadata: Final = kwargs.get("litellm_params", {}).get("litellm_metadata", {})
             old_metadata: Final = kwargs.get("litellm_params", {}).get("metadata", {})

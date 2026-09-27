@@ -318,7 +318,9 @@ _CLIENT_PRICING_METADATA_FIELDS: Final = frozenset({"model_info", "standard_logg
 # ``attempted_fallbacks`` and ``original_model_group`` are written by the router
 # and read by spend logs as fact; a client value has no legitimate meaning and no
 # key or team setting keeps it, so the strip is never gated.
-_ROUTER_RESERVED_METADATA_FIELDS: Final = frozenset({"attempted_fallbacks", "original_model_group"})
+_ROUTER_RESERVED_METADATA_FIELDS: Final = frozenset(
+    {"attempted_fallbacks", "original_model_group", "user_api_key_tokenin_account_hold_id"}
+)
 _ALLOW_CLIENT_PRICING_OVERRIDE_METADATA_KEY: Final = "allow_client_pricing_override"
 
 # Request fields whose value, when URL-valued, becomes the outbound destination
@@ -1379,6 +1381,13 @@ class LiteLLMProxyRequestSetup:
         )
         if user_api_key_dict.budget_reservation is not None:
             data[_metadata_variable_name]["user_api_key_budget_reservation"] = user_api_key_dict.budget_reservation
+        if user_api_key_dict.tokenin_account_hold_id is not None:
+            # The hold id settles real credit, so it is stamped on both buckets and
+            # stripped from client input: a forged id could refund another account.
+            for _bucket_name in ("metadata", "litellm_metadata"):
+                _bucket: Final = data.setdefault(_bucket_name, {})
+                if isinstance(_bucket, dict):
+                    _bucket["user_api_key_tokenin_account_hold_id"] = user_api_key_dict.tokenin_account_hold_id
         if user_api_key_dict.matched_model_access_groups:
             data[_metadata_variable_name][MODEL_ACCESS_GROUP_METADATA_KEY] = (
                 user_api_key_dict.matched_model_access_groups

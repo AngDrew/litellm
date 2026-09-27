@@ -2888,6 +2888,11 @@ class UserAPIKeyAuth(LiteLLM_VerificationTokenView):  # the expected response ob
         ),
     )
     budget_reservation: dict[str, Any] | None = Field(default=None, exclude=True)
+    tokenin_account_hold_id: str | None = Field(
+        default=None,
+        exclude=True,
+        description="Account-ledger reservation created at admission for an enrolled Tokenin account",
+    )
     matched_model_access_groups: list[str] | None = Field(default=None, exclude=True)
     budget_throttle_pct: float | None = Field(default=None, exclude=True)
     user: Any | None = None  # Expanded user object when expand=user is used
