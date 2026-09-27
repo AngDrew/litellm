@@ -3371,6 +3371,18 @@ class ProxyBaseLLMRequestProcessing:
                 ):
                     await proxy_logging_obj._arelease_max_parallel_requests_on_disconnect(user_api_key_dict)
 
+                # A settled account hold is already resolved, so this only turns a
+                # hold that nobody could bill into a visible uncertain one. A client
+                # that got no provider output at all is refunded on the cancel path.
+                from litellm.proxy.tokenin.enforcement import (
+                    handle_account_hold_on_cancel,
+                    hold_metadata_from_request_data,
+                )
+
+                await handle_account_hold_on_cancel(
+                    hold_metadata_from_request_data(request_data), provider_output_delivered=True
+                )
+
             if hasattr(response, "aclose"):
                 try:
                     await response.aclose()
@@ -3473,8 +3485,17 @@ class ProxyBaseLLMRequestProcessing:
                 from litellm.proxy.spend_tracking.budget_reservation import (
                     release_budget_reservation_on_cancel,
                 )
+                from litellm.proxy.tokenin.enforcement import (
+                    handle_account_hold_on_cancel,
+                    hold_metadata_from_request_data,
+                )
 
                 await release_budget_reservation_on_cancel(getattr(user_api_key_dict, "budget_reservation", None))
+                # No provider output was delivered or withheld, so the account hold is
+                # known not to have billed and its whole reservation is returned.
+                await handle_account_hold_on_cancel(
+                    hold_metadata_from_request_data(request_data), provider_output_delivered=False
+                )
             raise
         except Exception as e:
             verbose_proxy_logger.exception(

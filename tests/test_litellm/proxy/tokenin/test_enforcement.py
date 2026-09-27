@@ -65,6 +65,28 @@ async def test_settle_mark_and_cancel_reach_the_ledger_once(monkeypatch: pytest.
 
 
 @pytest.mark.asyncio
+async def test_client_cancel_refunds_only_when_the_provider_produced_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancel: Final = AsyncMock(return_value=True)
+    uncertain: Final = AsyncMock(return_value=True)
+    monkeypatch.setattr(enforcement, "_prisma_client", lambda: object())
+    monkeypatch.setattr("litellm.proxy.tokenin.ledger.cancel_account_request", cancel)
+    monkeypatch.setattr("litellm.proxy.tokenin.ledger.mark_account_request_uncertain", uncertain)
+    metadata: Final = {enforcement.TOKENIN_ACCOUNT_HOLD_METADATA_KEY: HOLD}
+    await enforcement.handle_account_hold_on_cancel(metadata, provider_output_delivered=False)
+    cancel.assert_awaited_once()
+    uncertain.assert_not_awaited()
+    cancel.reset_mock()
+    await enforcement.handle_account_hold_on_cancel(metadata, provider_output_delivered=True)
+    uncertain.assert_awaited_once()
+    cancel.assert_not_awaited()
+    uncertain.reset_mock()
+    await enforcement.handle_account_hold_on_cancel({}, provider_output_delivered=False)
+    cancel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_failed_or_unavailable_settlement_never_raises_into_the_request(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "litellm.proxy.tokenin.ledger.settle_account_request",
