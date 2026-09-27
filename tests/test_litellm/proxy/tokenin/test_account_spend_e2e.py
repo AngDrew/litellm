@@ -16,8 +16,10 @@ refused, and that nothing is refunded for work that may have been billed.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Final
@@ -82,6 +84,23 @@ def _config(database_url: str) -> dict[str, Any]:
     }
 
 
+# State the app initializes once for this module, re-stamped before every test: the
+# proxy conftest restores proxy_server globals after each test and the litellm conftest
+# empties litellm's callback lists, either of which detaches the module-scoped app from
+# its cost callback (no callback means no settlement).
+_APP_GLOBALS: Final[dict[str, Any]] = {}
+_APP_CALLBACKS: Final[dict[str, Any]] = {}
+_CALLBACK_LISTS: Final = (
+    "callbacks",
+    "success_callback",
+    "failure_callback",
+    "input_callback",
+    "_async_success_callback",
+    "_async_failure_callback",
+    "_async_input_callback",
+)
+
+
 @pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def proxy_app():
     database_url: Final = os.environ["TOKENIN_E2E_DATABASE_URL"]
@@ -100,10 +119,36 @@ async def proxy_app():
 
     cleanup_router_config_variables()
     await initialize(config=config_path)
+    import litellm
+
     async with proxy_startup_event(app):
         assert proxy_server.prisma_client is not None
         await proxy_server.prisma_client.check_view_exists()
+        # The flat team is provisioned state the live proxy already assumes: tokenin/key/generate
+        # binds every issued key to it. An empty acceptance database has to seed it.
+        from litellm.proxy.tokenin.plans import FLAT_TEAM_ID
+
+        await proxy_server.prisma_client.db.execute_raw(
+            'INSERT INTO "LiteLLM_TeamTable" ("team_id") VALUES ($1) ON CONFLICT DO NOTHING', FLAT_TEAM_ID
+        )
+        for name in ("master_key", "prisma_client", "llm_router"):
+            _APP_GLOBALS[name] = getattr(proxy_server, name)
+        for name in _CALLBACK_LISTS:
+            _APP_CALLBACKS[name] = getattr(litellm, name)
         yield app
+
+
+@pytest.fixture(autouse=True)
+def _restore_app_globals(proxy_app) -> None:
+    import litellm
+
+    from litellm.proxy import proxy_server
+
+    for name, value in _APP_GLOBALS.items():
+        setattr(proxy_server, name, value)
+    for name, value in _APP_CALLBACKS.items():
+        setattr(litellm, name, value)
+    yield
 
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module")
@@ -204,6 +249,16 @@ async def _account_state(prisma, user_id: str) -> dict[str, Any]:
     }
 
 
+async def _await_open_holds_closed(prisma, user_id: str, *, timeout: float = 10.0) -> dict[str, Any]:
+    """Settlement and cancel run in the cost callback, after the response body: poll for it."""
+    deadline: Final = time.monotonic() + timeout
+    state: Final = await _account_state(prisma, user_id)
+    while state["open_nano"] > 0 and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+        state = await _account_state(prisma, user_id)
+    return state
+
+
 @pytest.mark.asyncio(loop_scope="module")
 async def test_zero_credit_account_is_refused_and_writes_no_spend(client, prisma) -> None:
     user_id, key = await _enrolled_account(client, prisma, models=[STUB_MODEL])
@@ -220,7 +275,7 @@ async def test_zero_credit_account_is_refused_and_writes_no_spend(client, prisma
 async def test_one_grant_is_shared_by_two_keys_and_never_overspent(client, prisma) -> None:
     user_id, key_one = await _enrolled_account(client, prisma, models=[STUB_MODEL])
     key_two: Final = await _issue_key(client, user_id, f"{user_id}-k2")
-    granted: Final = await _grant(client, user_id, "0.00005")
+    granted: Final = await _grant(client, user_id, "0.011")
     assert granted.status_code == 200, granted.text
     grant_nano: Final = int(round(float(granted.json()["credited"]) * 1_000_000_000))
 
@@ -231,7 +286,7 @@ async def test_one_grant_is_shared_by_two_keys_and_never_overspent(client, prism
         (allowed if response.status_code == 200 else denied).append(response.status_code)
     assert allowed, "the grant must be spendable through both keys"
     assert set(denied) <= {402}, denied
-    state: Final = await _account_state(prisma, user_id)
+    state: Final = await _await_open_holds_closed(prisma, user_id)
     assert state["charged_nano"] <= grant_nano, state
     assert state["charged_nano"] > 0, state
     assert state["debt_nano"] == 0, state
@@ -296,7 +351,7 @@ async def test_streaming_completion_settles_the_actual_cost(client, prisma) -> N
         assert response.status_code == 200
         body: Final = "".join([chunk async for chunk in response.aiter_text()])
     assert "data:" in body
-    state: Final = await _account_state(prisma, user_id)
+    state: Final = await _await_open_holds_closed(prisma, user_id)
     assert state["holds"], "a stream must leave a settled hold"
     assert all(row["state"] == "settled" for row in state["holds"]), state
     assert state["charged_nano"] > 0, state
@@ -316,7 +371,7 @@ async def test_client_disconnect_never_drops_credit_silently(client, prisma) -> 
         assert response.status_code == 200
         async for _chunk in response.aiter_text():
             break
-    state: Final = await _account_state(prisma, user_id)
+    state: Final = await _await_open_holds_closed(prisma, user_id)
     for row in state["holds"]:
         assert row["state"] in {"settled", "cancelled", "uncertain"}, state
         if row["state"] == "uncertain":
@@ -332,10 +387,10 @@ async def test_operator_reconciliation_clears_a_pinned_hold(client, prisma) -> N
     await prisma.db.execute_raw(
         'INSERT INTO "LiteLLM_TokeninHold" '
         '("request_id", "user_id", "key_hash", "model", "state", "estimated_nano", "admitted_at") '
-        "VALUES ($1,$2,'pinned','gpt-4o-mini','held',1000000000,$3)",
+        "VALUES ($1,$2,'pinned','gpt-4o-mini','held',1000000000,$3::timestamp)",
         request_id,
         user_id,
-        datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=30),
+        (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=30)).isoformat(),
     )
     grant_row: Final = await prisma.db.query_raw(
         'SELECT "idempotency_key" FROM "LiteLLM_TokeninGrant" WHERE "user_id" = $1 LIMIT 1', user_id

@@ -23,6 +23,16 @@ PERIOD_START: Final = datetime(2026, 1, 31, tzinfo=timezone.utc)
 PERIOD_END: Final = datetime(2026, 2, 28, tzinfo=timezone.utc)
 
 
+def _stored(value: object) -> datetime | None:
+    """Postgres casts a text bind into its timestamp column; mirror that for the fake store."""
+    if value is None:
+        return None
+    moment: Final = datetime.fromisoformat(value) if isinstance(value, str) else value
+    if not isinstance(moment, datetime):
+        raise AssertionError(f"not a timestamp bind: {value!r}")
+    return moment.astimezone(timezone.utc).replace(tzinfo=None) if moment.tzinfo is not None else moment
+
+
 class FakeTx:
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
@@ -61,8 +71,8 @@ class FakeTx:
                 "amount_nano": amount,
                 "subscription_id": sub,
                 "period_index": index,
-                "period_start": start,
-                "period_end": end,
+                "period_start": _stored(start),
+                "period_end": _stored(end),
             }
             return 1
         if 'INSERT INTO "LiteLLM_TokeninPolicy"' in sql:
@@ -75,7 +85,7 @@ class FakeTx:
                 "models": models,
                 "rpm_limit": rpm,
                 "max_parallel_requests": concurrent,
-                "effective_at": effective,
+                "effective_at": _stored(effective),
                 "created_at": datetime(2026, 1, 1) + timedelta(seconds=len(self.policies)),
             }
             return 1

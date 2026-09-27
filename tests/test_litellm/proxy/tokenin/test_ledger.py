@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Final
@@ -27,6 +27,18 @@ ACCOUNT: Final = "paid-account"
 NANO: Final = 1_000_000_000
 JAN31: Final = datetime(2026, 1, 31)
 FEB28: Final = datetime(2026, 2, 28)
+
+
+def _stored(value: object) -> datetime | None:
+    """Postgres casts a text bind into its timestamp column; mirror that for the fake store."""
+    if value is None:
+        return None
+    moment: Final = datetime.fromisoformat(value) if isinstance(value, str) else value
+    if not isinstance(moment, datetime):
+        raise AssertionError(f"not a timestamp bind: {value!r}")
+    return moment.astimezone(timezone.utc).replace(tzinfo=None) if moment.tzinfo is not None else moment
+
+
 MAR31: Final = datetime(2026, 3, 31)
 APR30: Final = datetime(2026, 4, 30)
 
@@ -168,7 +180,7 @@ class LedgerDB:
                 for grant_obj in self.grants.values()
             ]
         if '"LiteLLM_TokeninPolicy"' in sql:
-            return [policy for policy in self.policies if policy["effective_at"] <= values[1]]
+            return [policy for policy in self.policies if policy["effective_at"] <= _stored(values[1])]
         if "COUNT(*) FILTER" in sql:
             return [
                 {
@@ -209,7 +221,7 @@ class LedgerDB:
                 "state": state,
                 "estimated_nano": amount,
                 "charged_nano": charged,
-                "admitted_at": timestamp,
+                "admitted_at": _stored(timestamp),
             }
         elif 'UPDATE "LiteLLM_TokeninAllocation"' in sql and len(values) == 1:
             self.allocations = {key: amount for key, amount in self.allocations.items() if key[0] != str(values[0])}
