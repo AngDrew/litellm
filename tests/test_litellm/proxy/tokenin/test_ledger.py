@@ -450,6 +450,98 @@ async def test_cancel_releases_credit_but_never_refunds_settled_holds() -> None:
     assert db.allocations[("reuse", "paid")] == 4 * NANO
 
 
+class SettlementRaceDB:
+    """The first hold read pauses while a concurrent settlement commits under the account lock."""
+
+    def __init__(self) -> None:
+        self.db: Final = self
+        self.state: str = "held"
+        self.charged_nano: int | None = None
+        self.allocation_nano: int = 2 * NANO
+        self.account_lock: asyncio.Lock = asyncio.Lock()
+        self.identity_read: asyncio.Event = asyncio.Event()
+        self.continue_identity: asyncio.Event = asyncio.Event()
+        self.transaction_count: int = 0
+
+    def tx(self) -> SettlementRaceTransaction:
+        self.transaction_count += 1
+        return SettlementRaceTransaction(self, self.transaction_count)
+
+
+class SettlementRaceTransaction:
+    def __init__(self, db: SettlementRaceDB, transaction_id: int) -> None:
+        self.db: Final = db
+        self.transaction_id: Final = transaction_id
+        self.account_locked: bool = False
+        self.identity_read: bool = False
+
+    async def __aenter__(self) -> SettlementRaceTransaction:
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        if self.account_locked:
+            self.db.account_lock.release()
+
+    async def query_raw(self, sql: str, *values: object) -> list[dict[str, object]]:
+        if '"LiteLLM_TokeninAccount"' in sql and "FOR UPDATE" in sql:
+            await self.db.account_lock.acquire()
+            self.account_locked = True
+            return [{"user_id": ACCOUNT, "debt_nano": 0}]
+        if '"LiteLLM_TokeninHold" WHERE "request_id"' in sql:
+            if '"state", "charged_nano"' in sql:
+                return [{"state": self.db.state, "charged_nano": self.db.charged_nano}]
+            if 'SELECT "state"' in sql:
+                return [{"state": self.db.state}]
+            if not self.identity_read:
+                self.identity_read = True
+                stale_state: Final = self.db.state
+                if self.transaction_id == 1:
+                    self.db.identity_read.set()
+                    await self.db.continue_identity.wait()
+                return [
+                    {
+                        "user_id": ACCOUNT,
+                        **({"state": stale_state} if '"state"' in sql else {}),
+                    }
+                ]
+        if '"LiteLLM_TokeninAllocation"' in sql and "JOIN" in sql:
+            return [{"grant_id": "paid", "amount_nano": self.db.allocation_nano}]
+        raise AssertionError(sql)
+
+    async def execute_raw(self, sql: str, *values: object) -> int:
+        if 'UPDATE "LiteLLM_TokeninAllocation"' in sql:
+            self.db.allocation_nano = int(values[2]) if len(values) == 3 else 0
+        elif 'UPDATE "LiteLLM_TokeninHold"' in sql:
+            if "'cancelled'" in sql:
+                self.db.state, self.db.charged_nano = "cancelled", 0
+            elif "'uncertain'" in sql:
+                self.db.state = "uncertain"
+            else:
+                self.db.state, self.db.charged_nano = "settled", int(values[1])
+        else:
+            raise AssertionError(sql)
+        return 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transition", ("cancel", "uncertain"))
+async def test_settlement_wins_over_a_stale_disconnect_transition(transition: str) -> None:
+    db: Final = SettlementRaceDB()
+    transition_task: Final = asyncio.create_task(
+        cancel_account_request(db, "racing") if transition == "cancel" else mark_account_request_uncertain(db, "racing")
+    )
+    await db.identity_read.wait()
+    try:
+        assert await settle_account_request(db, "racing", 1.0) == NANO
+    finally:
+        db.continue_identity.set()
+
+    assert await transition_task is False
+    assert db.state == "settled"
+    assert db.charged_nano == NANO
+    assert db.allocation_nano == NANO
+
+
 @pytest.mark.asyncio
 async def test_uncertain_hold_keeps_reservation_and_never_releases_speculatively() -> None:
     db: Final = LedgerDB()

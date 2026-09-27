@@ -379,7 +379,7 @@ async def cancel_account_request(
     reserved unless the operator route, which decides with a human note on record, releases them."""
     async with prisma_client.db.tx() as tx:
         identity: Final = await tx.query_raw(
-            'SELECT "user_id", "state" FROM "LiteLLM_TokeninHold" WHERE "request_id" = $1', request_id
+            'SELECT "user_id" FROM "LiteLLM_TokeninHold" WHERE "request_id" = $1', request_id
         )
         if not identity:
             return False
@@ -387,7 +387,12 @@ async def cancel_account_request(
             'SELECT "user_id" FROM "LiteLLM_TokeninAccount" WHERE "user_id" = $1 FOR UPDATE',
             identity[0]["user_id"],
         )
-        state: Final = identity[0]["state"]
+        current: Final = await tx.query_raw(
+            'SELECT "state" FROM "LiteLLM_TokeninHold" WHERE "request_id" = $1', request_id
+        )
+        if not current:
+            return False
+        state: Final = current[0]["state"]
         if state == "cancelled":
             return True
         if state != "held" and not (allow_uncertain and state == "uncertain"):
@@ -407,7 +412,7 @@ async def mark_account_request_uncertain(prisma_client: PrismaClient, request_id
     """Keep the reservation when billing outcome is unknown, so nothing is refunded speculatively."""
     async with prisma_client.db.tx() as tx:
         identity: Final = await tx.query_raw(
-            'SELECT "user_id", "state" FROM "LiteLLM_TokeninHold" WHERE "request_id" = $1', request_id
+            'SELECT "user_id" FROM "LiteLLM_TokeninHold" WHERE "request_id" = $1', request_id
         )
         if not identity:
             return False
@@ -415,7 +420,12 @@ async def mark_account_request_uncertain(prisma_client: PrismaClient, request_id
             'SELECT "user_id" FROM "LiteLLM_TokeninAccount" WHERE "user_id" = $1 FOR UPDATE',
             identity[0]["user_id"],
         )
-        state: Final = identity[0]["state"]
+        current: Final = await tx.query_raw(
+            'SELECT "state" FROM "LiteLLM_TokeninHold" WHERE "request_id" = $1', request_id
+        )
+        if not current:
+            return False
+        state: Final = current[0]["state"]
         if state == "uncertain":
             return True
         if state != "held":

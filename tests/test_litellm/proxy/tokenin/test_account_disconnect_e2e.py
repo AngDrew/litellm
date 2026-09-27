@@ -23,7 +23,7 @@ import json
 import os
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import Any, Final
 
 import httpx
@@ -67,11 +67,11 @@ class SlowUpstream:
     """
 
     def __init__(self) -> None:
-        self.url: Final = ""
-        self.first_chunk_delay = 0.0
-        self.chunk_interval = 1.0
-        self.chunk_count = 5
-        self.requests = 0
+        self.url: str = ""
+        self.first_chunk_delay: float = 0.0
+        self.chunk_interval: float = 1.0
+        self.chunk_count: int = 5
+        self.requests: int = 0
         self.chunks_sent: Final[dict[int, int]] = {}
         self.completed: Final[set[int]] = set()
 
@@ -142,17 +142,21 @@ async def live_server(slow_upstream: SlowUpstream) -> AsyncIterator[str]:
     os.environ["TOKENIN_ACCOUNT_SERVICE_TOKEN"] = SERVICE_TOKEN
     os.environ["LITELLM_MASTER_KEY"] = MASTER_KEY
 
-    config: Final = _config(database_url)
-    config["model_list"].append(
-        {
-            "model_name": SLOW_MODEL,
-            "litellm_params": {
-                "model": "openai/gpt-4o-mini",
-                "api_key": "sk-stub-provider",
-                "api_base": slow_upstream.url,
+    base_config: Final = _config(database_url)
+    config: Final = {
+        **base_config,
+        "model_list": [
+            *base_config["model_list"],
+            {
+                "model_name": SLOW_MODEL,
+                "litellm_params": {
+                    "model": "openai/gpt-4o-mini",
+                    "api_key": "sk-stub-provider",
+                    "api_base": slow_upstream.url,
+                },
             },
-        }
-    )
+        ],
+    }
     config_path: Final = tempfile.NamedTemporaryFile(mode="w", suffix="-disconnect.yaml", delete=False).name
     with open(config_path, "w", encoding="utf-8") as handle:
         yaml.dump(config, handle)
@@ -229,30 +233,21 @@ def _stream_body() -> dict[str, Any]:
     return {"model": SLOW_MODEL, "messages": [{"role": "user", "content": "hi"}], "stream": True}
 
 
-async def _disconnect_after(base_url: str, key: str, *, chunks_read: int) -> None:
-    """Stream one request over a real socket and hang up while the proxy is still streaming."""
+async def _disconnect_after_first_chunk(base_url: str, key: str) -> None:
+    """Read one data chunk over a real socket, then hang up while the proxy is still streaming."""
     async with httpx.AsyncClient(base_url=base_url, timeout=REQUEST_TIMEOUT) as client:
         async with client.stream(
             "POST", "/v1/chat/completions", headers={"Authorization": f"Bearer {key}"}, json=_stream_body()
         ) as response:
             assert response.status_code == 200, await response.aread()
-            read: Final = 0
-            if chunks_read:
-                async for line in response.aiter_lines():
-                    if line.startswith("data:"):
-                        read += 1
-                        if read == chunks_read:
-                            break
-            assert read == chunks_read, f"expected {chunks_read} data chunks before hanging up, saw {read}"
+            async for line in response.aiter_lines():
+                if line.startswith("data:"):
+                    return
+            raise AssertionError("stream ended before the client received a data chunk")
 
 
-async def _abort_mid_request(base_url: str, key: str) -> None:
-    """Open a request over a raw socket and blow it up before the provider has produced anything.
-
-    A client cannot hang up before the response headers using httpx: the proxy defers the
-    response start until the provider's first chunk arrives. Aborting the TCP connection is
-    the only way to leave with no provider output on the wire at all.
-    """
+async def _abort_mid_request(base_url: str, key: str, upstream: SlowUpstream, baseline: int) -> int:
+    """Abort a raw TCP request after the upstream is waiting for its first chunk."""
     host, port = base_url.removeprefix("http://").split(":")
     writer: Final = (await asyncio.open_connection(host, int(port)))[1]
     body: Final = json.dumps(_stream_body()).encode()
@@ -266,13 +261,18 @@ async def _abort_mid_request(base_url: str, key: str) -> None:
         + body
     )
     await writer.drain()
-    await asyncio.sleep(0.5)
+    request_number: Final = await _await_upstream_request(upstream, baseline)
+    assert request_number == baseline + 1
+    assert upstream.chunks_sent[request_number] == 0, "the client must abort before the first provider chunk"
+    await asyncio.sleep(0.1)
+    assert upstream.chunks_sent[request_number] == 0
     writer.transport.abort()
     writer.close()
+    return request_number
 
 
 async def _await_upstream_request(upstream: SlowUpstream, baseline: int, *, timeout: float = 8.0) -> int:
-    """Wait for the proxy to reach the provider, which trails the client's abort by the auth path."""
+    """Wait until the proxy has opened the upstream request."""
     deadline: Final = time.monotonic() + timeout
     while upstream.requests <= baseline and time.monotonic() < deadline:
         await asyncio.sleep(0.02)
@@ -302,7 +302,7 @@ async def test_disconnect_after_a_chunk_charges_the_partial_stream(
     slow_upstream.chunk_interval = 2.0
     slow_upstream.chunk_count = 5
 
-    await _disconnect_after(live_server, key, chunks_read=1)
+    await _disconnect_after_first_chunk(live_server, key)
 
     request_number: Final = slow_upstream.requests
     assert slow_upstream.chunks_sent[request_number] == 1, slow_upstream.chunks_sent
@@ -323,31 +323,40 @@ async def test_disconnect_after_a_chunk_charges_the_partial_stream(
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_disconnect_before_provider_output_never_refunds(
-    client, live_server: str, slow_upstream: SlowUpstream, prisma
+async def test_disconnect_before_provider_output_refunds_the_reservation(
+    client, live_server: str, slow_upstream: SlowUpstream, prisma, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A client that aborts before the provider has produced anything. The proxy still
-    cannot price the request, so it keeps the reservation instead of guessing a refund."""
+    """A client aborts before the provider emits output; the shielded finalizer refunds once."""
+    from litellm.proxy.tokenin import enforcement
+
     user_id, key = await _enrolled_account(client, prisma, models=[SLOW_MODEL])
     await _grant(client, user_id, "0.05")
     slow_upstream.first_chunk_delay = 8.0
     slow_upstream.chunk_interval = 2.0
     slow_upstream.chunk_count = 5
 
-    baseline: Final = slow_upstream.requests
-    await _abort_mid_request(live_server, key)
+    hold_resolutions: Final[list[bool]] = []
+    original_handler: Final = enforcement.handle_account_hold_on_cancel
 
-    request_number: Final = await _await_upstream_request(slow_upstream, baseline)
-    assert request_number == baseline + 1, "the proxy must have reached the upstream"
-    assert slow_upstream.chunks_sent[request_number] == 0, "the provider produced no output before the client left"
+    async def record_hold_resolution(metadata: Mapping[str, object] | None, *, provider_output_delivered: bool) -> None:
+        hold_resolutions.append(provider_output_delivered)
+        await original_handler(metadata, provider_output_delivered=provider_output_delivered)
+
+    monkeypatch.setattr(enforcement, "handle_account_hold_on_cancel", record_hold_resolution)
+    baseline: Final = slow_upstream.requests
+    request_number: Final = await _abort_mid_request(live_server, key, slow_upstream, baseline)
+    assert slow_upstream.chunks_sent[request_number] == 0, "the upstream emitted no chunk when the client aborted"
     assert request_number not in slow_upstream.completed
 
     state: Final = await _await_hold_finalized(prisma, user_id)
     rows: Final = state["holds"]
     assert rows, state
-    assert rows[0]["state"] in {"settled", "uncertain"}, state
-    if rows[0]["state"] == "uncertain":
-        assert int(rows[0]["charged_nano"] or 0) == 0 and int(rows[0]["held_nano"]) > 0, state
+    assert rows[0]["state"] == "cancelled", state
+    assert int(rows[0]["charged_nano"] or 0) == 0, state
+    assert int(rows[0]["held_nano"]) == 0, "cancellation must release the allocation"
+    assert state["open_nano"] == 0, state
+    assert state["charged_nano"] == 0, state
+    assert hold_resolutions == [False], "the shielded finalizer must resolve the hold exactly once"
 
 
 @pytest.mark.asyncio(loop_scope="module")
@@ -364,7 +373,7 @@ async def test_unpriceable_disconnect_stays_reserved_until_the_operator_clears_i
     slow_upstream.chunk_count = 5
     monkeypatch.setattr(litellm, "disable_streaming_logging", True)
 
-    await _disconnect_after(live_server, key, chunks_read=1)
+    await _disconnect_after_first_chunk(live_server, key)
 
     state: Final = await _await_hold_finalized(prisma, user_id)
     rows: Final = state["holds"]
