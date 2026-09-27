@@ -370,7 +370,12 @@ class _ProxyDBLogger(CustomLogger):
                     await mark_account_hold_uncertain(metadata=metadata)
                     return
                 await _release_budget_reservation(budget_reservation=budget_reservation)
-                await mark_account_hold_uncertain(metadata=metadata)
+                if not (kwargs.get("stream") is True and "complete_streaming_response" not in kwargs):
+                    # Streaming logs this callback per chunk and a chunk carries no final cost
+                    # yet, so an in-flight stream is not an unknown outcome: only a completed
+                    # stream that still reports no cost is one. Mirrors the deferred
+                    # cost-tracking failure check below.
+                    await mark_account_hold_uncertain(metadata=metadata)
                 # Non-model call types (health checks, afile_delete) have no model or standard_logging_object.
                 # Use .get() for "stream" to avoid KeyError on health checks.
                 # WS session wrappers (_aresponses_websocket, _arealtime) also reach here with
