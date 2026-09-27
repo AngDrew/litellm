@@ -70,6 +70,12 @@ def _dollars(amount_nano: int) -> Decimal:
     return Decimal(amount_nano) / _NANODOLLARS
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
 def _fingerprint(payload: Mapping[str, object]) -> str:
     serialized: Final = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode()).hexdigest()
@@ -125,13 +131,17 @@ def _grant_details(data: GrantRequest) -> tuple[int, datetime | None, datetime |
     end: Final = _utc(data.period_end)
     if not start < end or not 28 <= (end - start).total_seconds() / 86400 <= 32:
         raise HTTPException(status_code=400, detail="Fixed grant period must span one paid month")
+    return _fixed_monthly_amount(plan), start, end, "fixed"
+
+
+def _fixed_monthly_amount(plan: TokeninPlan) -> int:
     if plan.monthly_value is None and plan.budget_duration not in {"30d", "1mo"}:
         raise HTTPException(status_code=400, detail="Fixed plan lacks a monthly credit")
     try:
         monthly_credit: Final = Decimal(str(plan.monthly_value if plan.monthly_value is not None else plan.max_budget))
     except (InvalidOperation, ValueError):
         raise HTTPException(status_code=400, detail="Fixed plan lacks monthly credit")
-    return _amount_nano(monthly_credit), start, end, "fixed"
+    return _amount_nano(monthly_credit)
 
 
 async def is_managed_account(prisma_client: PrismaClient, user_id: str | None) -> bool:
@@ -170,8 +180,32 @@ def _grant_response(row: Mapping[str, object], duplicate: bool) -> dict[str, obj
         "user_id": row["user_id"],
         "idempotency_key": row["idempotency_key"],
         "credited": float(_dollars(int(row["amount_nano"]))),
+        "plan_id": row.get("plan_id"),
+        "kind": row.get("kind"),
+        "subscription_id": row.get("subscription_id"),
+        "period_index": row.get("period_index"),
+        "period_start": _as_utc(row.get("period_start")),
+        "period_end": _as_utc(row.get("period_end")),
         "duplicate": duplicate,
         "available_usd": None,
+        "enforcement_active": False,
+    }
+
+
+@router.get("/tokenin/account/catalog", dependencies=[Depends(_service_only)], tags=["tokenin"])
+async def account_catalog() -> dict[str, object]:
+    plans: Final = load_plans()
+    return {
+        "plans": [
+            {
+                "id": plan.id,
+                "kind": plan.kind,
+                "monthly_value_usd": float(_dollars(_fixed_monthly_amount(plan))) if plan.kind == "fixed" else None,
+                "rpm_limit": plan.rpm_limit,
+                "max_parallel_requests": plan.max_parallel_requests,
+            }
+            for plan in plans
+        ],
         "enforcement_active": False,
     }
 
@@ -241,7 +275,18 @@ async def grant_account(data: GrantRequest) -> dict[str, object]:
         if inserted != 1:
             raise HTTPException(status_code=409, detail="Paid period already granted")
     return _grant_response(
-        {"user_id": data.user_id, "idempotency_key": data.idempotency_key, "amount_nano": amount}, duplicate=False
+        {
+            "user_id": data.user_id,
+            "idempotency_key": data.idempotency_key,
+            "amount_nano": amount,
+            "plan_id": data.plan_id,
+            "kind": kind,
+            "subscription_id": data.subscription_id,
+            "period_index": data.period_index,
+            "period_start": start,
+            "period_end": end,
+        },
+        duplicate=False,
     )
 
 
@@ -327,7 +372,7 @@ def _policy_response(row: Mapping[str, object], duplicate: bool) -> dict[str, ob
         "models": row["models"],
         "rpm_limit": row["rpm_limit"],
         "max_parallel_requests": row["max_parallel_requests"],
-        "effective_at": row["effective_at"],
+        "effective_at": _as_utc(row["effective_at"]),
         "enforcement_active": False,
     }
 
@@ -351,7 +396,15 @@ async def account_summary(user_id: str = Query(min_length=1)) -> dict[str, objec
         raise HTTPException(status_code=404, detail="Account not found")
     return {
         "user_id": user_id,
-        "grants": [{**row, "amount_usd": float(_dollars(int(row["amount_nano"])))} for row in grants],
+        "grants": [
+            {
+                **row,
+                "period_start": _as_utc(row["period_start"]),
+                "period_end": _as_utc(row["period_end"]),
+                "amount_usd": float(_dollars(int(row["amount_nano"]))),
+            }
+            for row in grants
+        ],
         "policies": [_policy_response(row, duplicate=False) for row in policies],
         "available_usd": None,
         "enforcement_active": False,

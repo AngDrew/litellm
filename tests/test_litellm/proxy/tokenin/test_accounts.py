@@ -5,12 +5,15 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Final
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 from fastapi import FastAPI, HTTPException
 from starlette.requests import Request
 
+from litellm.proxy._types import LitellmUserRoles, ProxyException, UserAPIKeyAuth
+from litellm.proxy.auth.user_api_key_auth import _authorize_authenticated_request
 from litellm.proxy.tokenin import accounts
 from litellm.proxy.tokenin.plans import FLAT_TEAM_ID, TokeninPlan
 
@@ -343,6 +346,29 @@ async def test_http_routes_reject_generic_key_and_accept_service_secret(store: F
         )
         assert recovered.status_code == 200
         assert recovered.json()["duplicate"] is True
+        assert recovered.json()["period_start"].endswith("Z")
+        policy: Final = await client.post(
+            "/tokenin/account/policy",
+            headers={"Authorization": "Bearer very-long-test-secret-32-characters-minimum"},
+            json={
+                "user_id": ACCOUNT,
+                "idempotency_key": "policy-http",
+                "plan_id": "medium",
+                "models": ["model-a"],
+                "rpm_limit": 20,
+                "max_parallel_requests": 1,
+                "effective_at": "2026-02-28T00:00:00.000Z",
+            },
+        )
+        assert policy.status_code == 200
+        assert policy.json()["effective_at"].endswith("Z")
+        catalog: Final = await client.get(
+            "/tokenin/account/catalog",
+            headers={"Authorization": "Bearer very-long-test-secret-32-characters-minimum"},
+        )
+        assert catalog.status_code == 200
+        assert catalog.json()["plans"][0]["monthly_value_usd"] == 10.0
+        assert catalog.json()["plans"][1]["monthly_value_usd"] is None
 
 
 @pytest.mark.asyncio
@@ -364,6 +390,45 @@ async def test_enrolled_account_calls_fail_closed_and_legacy_mode_is_unchanged(
     monkeypatch.setenv("TOKENIN_ACCOUNT_V2_ENABLED", "false")
     await accounts.require_request_admission(None, ACCOUNT, None, "/v1/chat/completions")
     assert await accounts.is_managed_account(db, ACCOUNT) is False
+
+
+@pytest.mark.asyncio
+async def test_account_auth_denial_cannot_use_db_outage_fallback_or_admin_role(
+    store: FakeTx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.proxy import proxy_server
+
+    await accounts.grant_account(_fixed("auth-managed"))
+    monkeypatch.setattr(proxy_server, "prisma_client", SimpleNamespace(db=store))
+    monkeypatch.setattr(proxy_server, "general_settings", {"allow_requests_on_db_unavailable": True})
+    monkeypatch.setattr(
+        proxy_server,
+        "proxy_logging_obj",
+        SimpleNamespace(post_call_failure_hook=AsyncMock(return_value=None)),
+    )
+    admin: Final = UserAPIKeyAuth(user_id=ACCOUNT, team_id=FLAT_TEAM_ID, user_role=LitellmUserRoles.PROXY_ADMIN)
+    request: Final = _request("managed-key")
+    with pytest.raises(ProxyException) as denied:
+        await _authorize_authenticated_request(
+            user_api_key_auth_obj=admin,
+            request=request,
+            request_data={"model": "model-a", "messages": []},
+            route="/v1/chat/completions",
+            api_key="managed-key",
+        )
+    assert denied.value.code == "503"
+
+
+@pytest.mark.parametrize(
+    "route",
+    ["/v1/chat/completions", "/v1/embeddings", "/v1/responses", "/v1/images/generations", "/v1/messages"],
+)
+@pytest.mark.asyncio
+async def test_paid_llm_route_fails_closed_for_enrolled_account(store: FakeTx, route: str) -> None:
+    await accounts.grant_account(_fixed("route-scope"))
+    with pytest.raises(HTTPException) as denied:
+        await accounts.require_request_admission(SimpleNamespace(db=store), ACCOUNT, FLAT_TEAM_ID, route)
+    assert denied.value.status_code == 503
 
 
 def _request(token: str) -> Request:

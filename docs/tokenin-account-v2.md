@@ -4,6 +4,8 @@ This phase records verified account grants and future-dated policy revisions. It
 
 With the flag set to `true`, new `/tokenin/account/*` routes require `Authorization: Bearer <TOKENIN_ACCOUNT_SERVICE_TOKEN>`. The token must be at least 32 characters. It is a separate secret held by the trusted payment service, not a customer key or the proxy admin key. The payment service must verify payment, ownership, amount, and paid period before calling the proxy. Neither these routes nor their payloads are payment verification. The flag defaults to off, and the existing key and wallet routes retain their old behavior while it is off
 
+`GET /tokenin/account/catalog` returns `{ "plans": [{ "id", "kind", "monthly_value_usd", "rpm_limit", "max_parallel_requests" }], "enforcement_active": false }`. Fixed `monthly_value_usd` is the proxy's resolved monthly credit; PAYG reports null. The payment service can snapshot this amount on invoice creation. There is no model alias catalog in the proxy's Tokenin plans, so paid-plan aliases must come from a separate trusted allowlist
+
 `POST /tokenin/account/grants` accepts:
 
 ```json
