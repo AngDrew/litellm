@@ -319,7 +319,6 @@ from litellm.proxy.common_request_processing import (
     ProxyBaseLLMRequestProcessing,
     _is_azure_model_router_request,
     _should_return_raw_model_name,
-    _withheld_provider_output,
     create_response,
     open_sse_before_first_byte,
     ttft_keepalive_interval,
@@ -8607,7 +8606,6 @@ async def async_data_generator(
     verbose_proxy_logger.debug("inside generator")
     stream_completed = False
     client_disconnected = False
-    provider_output_seen: bool = False
     try:
         error_message: str | None = None
         requested_model_from_client: Final = _get_client_requested_model_for_streaming(request_data=request_data)
@@ -8669,7 +8667,6 @@ async def async_data_generator(
             if item is _STREAM_KEEPALIVE:
                 yield ": ping\n\n"
                 continue
-            provider_output_seen = True  # rebind-ok: track provider output for disconnect hold resolution
             chunk = cast(Any, item)  # cast-ok: sentinel already handled above, item is a real chunk here
             if needs_per_chunk_hook:
                 ### CALL HOOKS ### - modify outgoing data
@@ -8838,7 +8835,6 @@ async def async_data_generator(
             request=request,
             request_data=request_data,
             response=response,
-            provider_output_delivered=provider_output_seen or _withheld_provider_output(response),
             stream_completed=stream_completed,
             client_disconnected=client_disconnected,
             user_api_key_dict=user_api_key_dict,

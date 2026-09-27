@@ -3335,7 +3335,6 @@ class ProxyBaseLLMRequestProcessing:
         request: Request | None,
         request_data: dict,
         response: Any,
-        provider_output_delivered: bool = True,
         stream_completed: bool = False,
         client_disconnected: bool = False,
         user_api_key_dict: UserAPIKeyAuth | None = None,
@@ -3372,16 +3371,15 @@ class ProxyBaseLLMRequestProcessing:
                 ):
                     await proxy_logging_obj._arelease_max_parallel_requests_on_disconnect(user_api_key_dict)
 
-                # The finalizer is shielded so disconnect cancellation cannot interrupt
-                # the account hold decision.
+                # The shield ensures disconnect cancellation cannot interrupt this conservative
+                # decision: prompt usage may be billable before any output chunk arrives.
                 from litellm.proxy.tokenin.enforcement import (
                     handle_account_hold_on_cancel,
                     hold_metadata_from_request_data,
                 )
 
                 await handle_account_hold_on_cancel(
-                    hold_metadata_from_request_data(request_data),
-                    provider_output_delivered=provider_output_delivered,
+                    hold_metadata_from_request_data(request_data), billing_known_absent=False
                 )
 
             if hasattr(response, "aclose"):
@@ -3466,8 +3464,8 @@ class ProxyBaseLLMRequestProcessing:
                 # so a GeneratorExit on client disconnect is raised there and any
                 # statement after the yield never runs. The slow-path hook is
                 # awaited above, so a cancellation during it still leaves this
-                # False and refunds. A keepalive ping carries no provider output,
-                # so it must not suppress that refund.
+                # False and releases the spend-budget reservation. A keepalive ping carries
+                # no provider output, so it must not suppress that release.
                 delivered_chunk = delivered_chunk or chunk != STREAM_SSE_KEEPALIVE_PING_BYTES
                 yield serialize_chunk(chunk)
             stream_completed = True
@@ -3522,7 +3520,6 @@ class ProxyBaseLLMRequestProcessing:
                 request=request,
                 request_data=request_data,
                 response=response,
-                provider_output_delivered=delivered_chunk or _withheld_provider_output(response),
                 stream_completed=stream_completed,
                 client_disconnected=client_disconnected,
                 user_api_key_dict=user_api_key_dict,

@@ -139,16 +139,9 @@ async def cancel_account_hold(metadata: Mapping[str, object] | None) -> None:
         verbose_proxy_logger.exception("Tokenin account hold %s was not cancelled", hold_id)
 
 
-async def handle_account_hold_on_cancel(
-    metadata: Mapping[str, object] | None, *, provider_output_delivered: bool
-) -> None:
-    """Client-cancel outcome: refund only when the provider produced no output.
-
-    A delivered chunk means the provider may already have billed, and a stream that
-    broke mid-flight cannot be priced from here, so the reservation stays uncertain
-    and visible to reconciliation instead of being refunded.
-    """
-    if provider_output_delivered:
-        await mark_account_hold_uncertain(metadata=metadata)
-    else:
+async def handle_account_hold_on_cancel(metadata: Mapping[str, object] | None, *, billing_known_absent: bool) -> None:
+    """Release only when a caller has established that provider billing did not occur."""
+    if billing_known_absent:
         await cancel_account_hold(metadata=metadata)
+    else:
+        await mark_account_hold_uncertain(metadata=metadata)

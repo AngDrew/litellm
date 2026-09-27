@@ -323,10 +323,10 @@ async def test_disconnect_after_a_chunk_charges_the_partial_stream(
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_disconnect_before_provider_output_refunds_the_reservation(
+async def test_disconnect_without_output_keeps_hold_uncertain_until_operator_resolution(
     client, live_server: str, slow_upstream: SlowUpstream, prisma, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A client aborts before the provider emits output; the shielded finalizer refunds once."""
+    """Zero output chunks after provider acceptance do not prove the prompt was free."""
     from litellm.proxy.tokenin import enforcement
 
     user_id, key = await _enrolled_account(client, prisma, models=[SLOW_MODEL])
@@ -338,9 +338,9 @@ async def test_disconnect_before_provider_output_refunds_the_reservation(
     hold_resolutions: Final[list[bool]] = []
     original_handler: Final = enforcement.handle_account_hold_on_cancel
 
-    async def record_hold_resolution(metadata: Mapping[str, object] | None, *, provider_output_delivered: bool) -> None:
-        hold_resolutions.append(provider_output_delivered)
-        await original_handler(metadata, provider_output_delivered=provider_output_delivered)
+    async def record_hold_resolution(metadata: Mapping[str, object] | None, *, billing_known_absent: bool) -> None:
+        hold_resolutions.append(billing_known_absent)
+        await original_handler(metadata, billing_known_absent=billing_known_absent)
 
     monkeypatch.setattr(enforcement, "handle_account_hold_on_cancel", record_hold_resolution)
     baseline: Final = slow_upstream.requests
@@ -351,12 +351,18 @@ async def test_disconnect_before_provider_output_refunds_the_reservation(
     state: Final = await _await_hold_finalized(prisma, user_id)
     rows: Final = state["holds"]
     assert rows, state
-    assert rows[0]["state"] == "cancelled", state
+    assert rows[0]["state"] == "uncertain", state
     assert int(rows[0]["charged_nano"] or 0) == 0, state
-    assert int(rows[0]["held_nano"]) == 0, "cancellation must release the allocation"
-    assert state["open_nano"] == 0, state
-    assert state["charged_nano"] == 0, state
-    assert hold_resolutions == [False], "the shielded finalizer must resolve the hold exactly once"
+    assert int(rows[0]["held_nano"]) == int(rows[0]["estimated_nano"]) > 0, state
+    assert state["open_nano"] == 0, "uncertain allocations remain reserved, not open holds"
+    assert state["charged_nano"] == 0 and state["debt_nano"] == 0, state
+    assert hold_resolutions == [False], "the shielded finalizer must preserve the hold exactly once"
+
+    resolved: Final = await _resolved(client, rows[0]["request_id"], "cancel")
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["state"] == "cancelled", resolved.text
+    after: Final = await _account_state(prisma, user_id)
+    assert after["open_nano"] == 0 and after["charged_nano"] == 0 and after["debt_nano"] == 0, after
 
 
 @pytest.mark.asyncio(loop_scope="module")
