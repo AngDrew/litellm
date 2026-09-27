@@ -10,9 +10,17 @@ are active and unexpired. Expired keys contribute nothing, no purchase anniversa
 inferred, and a key's reset window is never treated as fresh unused allowance - carry is
 what the key shows as remaining right now.
 
-Every account with active legacy keys is enrolled, even when it carries nothing. An
-enrolled account is governed by the ledger, so leaving a spent-out key cap in place would
-double-constrain a key whose owner has just bought credit on the account.
+Enrolment: an account is enrolled when it has an active capped key (a key with a
+max_budget) or when it carries value. A zero-carry but capped account is enrolled so its
+spent-out cap cannot double-constrain the account after a new purchase. Accounts whose only
+active keys are uncapped (max_budget NULL) are left entirely alone and listed in the report
+as needing an operator decision: enrolling them with no carry would deny usage they are
+already getting, and there is no exhausted cap to double-constrain. If such an account buys
+after the cutover, grant creation enrols it and its uncapped keys become ledger-gated from
+then on, which is intended.
+
+Clearing covers the active capped keys of enrolled accounts. Uncapped keys have no cap to
+clear and are never touched, and expired keys are excluded so they cannot be revived.
 
 Idempotency: the grant id and payload hash are fixed, so a re-run inserts nothing and
 reports the existing amount. A corrected amount needs a new idempotency key; never reuse
@@ -73,7 +81,8 @@ class AccountPlan:
     amount_nano: int
     keys: list[str] = field(default_factory=list)
     active_keys: list[str] = field(default_factory=list)
-    has_active_keys: bool = False
+    enrol: bool = False
+    uncapped_only: bool = False
     action: str = "would_create"
     detail: str = ""
 
@@ -118,9 +127,17 @@ def plan_accounts(
         grouped.setdefault(str(row["user_id"]), []).append(row)
     plans: Final[list[AccountPlan]] = []
     for user_id, account_rows in sorted(grouped.items()):
-        active: Final = [str(row["token"]) for row in account_rows if is_active(row=row, now=now)]
+        active_capped: Final = [
+            str(row["token"])
+            for row in account_rows
+            if is_active(row=row, now=now) and row.get("max_budget") is not None
+        ]
+        uncapped_only: Final = (
+            bool(account_rows) and not active_capped and all(is_active(row=row, now=now) for row in account_rows)
+        )
         carry, counted, skipped = carry_over(rows=account_rows, now=now)
         grant_id: Final = f"legacy-carry:{user_id}"
+        enrol: Final = bool(active_capped) or carry > 0
         if carry <= 0:
             plans.append(
                 AccountPlan(
@@ -128,10 +145,15 @@ def plan_accounts(
                     grant_id=grant_id,
                     amount_nano=0,
                     keys=counted,
-                    active_keys=active,
-                    has_active_keys=bool(active),
+                    active_keys=active_capped,
+                    enrol=enrol,
+                    uncapped_only=uncapped_only,
                     action="skipped",
-                    detail="no remaining value" + (f"; {'; '.join(skipped)}" if skipped else ""),
+                    detail=(
+                        "uncapped, needs operator decision"
+                        if uncapped_only
+                        else "no remaining value" + (f"; {'; '.join(skipped)}" if skipped else "")
+                    ),
                 )
             )
             continue
@@ -149,8 +171,9 @@ def plan_accounts(
                 grant_id=grant_id,
                 amount_nano=amount_nano,
                 keys=counted,
-                active_keys=active,
-                has_active_keys=bool(active),
+                active_keys=active_capped,
+                enrol=enrol,
+                uncapped_only=uncapped_only,
                 action=action,
                 detail=detail + (f"; {'; '.join(skipped)}" if skipped else ""),
             )
@@ -194,7 +217,7 @@ async def migrate(
 
     if apply:
         for plan in plans:
-            if plan.action == "conflict" or not plan.has_active_keys:
+            if plan.action == "conflict" or not plan.enrol:
                 continue
             await client.execute_raw(
                 'INSERT INTO "LiteLLM_TokeninAccount" ("user_id") VALUES ($1) ON CONFLICT DO NOTHING', plan.user_id
@@ -221,6 +244,7 @@ async def migrate(
         "accounts": len(plans),
         "keys": sum(len(plan.keys) for plan in plans),
         "active_keys": sum(len(plan.active_keys) for plan in plans),
+        "uncapped_accounts": [plan.user_id for plan in plans if plan.uncapped_only],
         "carry_usd": str(sum(Decimal(plan.amount_nano) / NANO for plan in plans if plan.action != "conflict")),
         "created": sum(plan.action == "would_create" for plan in plans),
         "existing": sum(plan.action == "exists" for plan in plans),

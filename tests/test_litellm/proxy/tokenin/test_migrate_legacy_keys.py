@@ -161,6 +161,33 @@ async def test_zero_carry_account_is_still_enrolled_so_its_key_caps_cannot_doubl
 
 
 @pytest.mark.asyncio
+async def test_uncapped_only_account_is_left_untouched_and_listed_for_a_decision() -> None:
+    db: Final = FakeDB([_key("sk-unlimited", None, 120.0)])
+    summary: Final = await migration.migrate(
+        client=db, apply=True, clear_legacy_key_budgets=True, now=NOW, log=lambda _line: None
+    )
+    assert db.executed == []
+    assert db.accounts == set()
+    assert db.grants == {}
+    assert db.cleared_tokens == []
+    assert summary["uncapped_accounts"] == [ACCOUNT]
+    assert summary["accounts_detail"][0]["detail"] == "uncapped, needs operator decision"
+
+
+@pytest.mark.asyncio
+async def test_mixed_uncapped_and_capped_account_enrols_and_clears_only_the_capped_keys() -> None:
+    db: Final = FakeDB([_key("sk-capped", 10.0, 4.0), _key("sk-unlimited", None, 50.0)])
+    summary: Final = await migration.migrate(
+        client=db, apply=True, clear_legacy_key_budgets=True, now=NOW, log=lambda _line: None
+    )
+    assert db.accounts == {ACCOUNT}
+    assert db.grants == {GRANT_ID: 6_000_000_000}
+    assert summary["carry_usd"] == "6"
+    assert db.cleared_tokens == ["sk-capped"]
+    assert summary["uncapped_accounts"] == []
+
+
+@pytest.mark.asyncio
 async def test_carrying_account_keeps_exactly_its_carried_amount_and_only_credits_live_keys() -> None:
     db: Final = FakeDB(
         [
