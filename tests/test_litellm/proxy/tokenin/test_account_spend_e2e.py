@@ -124,13 +124,6 @@ async def proxy_app():
     async with proxy_startup_event(app):
         assert proxy_server.prisma_client is not None
         await proxy_server.prisma_client.check_view_exists()
-        # The flat team is provisioned state the live proxy already assumes: tokenin/key/generate
-        # binds every issued key to it. An empty acceptance database has to seed it.
-        from litellm.proxy.tokenin.plans import FLAT_TEAM_ID
-
-        await proxy_server.prisma_client.db.execute_raw(
-            'INSERT INTO "LiteLLM_TeamTable" ("team_id") VALUES ($1) ON CONFLICT DO NOTHING', FLAT_TEAM_ID
-        )
         for name in ("master_key", "prisma_client", "llm_router"):
             _APP_GLOBALS[name] = getattr(proxy_server, name)
         for name in _CALLBACK_LISTS:
@@ -163,6 +156,22 @@ async def prisma(proxy_app):
     from litellm.proxy import proxy_server
 
     return proxy_server.prisma_client
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module", autouse=True)
+async def flat_team(client) -> None:
+    """The flat team is provisioning the proxy assumes, not something it creates: both the
+    legacy key route and account keys bind to this id. Create it the supported way, through
+    the API, so the documented seed path is what the run proves."""
+    from litellm.proxy.tokenin.plans import FLAT_TEAM_ID
+
+    created: Final = await client.post(
+        "/team/new",
+        headers={"Authorization": f"Bearer {MASTER_KEY}"},
+        json={"team_id": FLAT_TEAM_ID, "team_alias": "tokenin-flat", "models": []},
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["team_id"] == FLAT_TEAM_ID, created.text
 
 
 async def _service_post(client: httpx.AsyncClient, path: str, payload: dict[str, Any]) -> httpx.Response:

@@ -26,6 +26,10 @@ PORT="$(docker port "$CONTAINER" 5432/tcp | head -1 | sed 's/.*://')"
 DATABASE="postgresql://e2e:e2e@127.0.0.1:${PORT}/tokenin_e2e"
 echo "postgres ready at 127.0.0.1:${PORT}"
 
+# pg_isready runs inside the container; docker's host-side port forward can lag it by a
+# moment, which shows up as a one-off P1001 from prisma on a busy host.
+until (exec 3<>/dev/tcp/127.0.0.1/"$PORT") 2>/dev/null; do sleep 1; done
+
 if [ ! -e "$HOME/.cache/prisma-python/binaries" ]; then
   echo "fetching the prisma python query engine (one-time)"
   ./.venv/bin/prisma py fetch >/dev/null
