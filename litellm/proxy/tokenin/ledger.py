@@ -340,3 +340,54 @@ async def settle_account_request(prisma_client: PrismaClient, request_id: str, a
             charged_nano,
         )
         return charged_nano
+
+
+async def cancel_account_request(prisma_client: PrismaClient, request_id: str) -> bool:
+    """Release a reservation whose work is known not to have billed. Unknown holds stay reserved."""
+    async with prisma_client.db.tx() as tx:
+        identity: Final = await tx.query_raw(
+            'SELECT "user_id", "state" FROM "LiteLLM_TokeninHold" WHERE "request_id" = $1', request_id
+        )
+        if not identity:
+            return False
+        await tx.query_raw(
+            'SELECT "user_id" FROM "LiteLLM_TokeninAccount" WHERE "user_id" = $1 FOR UPDATE',
+            identity[0]["user_id"],
+        )
+        state: Final = identity[0]["state"]
+        if state == "cancelled":
+            return True
+        if state != "held":
+            return False
+        await tx.execute_raw(
+            'UPDATE "LiteLLM_TokeninAllocation" SET "amount_nano" = 0 WHERE "request_id" = $1', request_id
+        )
+        await tx.execute_raw(
+            'UPDATE "LiteLLM_TokeninHold" SET "state" = \'cancelled\', "charged_nano" = 0, '
+            '"settled_at" = clock_timestamp() AT TIME ZONE \'UTC\' WHERE "request_id" = $1',
+            request_id,
+        )
+        return True
+
+
+async def mark_account_request_uncertain(prisma_client: PrismaClient, request_id: str) -> bool:
+    """Keep the reservation when billing outcome is unknown, so nothing is refunded speculatively."""
+    async with prisma_client.db.tx() as tx:
+        identity: Final = await tx.query_raw(
+            'SELECT "user_id", "state" FROM "LiteLLM_TokeninHold" WHERE "request_id" = $1', request_id
+        )
+        if not identity:
+            return False
+        await tx.query_raw(
+            'SELECT "user_id" FROM "LiteLLM_TokeninAccount" WHERE "user_id" = $1 FOR UPDATE',
+            identity[0]["user_id"],
+        )
+        state: Final = identity[0]["state"]
+        if state == "uncertain":
+            return True
+        if state != "held":
+            return False
+        await tx.execute_raw(
+            'UPDATE "LiteLLM_TokeninHold" SET "state" = \'uncertain\' WHERE "request_id" = $1', request_id
+        )
+        return True

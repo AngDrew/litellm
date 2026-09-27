@@ -372,6 +372,34 @@ async def test_http_routes_reject_generic_key_and_accept_service_secret(store: F
 
 
 @pytest.mark.asyncio
+async def test_model_catalog_lists_only_configured_aliases_for_service_token(
+    store: FakeTx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.proxy import proxy_server
+
+    monkeypatch.setattr(proxy_server, "llm_router", SimpleNamespace(get_model_names=lambda: ["model-b", "model-a"]))
+    app: Final = FastAPI()
+    app.include_router(accounts.router)
+    transport: Final = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        denied: Final = await client.get("/tokenin/account/models")
+        assert denied.status_code == 403
+        models: Final = await client.get(
+            "/tokenin/account/models",
+            headers={"Authorization": "Bearer very-long-test-secret-32-characters-minimum"},
+        )
+        assert models.status_code == 200
+        assert models.json() == {"models": ["model-a", "model-b"], "enforcement_active": False}
+    monkeypatch.setattr(proxy_server, "llm_router", None)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        unavailable: Final = await client.get(
+            "/tokenin/account/models",
+            headers={"Authorization": "Bearer very-long-test-secret-32-characters-minimum"},
+        )
+        assert unavailable.status_code == 503
+
+
+@pytest.mark.asyncio
 async def test_enrolled_account_calls_fail_closed_and_legacy_mode_is_unchanged(
     store: FakeTx, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -210,6 +210,15 @@ async def account_catalog() -> dict[str, object]:
     }
 
 
+@router.get("/tokenin/account/models", dependencies=[Depends(_service_only)], tags=["tokenin"])
+async def account_models() -> dict[str, object]:
+    from litellm.proxy.proxy_server import llm_router
+
+    if llm_router is None:
+        raise HTTPException(status_code=503, detail="Model catalog unavailable")
+    return {"models": sorted(llm_router.get_model_names()), "enforcement_active": False}
+
+
 @router.post("/tokenin/account/grants", dependencies=[Depends(_service_only)], tags=["tokenin"])
 async def grant_account(data: GrantRequest) -> dict[str, object]:
     amount, start, end, kind = _grant_details(data)

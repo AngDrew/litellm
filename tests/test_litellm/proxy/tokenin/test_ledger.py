@@ -11,7 +11,9 @@ from fastapi import HTTPException
 from litellm.proxy.tokenin.ledger import (
     GrantBalance,
     allocate_fifo,
+    cancel_account_request,
     eligible_grants,
+    mark_account_request_uncertain,
     settle_account_request,
     to_nano_ceil,
 )
@@ -188,6 +190,8 @@ class LedgerDB:
                 "charged_nano": charged,
                 "admitted_at": timestamp,
             }
+        elif 'UPDATE "LiteLLM_TokeninAllocation"' in sql and len(values) == 1:
+            self.allocations = {key: amount for key, amount in self.allocations.items() if key[0] != str(values[0])}
         elif 'INSERT INTO "LiteLLM_TokeninAllocation"' in sql or 'UPDATE "LiteLLM_TokeninAllocation"' in sql:
             request_id, grant_id, amount = values
             key = (str(request_id), str(grant_id))
@@ -195,8 +199,13 @@ class LedgerDB:
         elif 'UPDATE "LiteLLM_TokeninAccount"' in sql:
             self.debt = 0 if '"debt_nano" = 0' in sql else self.debt + int(values[1])
         elif 'UPDATE "LiteLLM_TokeninHold"' in sql:
-            self.holds[str(values[0])]["state"] = "settled"
-            self.holds[str(values[0])]["charged_nano"] = values[1]
+            hold = self.holds[str(values[0])]
+            if "'cancelled'" in sql:
+                hold["state"], hold["charged_nano"] = "cancelled", 0
+            elif "'uncertain'" in sql:
+                hold["state"] = "uncertain"
+            else:
+                hold["state"], hold["charged_nano"] = "settled", values[1]
         else:
             raise AssertionError(sql)
         return 1
@@ -324,6 +333,38 @@ async def test_overrun_debt_repaid_by_new_payg_without_consuming_rpm_slot() -> N
     assert len(debt_holds) == 1
     assert debt_holds[0]["admitted_at"] == datetime(1970, 1, 1)
     assert sum(amount for (_, grant_id), amount in db.allocations.items() if grant_id == "topup") == 750_000_000
+
+
+@pytest.mark.asyncio
+async def test_cancel_releases_credit_but_never_refunds_settled_holds() -> None:
+    db: Final = LedgerDB()
+    db.grants = {"paid": grant("paid", 4 * NANO, FEB28, MAR31, 1)}
+    await reserve_account_request(db, ACCOUNT, "cancelled", "allowed", 3.0)
+    assert await cancel_account_request(db, "cancelled") is True
+    assert await cancel_account_request(db, "cancelled") is True
+    assert db.holds["cancelled"]["state"] == "cancelled"
+    assert await reserve_account_request(db, ACCOUNT, "reuse", "allowed", 4.0) == (("paid", 4 * NANO),)
+    assert await cancel_account_request(db, "unknown-request") is False
+    assert await settle_account_request(db, "reuse", 4.0) == 4 * NANO
+    assert await cancel_account_request(db, "reuse") is False
+    assert db.allocations[("reuse", "paid")] == 4 * NANO
+
+
+@pytest.mark.asyncio
+async def test_uncertain_hold_keeps_reservation_and_never_releases_speculatively() -> None:
+    db: Final = LedgerDB()
+    db.grants = {"paid": grant("paid", 2 * NANO, FEB28, MAR31, 1)}
+    await reserve_account_request(db, ACCOUNT, "lost", "allowed", 2.0)
+    assert await mark_account_request_uncertain(db, "lost") is True
+    assert await mark_account_request_uncertain(db, "lost") is True
+    assert await cancel_account_request(db, "lost") is False
+    with pytest.raises(HTTPException) as blocked:
+        await settle_account_request(db, "lost", 1.0)
+    assert blocked.value.status_code == 503
+    with pytest.raises(HTTPException) as exhausted:
+        await reserve_account_request(db, ACCOUNT, "next", "allowed", 0.5)
+    assert exhausted.value.status_code == 402
+    assert db.allocations[("lost", "paid")] == 2 * NANO
 
 
 @pytest.mark.asyncio
