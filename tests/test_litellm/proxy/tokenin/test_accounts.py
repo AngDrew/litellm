@@ -330,6 +330,20 @@ async def test_managed_admission_scopes_routes_and_requires_the_spend_switch(
     with pytest.raises(HTTPException) as unsupported:
         await accounts.require_request_admission(client, ACCOUNT, FLAT_TEAM_ID, "/v1/embeddings")
     assert unsupported.value.status_code == 503
+    # A pass-through route reaches a provider with the proxy's own credentials, so it
+    # must not be a way around the ledger either.
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints
+
+    monkeypatch.setattr(
+        pass_through_endpoints.InitPassThroughEndpointHelpers,
+        "is_registered_pass_through_route",
+        staticmethod(lambda route: route == "/vertex_ai/custom"),
+    )
+    with pytest.raises(HTTPException) as pass_through:
+        await accounts.require_request_admission(client, ACCOUNT, FLAT_TEAM_ID, "/vertex_ai/custom")
+    assert pass_through.value.status_code == 503
+    assert await accounts.require_request_admission(client, "not-enrolled", FLAT_TEAM_ID, "/vertex_ai/custom") is None
+    assert await accounts.require_request_admission(client, ACCOUNT, FLAT_TEAM_ID, "/user/info") is None
 
 
 @pytest.mark.asyncio

@@ -202,7 +202,18 @@ async def require_request_admission(
     from litellm.proxy.tokenin.plans import FLAT_TEAM_ID
 
     if not RouteChecks.is_llm_api_route(route):
-        return
+        # Pass-through routes forward to a real provider with the proxy's credentials, so
+        # an enrolled account must not reach them either: they would spend outside the
+        # ledger. Every other non-LLM route is unrelated to account spend and passes.
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            InitPassThroughEndpointHelpers,
+        )
+
+        if not (
+            InitPassThroughEndpointHelpers.is_registered_pass_through_route(route=route)
+            or RouteChecks.is_auth_enforced_pass_through_route(route)
+        ):
+            return
     if prisma_client is None or user_id == DB_UNAVAILABLE_FALLBACK_USER_ID:
         raise HTTPException(status_code=503, detail="Managed account authorization unavailable")
     if user_id is None and team_id == FLAT_TEAM_ID:
