@@ -53,7 +53,8 @@ def _plan(plan_id: str) -> TokeninPlan:
 def _utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise HTTPException(status_code=400, detail="Period timestamps require a timezone")
-    return value.astimezone(timezone.utc).replace(tzinfo=None)
+    converted: Final = value.astimezone(timezone.utc)
+    return converted.replace(tzinfo=None, microsecond=(converted.microsecond // 1000) * 1000)
 
 
 def _amount_nano(value: Decimal) -> int:

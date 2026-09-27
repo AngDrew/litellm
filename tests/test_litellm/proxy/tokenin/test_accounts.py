@@ -193,6 +193,23 @@ async def test_reused_event_conflict_and_duplicate_paid_period_conflict(store: F
 
 
 @pytest.mark.asyncio
+async def test_paid_period_neighbors_keep_database_millisecond_precision(store: FakeTx) -> None:
+    first_start: Final = PERIOD_START.replace(microsecond=123456)
+    first_end: Final = PERIOD_END.replace(microsecond=987654)
+    await accounts.grant_account(_fixed("first-ms", start=first_start, end=first_end))
+    await accounts.grant_account(
+        _fixed(
+            "next-ms",
+            index=1,
+            start=first_end,
+            end=datetime(2026, 3, 28, tzinfo=timezone.utc).replace(microsecond=987654),
+        )
+    )
+    assert store.grants["first-ms"]["period_end"] == PERIOD_END.replace(tzinfo=None, microsecond=987000)
+    assert len(store.grants) == 2
+
+
+@pytest.mark.asyncio
 async def test_paid_period_neighbors_must_be_contiguous(store: FakeTx) -> None:
     await accounts.grant_account(_fixed("first"))
     with pytest.raises(HTTPException) as gap:
