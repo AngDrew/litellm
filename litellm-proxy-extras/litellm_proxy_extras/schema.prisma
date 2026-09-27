@@ -626,8 +626,10 @@ model LiteLLM_Config {
 model LiteLLM_TokeninAccount {
   user_id    String @id
   created_at DateTime @default(now())
+  debt_nano  BigInt @default(0)
   grants     LiteLLM_TokeninGrant[]
   policies   LiteLLM_TokeninPolicy[]
+  holds      LiteLLM_TokeninHold[]
 }
 
 model LiteLLM_TokeninGrant {
@@ -643,6 +645,7 @@ model LiteLLM_TokeninGrant {
   period_end      DateTime?
   created_at      DateTime @default(now())
   account         LiteLLM_TokeninAccount @relation(fields: [user_id], references: [user_id])
+  allocations     LiteLLM_TokeninAllocation[]
 
   @@unique([user_id, subscription_id, period_index])
   @@index([user_id, period_start])
@@ -660,7 +663,35 @@ model LiteLLM_TokeninPolicy {
   created_at           DateTime @default(now())
   account              LiteLLM_TokeninAccount @relation(fields: [user_id], references: [user_id])
 
-  @@index([user_id, effective_at])
+  @@unique([user_id, effective_at])
+}
+
+model LiteLLM_TokeninHold {
+  request_id     String @id
+  user_id        String
+  key_hash       String
+  model          String
+  state          String
+  estimated_nano BigInt
+  charged_nano   BigInt?
+  admitted_at    DateTime @default(now())
+  settled_at     DateTime?
+  account        LiteLLM_TokeninAccount @relation(fields: [user_id], references: [user_id])
+  allocations    LiteLLM_TokeninAllocation[]
+
+  @@index([user_id, admitted_at])
+  @@index([user_id, state])
+}
+
+model LiteLLM_TokeninAllocation {
+  request_id  String
+  grant_id    String
+  amount_nano BigInt
+  hold        LiteLLM_TokeninHold @relation(fields: [request_id], references: [request_id])
+  grant       LiteLLM_TokeninGrant @relation(fields: [grant_id], references: [idempotency_key])
+
+  @@id([request_id, grant_id])
+  @@index([grant_id])
 }
 
 model LiteLLM_SpendLogs {
