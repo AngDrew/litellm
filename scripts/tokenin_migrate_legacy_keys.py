@@ -63,7 +63,7 @@ _LEGACY_KEYS_QUERY: Final = (
 )
 _CLEAR_LEGACY_KEY_BUDGETS_SQL: Final = (
     'UPDATE "LiteLLM_VerificationToken" SET "max_budget" = NULL, "budget_duration" = NULL, '
-    '"budget_reset_at" = NULL, "budget_limits" = NULL, "expires" = NULL, "updated_at" = $2 '
+    '"budget_reset_at" = NULL, "budget_limits" = NULL, "expires" = NULL, "updated_at" = $2::timestamp '
     'WHERE "token" = ANY($1)'
 )
 
@@ -91,9 +91,23 @@ def to_nano(value: Decimal) -> int:
     return int((value * NANO).to_integral_value(rounding=ROUND_CEILING))
 
 
+def as_naive_utc(value: object) -> datetime | None:
+    """Raw prisma results are JSON strings, so a stored timestamp is text until parsed.
+
+    Kept local: this script runs against production with no litellm import.
+    """
+    if isinstance(value, datetime):
+        moment: Final = value
+    elif isinstance(value, str):
+        moment = datetime.fromisoformat(value)
+    else:
+        return None
+    return moment.astimezone(timezone.utc).replace(tzinfo=None) if moment.tzinfo is not None else moment
+
+
 def is_active(row: Mapping[str, object], now: datetime) -> bool:
-    expires: Final = row.get("expires")
-    return not isinstance(expires, datetime) or expires > now
+    expires: Final = as_naive_utc(row.get("expires"))
+    return expires is None or expires > now
 
 
 def carry_over(rows: Sequence[Mapping[str, object]], now: datetime) -> tuple[Decimal, list[str], list[str]]:
@@ -235,7 +249,7 @@ async def migrate(
                     plan.amount_nano,
                 )
             if clear_legacy_key_budgets:
-                await client.execute_raw(_CLEAR_LEGACY_KEY_BUDGETS_SQL, plan.active_keys, moment)
+                await client.execute_raw(_CLEAR_LEGACY_KEY_BUDGETS_SQL, plan.active_keys, moment.isoformat())
 
     summary: Final = {
         "generated_at": moment.isoformat(),

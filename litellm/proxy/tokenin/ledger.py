@@ -1,11 +1,16 @@
-"""Atomic account-level prepaid holds. Admission remains dark until cost settlement is wired to every supported route."""
+"""Atomic account-level prepaid holds. Admission remains dark until cost settlement is wired to every supported route.
+
+Timestamps cross the prisma boundary as text: raw query results are JSON strings and bound
+parameters reach Postgres untyped. They convert through :func:`as_naive_utc` and
+:func:`as_sql_timestamp` so the ledger keeps working in naive UTC.
+"""
 
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import ROUND_CEILING, Decimal
-from typing import Final
+from typing import Any, Final
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -59,9 +64,25 @@ def _grant(row: Mapping[str, object]) -> GrantBalance:
         allocated_nano=int(row["allocated_nano"]),
         subscription_id=str(row["subscription_id"]) if row["subscription_id"] is not None else None,
         period_index=int(row["period_index"]) if row["period_index"] is not None else None,
-        period_start=row["period_start"] if isinstance(row["period_start"], datetime) else None,
-        period_end=row["period_end"] if isinstance(row["period_end"], datetime) else None,
+        period_start=as_naive_utc(row["period_start"]),
+        period_end=as_naive_utc(row["period_end"]),
     )
+
+
+def as_naive_utc(value: datetime | str | None) -> datetime | None:
+    """Read a ``TIMESTAMP(3)`` value: raw prisma results are JSON strings with a UTC offset."""
+    if value is None:
+        return None
+    moment: Final = datetime.fromisoformat(value) if isinstance(value, str) else value
+    return moment.astimezone(timezone.utc).replace(tzinfo=None) if moment.tzinfo is not None else moment
+
+
+def as_sql_timestamp(value: datetime | str) -> str:
+    """Bind a ``TIMESTAMP(3)`` value: text parameter, and the SQL carries the ``::timestamp`` cast."""
+    moment: Final = as_naive_utc(value)
+    if moment is None:
+        raise ValueError("a SQL timestamp bind requires a value")
+    return moment.isoformat()
 
 
 def eligible_grants(grants: Sequence[GrantBalance], now: datetime) -> tuple[GrantBalance, ...]:
@@ -121,6 +142,15 @@ def allocate_fifo(grants: Sequence[GrantBalance], amount_nano: int) -> tuple[tup
     return tuple(allocations)
 
 
+async def _now(tx: Any) -> datetime:
+    """Database clock, so every ledger decision in one transaction reads one instant."""
+    clock: Final = await tx.query_raw("SELECT clock_timestamp() AT TIME ZONE 'UTC' AS now")
+    moment: Final = as_naive_utc(clock[0]["now"])
+    if moment is None:
+        raise HTTPException(status_code=503, detail="Account clock unavailable")
+    return moment
+
+
 def _active_plan(grants: Sequence[GrantBalance], now: datetime) -> tuple[str, datetime | None]:
     paid: Final = (
         grant
@@ -139,21 +169,21 @@ def _active_plan(grants: Sequence[GrantBalance], now: datetime) -> tuple[str, da
 def _matching_policy(
     policies: Sequence[Mapping[str, object]], plan_id: str, now: datetime, period_start: datetime | None
 ) -> Mapping[str, object]:
-    effective: Final = (
-        policy
-        for policy in policies
-        if policy["plan_id"] == plan_id
-        and isinstance(policy["effective_at"], datetime)
-        and policy["effective_at"] <= now
-        and (period_start is None or policy["effective_at"] >= period_start)
-    )
-    candidate_policies: Final = tuple(effective)
-    if period_start is not None and not any(policy["effective_at"] == period_start for policy in candidate_policies):
+    candidates: list[tuple[datetime, Mapping[str, object]]] = []
+    for policy in policies:
+        effective: Final = as_naive_utc(policy["effective_at"])
+        if (
+            policy["plan_id"] == plan_id
+            and effective is not None
+            and effective <= now
+            and (period_start is None or effective >= period_start)
+        ):
+            candidates.append((effective, policy))
+    if period_start is not None and not any(effective == period_start for effective, _ in candidates):
         raise HTTPException(status_code=503, detail="Paid period has no matching initial policy")
-    latest: Final = max(candidate_policies, key=lambda policy: policy["effective_at"], default=None)
-    if latest is None:
+    if not candidates:
         raise HTTPException(status_code=503, detail="Account plan policy is not active")
-    return latest
+    return max(candidates, key=lambda candidate: candidate[0])[1]
 
 
 async def reserve_account_request(
@@ -175,8 +205,7 @@ async def reserve_account_request(
         )
         if not account:
             raise HTTPException(status_code=503, detail="Managed account is not enrolled")
-        clock: Final = await tx.query_raw("SELECT clock_timestamp() AT TIME ZONE 'UTC' AS now")
-        now: Final = clock[0]["now"]
+        now: Final = await _now(tx)
         previous: Final = await tx.query_raw(
             'SELECT "user_id", "key_hash", "model", "estimated_nano", "state" '
             'FROM "LiteLLM_TokeninHold" WHERE "request_id" = $1',
@@ -208,12 +237,12 @@ async def reserve_account_request(
                 'INSERT INTO "LiteLLM_TokeninHold" '
                 '("request_id", "user_id", "key_hash", "model", "state", "estimated_nano", '
                 '"charged_nano", "admitted_at", "settled_at") '
-                "VALUES ($1,$2,'tokenin-debt','tokenin-debt','settled',$3,$3,$4,$5)",
+                "VALUES ($1,$2,'tokenin-debt','tokenin-debt','settled',$3,$3,$4::timestamp,$5::timestamp)",
                 debt_id,
                 user_id,
                 debt,
-                datetime(1970, 1, 1),
-                now,
+                as_sql_timestamp(datetime(1970, 1, 1)),
+                as_sql_timestamp(now),
             )
             for grant_id, amount in debt_allocation:
                 await tx.execute_raw(
@@ -231,19 +260,19 @@ async def reserve_account_request(
         plan_id, period_start = _active_plan(grants=remaining_grants, now=now)
         policies: Final = await tx.query_raw(
             'SELECT "plan_id", "models", "rpm_limit", "max_parallel_requests", "effective_at" '
-            'FROM "LiteLLM_TokeninPolicy" WHERE "user_id" = $1 AND "effective_at" <= $2',
+            'FROM "LiteLLM_TokeninPolicy" WHERE "user_id" = $1 AND "effective_at" <= $2::timestamp',
             user_id,
-            now,
+            as_sql_timestamp(now),
         )
         policy: Final = _matching_policy(policies=policies, plan_id=plan_id, now=now, period_start=period_start)
         if model not in policy["models"]:
             raise HTTPException(status_code=403, detail="Model not allowed by account plan")
         limits: Final = await tx.query_raw(
-            "SELECT COUNT(*) FILTER (WHERE \"admitted_at\" > $2 - INTERVAL '60 seconds') AS rpm, "
+            "SELECT COUNT(*) FILTER (WHERE \"admitted_at\" > $2::timestamp - INTERVAL '60 seconds') AS rpm, "
             "COUNT(*) FILTER (WHERE \"state\" IN ('held', 'uncertain')) AS concurrent "
             'FROM "LiteLLM_TokeninHold" WHERE "user_id" = $1',
             user_id,
-            now,
+            as_sql_timestamp(now),
         )
         if int(limits[0]["rpm"]) >= int(policy["rpm_limit"]):
             raise HTTPException(status_code=429, detail="Account RPM limit exceeded")
@@ -253,13 +282,13 @@ async def reserve_account_request(
         await tx.execute_raw(
             'INSERT INTO "LiteLLM_TokeninHold" '
             '("request_id", "user_id", "key_hash", "model", "state", "estimated_nano", "admitted_at") '
-            "VALUES ($1,$2,$3,$4,'held',$5,$6)",
+            "VALUES ($1,$2,$3,$4,'held',$5,$6::timestamp)",
             request_id,
             user_id,
             key_hash,
             model,
             estimated_nano,
-            now,
+            as_sql_timestamp(now),
         )
         for grant_id, amount in allocation:
             await tx.execute_raw(
@@ -309,9 +338,8 @@ async def settle_account_request(prisma_client: PrismaClient, request_id: str, a
             )
             remaining -= spent  # rebind-ok: refund any unused reservation after FIFO actual charge
         if remaining:
-            clock: Final = await tx.query_raw("SELECT clock_timestamp() AT TIME ZONE 'UTC' AS now")
             fresh_grants: Final = await tx.query_raw(_GRANTS_WITH_SPEND_QUERY, user_id)
-            eligible: Final = eligible_grants(tuple(_grant(row) for row in fresh_grants), clock[0]["now"])
+            eligible: Final = eligible_grants(tuple(_grant(row) for row in fresh_grants), await _now(tx))
             payable: Final = min(remaining, sum(grant.available_nano for grant in eligible))
             if payable:
                 for grant_id, amount in allocate_fifo(eligible, payable):

@@ -1,4 +1,8 @@
-"""Gated Tokenin paid-period records. No request spend is authorized by this module yet."""
+"""Gated Tokenin paid-period records. No request spend is authorized by this module yet.
+
+Every ``TIMESTAMP(3)`` bind carries an explicit ``::timestamp`` cast and a UTC ISO string:
+bound parameters reach Postgres as text, so it cannot infer the column type.
+"""
 
 import hashlib
 import hmac
@@ -14,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from litellm._logging import verbose_proxy_logger
+from litellm.proxy.tokenin.ledger import as_naive_utc
 from litellm.proxy.tokenin.plans import TokeninPlan, load_plans
 from litellm.proxy.utils import PrismaClient
 
@@ -94,10 +99,10 @@ def _dollars(amount_nano: int) -> Decimal:
     return Decimal(amount_nano) / _NANODOLLARS
 
 
-def _as_utc(value: datetime | None) -> datetime | None:
-    if value is None:
-        return None
-    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+def _as_utc(value: datetime | str | None) -> datetime | None:
+    """API responses carry aware UTC; raw prisma rows hand back naive-UTC JSON strings."""
+    converted: Final = as_naive_utc(value)
+    return converted.replace(tzinfo=timezone.utc) if converted is not None else None
 
 
 def _fingerprint(payload: Mapping[str, object]) -> str:
@@ -362,15 +367,16 @@ async def grant_account(data: GrantRequest) -> dict[str, object]:
                 data.period_index + 1,
             )
             for adjacent in neighbor:
-                expected: Final = adjacent["period_end"] if adjacent["period_index"] == data.period_index - 1 else end
-                actual: Final = start if adjacent["period_index"] == data.period_index - 1 else adjacent["period_start"]
+                earlier: Final = adjacent["period_index"] == data.period_index - 1
+                expected: Final = as_naive_utc(adjacent["period_end"]) if earlier else end
+                actual: Final = start if earlier else as_naive_utc(adjacent["period_start"])
                 if expected != actual:
                     raise HTTPException(status_code=409, detail="Paid periods are not contiguous")
         inserted: Final = await tx.execute_raw(
             'INSERT INTO "LiteLLM_TokeninGrant" '
             '("idempotency_key", "user_id", "payload_hash", "plan_id", "kind", "amount_nano", '
             '"subscription_id", "period_index", "period_start", "period_end") '
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING",
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::timestamp,$10::timestamp) ON CONFLICT DO NOTHING",
             data.idempotency_key,
             data.user_id,
             fingerprint,
@@ -379,8 +385,8 @@ async def grant_account(data: GrantRequest) -> dict[str, object]:
             amount,
             data.subscription_id,
             data.period_index,
-            start,
-            end,
+            start.isoformat() if start is not None else None,
+            end.isoformat() if end is not None else None,
         )
         if inserted != 1:
             raise HTTPException(status_code=409, detail="Paid period already granted")
@@ -463,7 +469,7 @@ async def set_account_policy(data: PolicyRequest) -> dict[str, object]:
             'INSERT INTO "LiteLLM_TokeninPolicy" '
             '("idempotency_key", "user_id", "payload_hash", "plan_id", "models", '
             '"rpm_limit", "max_parallel_requests", "effective_at") '
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8::timestamp)",
             data.idempotency_key,
             data.user_id,
             fingerprint,
@@ -471,7 +477,7 @@ async def set_account_policy(data: PolicyRequest) -> dict[str, object]:
             data.models,
             data.rpm_limit,
             data.max_parallel_requests,
-            effective,
+            effective.isoformat(),
         )
     return _policy_response(
         {
@@ -562,7 +568,8 @@ async def account_holds(
             "settled_at": _as_utc(row["settled_at"]),
         }
         for row in rows
-        if row["state"] in requested and row["admitted_at"] <= cutoff
+        if row["state"] in requested
+        and (as_naive_utc(row["admitted_at"]) is not None and as_naive_utc(row["admitted_at"]) <= cutoff)
     ]
     return {
         "user_id": user_id,
