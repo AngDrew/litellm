@@ -16,7 +16,7 @@ from starlette.requests import Request
 from litellm.proxy._types import LitellmUserRoles, ProxyException, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import _authorize_authenticated_request
 from litellm.proxy.tokenin import accounts
-from litellm.proxy.tokenin.plans import FLAT_TEAM_ID, TokeninPlan
+from litellm.proxy.tokenin.plans import FLAT_TEAM_ID, KEY_MODELS, TokeninPlan
 
 ACCOUNT: Final = "customer-123"
 PERIOD_START: Final = datetime(2026, 1, 31, tzinfo=timezone.utc)
@@ -375,6 +375,58 @@ async def test_managed_reservation_binds_key_model_and_worst_case_cost(
             client, ACCOUNT, FLAT_TEAM_ID, "/chat/completions", {"messages": []}, "sk-abc"
         )
     assert no_model.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_account_key_issuance_derives_identity_and_carries_no_limits(
+    store: FakeTx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.proxy.management_endpoints import key_management_endpoints
+
+    store.accounts.add(ACCOUNT)
+    issued: Final = AsyncMock(return_value={"token": "sk-account-key", "token_id": "key-1", "key_name": "account-1"})
+    monkeypatch.setattr(key_management_endpoints, "generate_key_helper_fn", issued)
+    app: Final = FastAPI()
+    app.include_router(accounts.router)
+    transport: Final = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        denied: Final = await client.post("/tokenin/account/keys", json={"user_id": ACCOUNT, "alias": "laptop"})
+        assert denied.status_code == 403
+        forbidden_fields: Final = await client.post(
+            "/tokenin/account/keys",
+            headers={"Authorization": "Bearer very-long-test-secret-32-characters-minimum"},
+            json={"user_id": ACCOUNT, "alias": "laptop", "plan_id": "medium", "max_budget": 50, "rpm_limit": 99},
+        )
+        assert forbidden_fields.status_code == 422
+        unknown_account: Final = await client.post(
+            "/tokenin/account/keys",
+            headers={"Authorization": "Bearer very-long-test-secret-32-characters-minimum"},
+            json={"user_id": "not-enrolled", "alias": "laptop"},
+        )
+        assert unknown_account.status_code == 409
+        created: Final = await client.post(
+            "/tokenin/account/keys",
+            headers={"Authorization": "Bearer very-long-test-secret-32-characters-minimum"},
+            json={"user_id": ACCOUNT, "alias": "laptop"},
+        )
+        assert created.status_code == 200
+        assert created.json()["key"] == "sk-account-key"
+        assert created.json()["user_id"] == ACCOUNT
+        assert created.json()["expires"] is None
+    assert issued.await_args is not None
+    assert issued.await_args.kwargs["user_id"] == ACCOUNT
+    assert issued.await_args.kwargs["team_id"] == FLAT_TEAM_ID
+    assert issued.await_args.kwargs["models"] == KEY_MODELS
+    assert not {
+        "max_budget",
+        "budget_duration",
+        "budget_reset_at",
+        "budget_limits",
+        "expires",
+        "rpm_limit",
+        "max_parallel_requests",
+        "plan_id",
+    } & set(issued.await_args.kwargs)
 
 
 @pytest.mark.asyncio

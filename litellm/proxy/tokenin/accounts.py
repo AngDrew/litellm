@@ -11,7 +11,7 @@ from typing import Final, Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from litellm._logging import verbose_proxy_logger
 from litellm.proxy.tokenin.plans import TokeninPlan, load_plans
@@ -122,6 +122,15 @@ class PolicyRequest(BaseModel):
         default=None,
         description="Latest known policy_id; null succeeds only when the account has no policy yet",
     )
+
+
+class AccountKeyRequest(BaseModel):
+    """Account-bound key issuance. No plan, budget, rate, or expiry field: the ledger governs spend."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str = Field(min_length=1)
+    alias: str = Field(min_length=1)
 
 
 class HoldResolution(BaseModel):
@@ -466,6 +475,35 @@ def _policy_response(row: Mapping[str, object], duplicate: bool) -> dict[str, ob
         "policy_id": row["idempotency_key"],
         "created_at": _as_utc(row.get("created_at")),
         "enforcement_active": False,
+    }
+
+
+@router.post("/tokenin/account/keys", dependencies=[Depends(_service_only)], tags=["tokenin"])
+async def account_key_generate(data: AccountKeyRequest) -> dict[str, object]:
+    """Issue a key bound to an enrolled account. Issues no credit, so rotation is harmless."""
+    prisma_client: Final = _db()
+    if not await is_managed_account(prisma_client, data.user_id):
+        raise HTTPException(status_code=409, detail="Account is not enrolled")
+    from litellm.proxy.management_endpoints.key_management_endpoints import generate_key_helper_fn
+    from litellm.proxy.tokenin.plans import FLAT_TEAM_ID, KEY_MODELS
+
+    response: Final[Mapping[str, object]] = await generate_key_helper_fn(
+        request_type="key",
+        user_id=data.user_id,
+        team_id=FLAT_TEAM_ID,
+        models=KEY_MODELS,
+        key_alias=data.alias,
+        table_name="key",
+    )
+    return {
+        "user_id": data.user_id,
+        "token_id": response.get("token_id"),
+        "key": response.get("token"),
+        "key_alias": data.alias,
+        "key_name": response.get("key_name"),
+        "created_at": _as_utc(response.get("created_at")),
+        "expires": None,
+        "enforcement_active": account_spend_enabled(),
     }
 
 

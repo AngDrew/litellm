@@ -59,6 +59,8 @@ Account debt blocks new admissions until it is repaid from newly eligible credit
 
 Spend is armed in two steps: `TOKENIN_ACCOUNT_V2_ENABLED=true` records grants and policies, and `TOKENIN_ACCOUNT_SPEND_ENABLED=true` lets enrolled accounts spend. With the second switch off, every enrolled request still fails closed with 503
 
+Keys for managed accounts are issued with `POST /tokenin/account/keys` (service token, body `{user_id, alias}`). It derives the account and team server-side, carries no plan, budget, rate, or expiry field, refuses unenrolled accounts, and moves no credit, so rotation and re-issuance are harmless. Legacy `/tokenin/key/generate` still refuses enrolled accounts
+
 ## Cutover options
 
 Decision: one coordinated cutover. The live proxy still issues per-key budgets, and this branch issues account-wallet credit instead, so deploying this branch before the platform migrates would change money behavior for existing customers. Keep the new image undeployed until the platform is ready
