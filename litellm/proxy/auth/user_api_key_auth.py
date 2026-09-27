@@ -2789,7 +2789,7 @@ async def _authorize_authenticated_request(
     # ProxyException consistently with pre-refactor behavior.
     try:
         from litellm.proxy.proxy_server import prisma_client
-        from litellm.proxy.tokenin.accounts import require_request_admission
+        from litellm.proxy.tokenin.accounts import require_request_admission, reserve_managed_request
 
         await require_request_admission(
             prisma_client=prisma_client,
@@ -2803,6 +2803,18 @@ async def _authorize_authenticated_request(
             request_data=request_data,
             route=route,
         )
+        # Reserve only after every authorization check passed: the provider has
+        # not been called yet, so nothing here can leave a charged-against hold.
+        account_hold_id: Final = await reserve_managed_request(
+            prisma_client=prisma_client,
+            user_id=user_api_key_auth_obj.user_id,
+            team_id=user_api_key_auth_obj.team_id,
+            route=route,
+            request_data=request_data,
+            api_key=api_key,
+        )
+        if account_hold_id is not None:
+            user_api_key_auth_obj.tokenin_account_hold_id = account_hold_id
     except Exception as e:
         return await UserAPIKeyAuthExceptionHandler._handle_authentication_error(
             e=e,

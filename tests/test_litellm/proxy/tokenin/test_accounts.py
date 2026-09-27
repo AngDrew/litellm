@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -312,6 +313,68 @@ async def test_policy_cas_binds_latest_created_revision_and_writes_nothing_when_
     with pytest.raises(HTTPException) as unknown_alias:
         await accounts.set_account_policy(stale.model_copy(update={"models": ["model-z"], "idempotency_key": "p4"}))
     assert unknown_alias.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_managed_admission_scopes_routes_and_requires_the_spend_switch(
+    store: FakeTx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store.accounts.add(ACCOUNT)
+    client: Final = SimpleNamespace(db=store)
+    with pytest.raises(HTTPException) as denied:
+        await accounts.require_request_admission(client, ACCOUNT, FLAT_TEAM_ID, "/chat/completions")
+    assert denied.value.status_code == 503
+    monkeypatch.setenv("TOKENIN_ACCOUNT_SPEND_ENABLED", "true")
+    assert await accounts.require_request_admission(client, ACCOUNT, FLAT_TEAM_ID, "/chat/completions") is None
+    assert await accounts.require_request_admission(client, ACCOUNT, FLAT_TEAM_ID, "/v1/chat/completions") is None
+    with pytest.raises(HTTPException) as unsupported:
+        await accounts.require_request_admission(client, ACCOUNT, FLAT_TEAM_ID, "/v1/embeddings")
+    assert unsupported.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_managed_reservation_binds_key_model_and_worst_case_cost(
+    store: FakeTx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store.accounts.add(ACCOUNT)
+    client: Final = SimpleNamespace(db=store)
+    reserve: Final = AsyncMock(return_value=(("paid", 1),))
+    estimator: Final = AsyncMock(return_value=2.5)
+    monkeypatch.setattr("litellm.proxy.tokenin.ledger.reserve_account_request", reserve)
+    monkeypatch.setattr("litellm.proxy.tokenin.enforcement.estimate_account_max_cost", estimator)
+    body: Final = {"model": "model-a"}
+    assert (
+        await accounts.reserve_managed_request(client, ACCOUNT, FLAT_TEAM_ID, "/chat/completions", body, "sk-abc")
+        is None
+    )
+    assert not reserve.await_count
+    monkeypatch.setenv("TOKENIN_ACCOUNT_SPEND_ENABLED", "true")
+    assert (
+        await accounts.reserve_managed_request(client, "not-enrolled", FLAT_TEAM_ID, "/chat/completions", body, "sk")
+        is None
+    )
+    assert (
+        await accounts.reserve_managed_request(client, ACCOUNT, FLAT_TEAM_ID, "/v1/embeddings", body, "sk-abc") is None
+    )
+    hold_id: Final = await accounts.reserve_managed_request(
+        client, ACCOUNT, FLAT_TEAM_ID, "/chat/completions", body, "sk-abc"
+    )
+    assert hold_id is not None and hold_id.startswith("tokenin-")
+    assert reserve.await_args is not None
+    assert reserve.await_args.kwargs["request_id"] == hold_id
+    assert reserve.await_args.kwargs["model"] == "model-a"
+    assert reserve.await_args.kwargs["estimated_cost"] == 2.5
+    assert reserve.await_args.kwargs["key_hash"] == hashlib.sha256(b"sk-abc").hexdigest()
+    estimator.side_effect = HTTPException(status_code=503, detail="Model has no supported maximum cost")
+    with pytest.raises(HTTPException) as unpriced:
+        await accounts.reserve_managed_request(client, ACCOUNT, FLAT_TEAM_ID, "/chat/completions", body, "sk-abc")
+    assert unpriced.value.status_code == 503
+    estimator.side_effect = None
+    with pytest.raises(HTTPException) as no_model:
+        await accounts.reserve_managed_request(
+            client, ACCOUNT, FLAT_TEAM_ID, "/chat/completions", {"messages": []}, "sk-abc"
+        )
+    assert no_model.value.status_code == 503
 
 
 @pytest.mark.asyncio

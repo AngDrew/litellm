@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Final, Literal
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -18,10 +19,16 @@ from litellm.proxy.utils import PrismaClient
 router = APIRouter()
 _NANODOLLARS: Final = Decimal("1000000000")
 _MAX_NANODOLLARS: Final = 2**63 - 1
+_MANAGED_ADMISSION_ROUTES: Final = frozenset({"/chat/completions", "/v1/chat/completions"})
 
 
 def account_v2_enabled() -> bool:
     return os.environ.get("TOKENIN_ACCOUNT_V2_ENABLED") == "true"
+
+
+def account_spend_enabled() -> bool:
+    """Second switch: records alone must never start charging managed accounts."""
+    return account_v2_enabled() and os.environ.get("TOKENIN_ACCOUNT_SPEND_ENABLED") == "true"
 
 
 def _service_only(request: Request) -> None:
@@ -184,7 +191,51 @@ async def require_request_admission(
     if user_id is None and team_id == FLAT_TEAM_ID:
         raise HTTPException(status_code=503, detail="Unattributed Tokenin key cannot be authorized")
     if await is_managed_account(prisma_client, user_id):
-        raise HTTPException(status_code=503, detail="Managed account spend is not yet enabled")
+        if not account_spend_enabled():
+            raise HTTPException(status_code=503, detail="Managed account spend is not yet enabled")
+        if route not in _MANAGED_ADMISSION_ROUTES:
+            raise HTTPException(status_code=503, detail="Managed accounts support only chat completions in this phase")
+
+
+async def reserve_managed_request(
+    prisma_client: PrismaClient | None,
+    user_id: str | None,
+    team_id: str | None,
+    route: str,
+    request_data: Mapping[str, object],
+    api_key: str | None,
+) -> str | None:
+    """Reserve the worst-case account cost and return the hold id stamped on the key.
+
+    Runs after ``common_checks`` so an authorization failure cannot leave a hold
+    behind for a request the provider never saw.
+    """
+    if not account_spend_enabled() or route not in _MANAGED_ADMISSION_ROUTES:
+        return None
+    if prisma_client is None or not user_id or not api_key or not team_id:
+        raise HTTPException(status_code=503, detail="Managed account attribution unavailable")
+    if not await is_managed_account(prisma_client, user_id):
+        return None
+    model: Final = request_data.get("model")
+    if not isinstance(model, str) or not model:
+        raise HTTPException(status_code=503, detail="Managed account request has no model")
+    from litellm.proxy.proxy_server import llm_router
+    from litellm.proxy.tokenin.enforcement import estimate_account_max_cost
+    from litellm.proxy.tokenin.ledger import reserve_account_request
+
+    estimated: Final = await estimate_account_max_cost(
+        request_body=dict(request_data), route=route, llm_router=llm_router
+    )
+    hold_id: Final = f"tokenin-{uuid4().hex}"
+    await reserve_account_request(
+        prisma_client=prisma_client,
+        user_id=user_id,
+        request_id=hold_id,
+        model=model,
+        estimated_cost=estimated,
+        key_hash=hashlib.sha256(api_key.encode()).hexdigest(),
+    )
+    return hold_id
 
 
 def _grant_response(row: Mapping[str, object], duplicate: bool) -> dict[str, object]:
