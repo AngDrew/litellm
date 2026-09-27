@@ -4,7 +4,9 @@ This phase records verified account grants and future-dated policy revisions. It
 
 With the flag set to `true`, new `/tokenin/account/*` routes require `Authorization: Bearer <TOKENIN_ACCOUNT_SERVICE_TOKEN>`. The token must be at least 32 characters. It is a separate secret held by the trusted payment service, not a customer key or the proxy admin key. The payment service must verify payment, ownership, amount, and paid period before calling the proxy. Neither these routes nor their payloads are payment verification. The flag defaults to off, and the existing key and wallet routes retain their old behavior while it is off
 
-`GET /tokenin/account/catalog` returns `{ "plans": [{ "id", "kind", "monthly_value_usd", "rpm_limit", "max_parallel_requests" }], "enforcement_active": false }`. Fixed `monthly_value_usd` is the proxy's resolved monthly credit; PAYG reports null. The payment service can snapshot this amount on invoice creation. There is no model alias catalog in the proxy's Tokenin plans, so paid-plan aliases must come from a separate trusted allowlist
+`GET /tokenin/account/status` is the platform's boot gate: `{ "v2_enabled", "spend_enabled", "enforcement_active", "supported_routes" }`, service token only, env reads only, no database access and no side effects. `enforcement_active` is the same global two-switch state this document calls the phase marker, and `supported_routes` lists the routes that currently admit managed accounts
+
+`GET /tokenin/account/catalog` returns `{ "plans": [{ "id", "kind", "monthly_value_usd", "rpm_limit", "max_parallel_requests" }], "enforcement_active": false }` (`false` because spend is off; the field tracks the switch on every route). Fixed `monthly_value_usd` is the proxy's resolved monthly credit; PAYG reports null. The payment service can snapshot this amount on invoice creation. There is no model alias catalog in the proxy's Tokenin plans, so paid-plan aliases must come from a separate trusted allowlist
 
 `POST /tokenin/account/grants` accepts:
 
@@ -25,7 +27,7 @@ Fixed grants use the plan catalog's `monthly_value` when present. Older deployed
 
 PAYG uses the same route with `kind: "payg"`, `plan_id: "payg"`, and a verified positive `topup_usd`; omit all subscription and period fields. The server stores money as integer nanodollars and rejects values with more than nine decimal places. The payment service must provide the original provider purchase ID as its stable idempotency key
 
-`GET /tokenin/account/grants/{idempotency_key}?user_id=...` recovers the persisted credit amount after a timeout without creating a second grant. `GET /tokenin/account/summary?user_id=...` lists recorded grants and policy revisions. `available_usd: null` and `enforcement_active: false` mean no live spendable balance can be inferred from either endpoint
+`GET /tokenin/account/grants/{idempotency_key}?user_id=...` recovers the persisted credit amount after a timeout without creating a second grant. `GET /tokenin/account/summary?user_id=...` lists recorded grants and policy revisions. `available_usd: null` means no live spendable balance can be inferred from either endpoint, and is not a spend authorization
 
 `POST /tokenin/account/policy` accepts `user_id`, `idempotency_key` (a stable policy event ID), `plan_id`, `models` (an explicit array of model aliases), `rpm_limit` (positive integer), `max_parallel_requests` (positive integer), and timezone-aware `effective_at`. Empty `models` explicitly denies all models; wildcards and `all-team-models` are rejected. An identical retry returns `duplicate: true`, and a changed payload for the same ID returns 409. Future policy revisions remain records only in phase 1, so an early upgrade cannot change running limits
 
@@ -59,6 +61,8 @@ Account debt blocks new admissions until it is repaid from newly eligible credit
 
 Spend is armed in two steps: `TOKENIN_ACCOUNT_V2_ENABLED=true` records grants and policies, and `TOKENIN_ACCOUNT_SPEND_ENABLED=true` lets enrolled accounts spend. With the second switch off, every enrolled request still fails closed with 503
 
+The flat team is pre-existing provisioning the proxy never creates: `FLAT_TEAM_ID = "ac0b4e54-71a7-4e1f-bfaf-32fad13c09e9"` in `litellm/proxy/tokenin/plans.py`, and both the legacy `tokenin/key/generate` and `POST /tokenin/account/keys` bind every issued key to it. Without that row, a freshly issued key fails auth with `Team doesn't exist in db` while charging nothing. Create it once per environment with the master key: `POST /team/new {"team_id": "ac0b4e54-71a7-4e1f-bfaf-32fad13c09e9", "team_alias": "tokenin-flat", "models": []}` (an empty `models` allows every model, which is what `models=["all-team-models"]` on the key expects). Verify with `SELECT "team_id" FROM "LiteLLM_TeamTable" WHERE "team_id" = 'ac0b4e54-71a7-4e1f-bfaf-32fad13c09e9'`. Staging and production must both have it before any key is issued; the acceptance run seeds it by hand for the same reason
+
 Keys for managed accounts are issued with `POST /tokenin/account/keys` (service token, body `{user_id, alias}`). It derives the account and team server-side, carries no plan, budget, rate, or expiry field, refuses unenrolled accounts, and moves no credit, so rotation and re-issuance are harmless. Legacy `/tokenin/key/generate` still refuses enrolled accounts
 
 ## Cutover options
@@ -84,3 +88,5 @@ Timestamps cross the prisma boundary as text: raw query results are JSON strings
 Two checks need a real provider on staging. First, streaming logs the cost callback per chunk and only the final chunk carries a cost, so an in-flight chunk must leave the hold `held`; the guard lives in `litellm/proxy/hooks/proxy_track_cost_callback.py` and is inert for the single-chunk mock, so it is unverified until a live stream runs. Second, a client that disconnects mid-stream must leave `settled`/`uncertain` (never a silent refund) and reconciliation must clear the residual
 
 `enforcement_active` is not one flag. The records-only routes (`/tokenin/account/catalog`, `/tokenin/account/models`, policy and summary responses) report a literal `false`, meaning no live spendable balance can be inferred from them. `/tokenin/account/keys` and the holds listing report `account_spend_enabled()`, the global two-switch state. Neither is per-account spend authorization: that is decided per request from enrollment, policy, credit, and the switches
+
+Revoking an account key needs no raw key value: `POST /key/delete` accepts `{"keys": ["<token_id>"]}` (the response's `token_id` is the stored hash, and the route hashes only raw `sk-` values) or `{"key_aliases": ["<alias>"]}`, and either never moves credit because grants and holds hang off `user_id`. An orphan whose `token_id` was lost to a crash is therefore still removable by alias
