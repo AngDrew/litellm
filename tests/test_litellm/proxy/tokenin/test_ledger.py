@@ -352,6 +352,19 @@ async def test_operator_reconciliation_lists_and_resolves_stuck_holds(monkeypatc
     assert finalized.value.status_code == 409
     assert (await accounts.account_holds(user_id=ACCOUNT, states="uncertain", older_than_minutes=0))["holds"] == []
 
+    await reserve_account_request(db, ACCOUNT, "lost", "allowed", 1.0)
+    assert await mark_account_request_uncertain(db, "lost") is True
+    released: Final = await accounts.resolve_account_hold(
+        request_id="lost", data=accounts.HoldResolution(action="cancel", note="provider confirmed no charge")
+    )
+    assert released == {
+        "request_id": "lost",
+        "state": "cancelled",
+        "charged_usd": 0.0,
+        "note": "provider confirmed no charge",
+    }
+    assert ("lost", "paid") not in db.allocations
+
 
 @pytest.mark.asyncio
 async def test_admission_replay_is_bound_to_account_key_model_and_estimate() -> None:
@@ -452,6 +465,12 @@ async def test_uncertain_hold_keeps_reservation_and_never_releases_speculatively
         await reserve_account_request(db, ACCOUNT, "next", "allowed", 0.5)
     assert exhausted.value.status_code == 402
     assert db.allocations[("lost", "paid")] == 2 * NANO
+
+    # The operator route is the only caller allowed to release it: a human decision with a
+    # note on record, never the automatic callbacks settled above.
+    assert await settle_account_request(db, "lost", 1.0, allow_uncertain=True) == NANO
+    assert db.holds["lost"]["state"] == "settled"
+    assert db.allocations[("lost", "paid")] == NANO
 
 
 @pytest.mark.asyncio

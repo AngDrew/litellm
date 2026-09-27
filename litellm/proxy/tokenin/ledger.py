@@ -300,7 +300,9 @@ async def reserve_account_request(
         return allocation
 
 
-async def settle_account_request(prisma_client: PrismaClient, request_id: str, actual_cost: float) -> int:
+async def settle_account_request(
+    prisma_client: PrismaClient, request_id: str, actual_cost: float, *, allow_uncertain: bool = False
+) -> int:
     charged_nano: Final = to_nano_ceil(actual_cost, allow_zero=True)
     async with prisma_client.db.tx() as tx:
         identity: Final = await tx.query_raw(
@@ -319,7 +321,7 @@ async def settle_account_request(prisma_client: PrismaClient, request_id: str, a
             if int(existing[0]["charged_nano"]) != charged_nano:
                 raise HTTPException(status_code=409, detail="Request cost changed after settlement")
             return charged_nano
-        if existing[0]["state"] != "held":
+        if existing[0]["state"] != "held" and not (allow_uncertain and existing[0]["state"] == "uncertain"):
             raise HTTPException(status_code=503, detail="Reservation needs manual reconciliation")
         allocation: Final = await tx.query_raw(
             'SELECT a."grant_id", a."amount_nano" FROM "LiteLLM_TokeninAllocation" a '
@@ -370,8 +372,11 @@ async def settle_account_request(prisma_client: PrismaClient, request_id: str, a
         return charged_nano
 
 
-async def cancel_account_request(prisma_client: PrismaClient, request_id: str) -> bool:
-    """Release a reservation whose work is known not to have billed. Unknown holds stay reserved."""
+async def cancel_account_request(
+    prisma_client: PrismaClient, request_id: str, *, allow_uncertain: bool = False
+) -> bool:
+    """Release a reservation whose work is known not to have billed. Unpriced outcomes stay
+    reserved unless the operator route, which decides with a human note on record, releases them."""
     async with prisma_client.db.tx() as tx:
         identity: Final = await tx.query_raw(
             'SELECT "user_id", "state" FROM "LiteLLM_TokeninHold" WHERE "request_id" = $1', request_id
@@ -385,7 +390,7 @@ async def cancel_account_request(prisma_client: PrismaClient, request_id: str) -
         state: Final = identity[0]["state"]
         if state == "cancelled":
             return True
-        if state != "held":
+        if state != "held" and not (allow_uncertain and state == "uncertain"):
             return False
         await tx.execute_raw(
             'UPDATE "LiteLLM_TokeninAllocation" SET "amount_nano" = 0 WHERE "request_id" = $1', request_id

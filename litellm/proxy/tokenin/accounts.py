@@ -613,7 +613,7 @@ async def resolve_account_hold(request_id: str, data: HoldResolution) -> dict[st
     if data.action == "settle":
         if data.cost_usd is None:
             raise HTTPException(status_code=400, detail="settle requires cost_usd")
-        charged: Final = await settle_account_request(client, request_id, float(data.cost_usd))
+        charged: Final = await settle_account_request(client, request_id, float(data.cost_usd), allow_uncertain=True)
         return {
             "request_id": request_id,
             "state": "settled",
@@ -625,7 +625,7 @@ async def resolve_account_hold(request_id: str, data: HoldResolution) -> dict[st
     applied: Final = (
         await mark_account_request_uncertain(client, request_id)
         if data.action == "uncertain"
-        else await cancel_account_request(client, request_id)
+        else await cancel_account_request(client, request_id, allow_uncertain=True)
     )
     if not applied:
         raise HTTPException(status_code=409, detail="Hold does not exist or is already finalized")
