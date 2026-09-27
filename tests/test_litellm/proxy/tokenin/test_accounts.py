@@ -579,6 +579,32 @@ async def test_http_routes_reject_generic_key_and_accept_service_secret(store: F
 
 
 @pytest.mark.asyncio
+async def test_status_reports_the_switches_that_gate_account_spend(
+    store: FakeTx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app: Final = FastAPI()
+    app.include_router(accounts.router)
+    transport: Final = httpx.ASGITransport(app=app)
+    monkeypatch.setenv("TOKENIN_ACCOUNT_V2_ENABLED", "true")
+    monkeypatch.setenv("TOKENIN_ACCOUNT_SERVICE_TOKEN", "very-long-test-secret-32-characters-minimum")
+    auth: Final = {"Authorization": "Bearer very-long-test-secret-32-characters-minimum"}
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        denied: Final = await client.get("/tokenin/account/status")
+        assert denied.status_code == 403
+        records: Final = await client.get("/tokenin/account/status", headers=auth)
+        assert records.status_code == 200
+        assert records.json() == {
+            "v2_enabled": True,
+            "spend_enabled": False,
+            "enforcement_active": False,
+            "supported_routes": ["/chat/completions", "/v1/chat/completions"],
+        }
+        monkeypatch.setenv("TOKENIN_ACCOUNT_SPEND_ENABLED", "true")
+        armed: Final = await client.get("/tokenin/account/status", headers=auth)
+        assert armed.json()["enforcement_active"] is True
+
+
+@pytest.mark.asyncio
 async def test_model_catalog_lists_only_configured_aliases_for_service_token(
     store: FakeTx, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -298,7 +298,22 @@ def _grant_response(row: Mapping[str, object], duplicate: bool) -> dict[str, obj
         "period_end": _as_utc(row.get("period_end")),
         "duplicate": duplicate,
         "available_usd": None,
-        "enforcement_active": False,
+        "enforcement_active": account_spend_enabled(),
+    }
+
+
+@router.get("/tokenin/account/status", dependencies=[Depends(_service_only)], tags=["tokenin"])
+async def account_status() -> dict[str, object]:
+    """What this proxy is armed for, for a platform boot gate. Reads env only, never the database.
+
+    ``enforcement_active`` is the global two-switch state, not per-account spend authorization:
+    enrollment, policy, and credit decide that per request.
+    """
+    return {
+        "v2_enabled": account_v2_enabled(),
+        "spend_enabled": account_spend_enabled(),
+        "enforcement_active": account_spend_enabled(),
+        "supported_routes": sorted(_MANAGED_ADMISSION_ROUTES),
     }
 
 
@@ -316,13 +331,13 @@ async def account_catalog() -> dict[str, object]:
             }
             for plan in plans
         ],
-        "enforcement_active": False,
+        "enforcement_active": account_spend_enabled(),
     }
 
 
 @router.get("/tokenin/account/models", dependencies=[Depends(_service_only)], tags=["tokenin"])
 async def account_models() -> dict[str, object]:
-    return {"models": sorted(_configured_model_aliases()), "enforcement_active": False}
+    return {"models": sorted(_configured_model_aliases()), "enforcement_active": account_spend_enabled()}
 
 
 @router.post("/tokenin/account/grants", dependencies=[Depends(_service_only)], tags=["tokenin"])
@@ -505,7 +520,7 @@ def _policy_response(row: Mapping[str, object], duplicate: bool) -> dict[str, ob
         "effective_at": _as_utc(row["effective_at"]),
         "policy_id": row["idempotency_key"],
         "created_at": _as_utc(row.get("created_at")),
-        "enforcement_active": False,
+        "enforcement_active": account_spend_enabled(),
     }
 
 
@@ -653,5 +668,5 @@ async def account_summary(user_id: str = Query(min_length=1)) -> dict[str, objec
         "policies": [_policy_response(row, duplicate=False) for row in policies],
         "latest_policy_id": policies[0]["idempotency_key"] if policies else None,
         "available_usd": None,
-        "enforcement_active": False,
+        "enforcement_active": account_spend_enabled(),
     }
