@@ -1,0 +1,373 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timezone
+from decimal import Decimal
+from types import SimpleNamespace
+from typing import Final
+
+import httpx
+import pytest
+from fastapi import FastAPI, HTTPException
+from starlette.requests import Request
+
+from litellm.proxy.tokenin import accounts
+from litellm.proxy.tokenin.plans import FLAT_TEAM_ID, TokeninPlan
+
+ACCOUNT: Final = "customer-123"
+PERIOD_START: Final = datetime(2026, 1, 31, tzinfo=timezone.utc)
+PERIOD_END: Final = datetime(2026, 2, 28, tzinfo=timezone.utc)
+
+
+class FakeTx:
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.accounts: set[str] = set()
+        self.grants: dict[str, dict[str, object]] = {}
+        self.policies: dict[str, dict[str, object]] = {}
+
+    def tx(self) -> FakeTx:
+        return self
+
+    async def __aenter__(self) -> FakeTx:
+        await self.lock.acquire()
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.lock.release()
+
+    async def execute_raw(self, sql: str, *values: object) -> int:
+        if 'INSERT INTO "LiteLLM_TokeninAccount"' in sql:
+            self.accounts.add(str(values[0]))
+            return 1
+        if 'INSERT INTO "LiteLLM_TokeninGrant"' in sql:
+            key, user_id, payload_hash, plan_id, kind, amount, sub, index, start, end = values
+            if str(key) in self.grants or any(
+                row["user_id"] == user_id and row["subscription_id"] == sub and row["period_index"] == index
+                for row in self.grants.values()
+                if sub is not None
+            ):
+                return 0
+            self.grants[str(key)] = {
+                "idempotency_key": key,
+                "user_id": user_id,
+                "payload_hash": payload_hash,
+                "plan_id": plan_id,
+                "kind": kind,
+                "amount_nano": amount,
+                "subscription_id": sub,
+                "period_index": index,
+                "period_start": start,
+                "period_end": end,
+            }
+            return 1
+        if 'INSERT INTO "LiteLLM_TokeninPolicy"' in sql:
+            key, user_id, payload_hash, plan_id, models, rpm, concurrent, effective = values
+            self.policies[str(key)] = {
+                "idempotency_key": key,
+                "user_id": user_id,
+                "payload_hash": payload_hash,
+                "plan_id": plan_id,
+                "models": models,
+                "rpm_limit": rpm,
+                "max_parallel_requests": concurrent,
+                "effective_at": effective,
+            }
+            return 1
+        raise AssertionError(sql)
+
+    async def query_raw(self, sql: str, *values: object) -> list[dict[str, object]]:
+        if '"LiteLLM_TokeninAccount"' in sql:
+            return [{"user_id": values[0]}] if values[0] in self.accounts else []
+        if '"LiteLLM_TokeninGrant"' in sql:
+            if '"period_index" IN' in sql:
+                user_id, sub, kind, before, after = values
+                return [
+                    row
+                    for row in self.grants.values()
+                    if row["user_id"] == user_id
+                    and row["subscription_id"] == sub
+                    and row["kind"] == kind
+                    and row["period_index"] in (before, after)
+                ]
+            if '"idempotency_key" = $1 AND "user_id" = $2' in sql:
+                row = self.grants.get(str(values[0]))
+                return [row] if row is not None and row["user_id"] == values[1] else []
+            if '"idempotency_key" = $1' in sql:
+                row = self.grants.get(str(values[0]))
+                return [row] if row is not None else []
+            return [row for row in self.grants.values() if row["user_id"] == values[0]]
+        if '"LiteLLM_TokeninPolicy"' in sql:
+            if '"idempotency_key" = $1' in sql:
+                row = self.policies.get(str(values[0]))
+                return [row] if row is not None else []
+            return [row for row in self.policies.values() if row["user_id"] == values[0]]
+        raise AssertionError(sql)
+
+
+@pytest.fixture
+def store(monkeypatch: pytest.MonkeyPatch) -> FakeTx:
+    fake: Final = FakeTx()
+    monkeypatch.setenv("TOKENIN_ACCOUNT_V2_ENABLED", "true")
+    monkeypatch.setenv("TOKENIN_ACCOUNT_SERVICE_TOKEN", "very-long-test-secret-32-characters-minimum")
+    monkeypatch.setattr(accounts, "_db", lambda: SimpleNamespace(db=fake))
+    monkeypatch.setattr(
+        accounts,
+        "load_plans",
+        lambda: [
+            TokeninPlan(
+                id="medium",
+                name="Medium",
+                kind="fixed",
+                rpm_limit=20,
+                max_parallel_requests=1,
+                max_budget=2.5,
+                monthly_value=10.0,
+            ),
+            TokeninPlan(id="payg", name="PAYG", kind="payg", rpm_limit=20, max_parallel_requests=1, max_budget=0.0),
+        ],
+    )
+    return fake
+
+
+def _fixed(
+    key: str, index: int = 0, start: datetime = PERIOD_START, end: datetime = PERIOD_END
+) -> accounts.GrantRequest:
+    return accounts.GrantRequest(
+        user_id=ACCOUNT,
+        idempotency_key=key,
+        plan_id="medium",
+        kind="fixed",
+        subscription_id="sub-123",
+        period_index=index,
+        period_start=start,
+        period_end=end,
+    )
+
+
+@pytest.mark.asyncio
+async def test_fixed_paid_grant_is_monthly_and_atomic_on_retry(store: FakeTx) -> None:
+    first, second = await asyncio.gather(accounts.grant_account(_fixed("p-0")), accounts.grant_account(_fixed("p-0")))
+    assert first["credited"] == second["credited"] == Decimal("10")
+    assert {first["duplicate"], second["duplicate"]} == {False, True}
+    assert first["available_usd"] is None
+    assert len(store.grants) == 1
+    assert (await accounts.get_grant("p-0", ACCOUNT))["credited"] == Decimal("10")
+    with pytest.raises(HTTPException) as wrong_user:
+        await accounts.get_grant("p-0", "someone-else")
+    assert wrong_user.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_legacy_deployed_catalog_uses_monthly_max_budget_when_no_monthly_value(
+    store: FakeTx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        accounts,
+        "load_plans",
+        lambda: [
+            TokeninPlan(
+                id="medium",
+                name="Medium",
+                kind="fixed",
+                rpm_limit=20,
+                max_parallel_requests=1,
+                max_budget=10.0,
+                budget_duration="30d",
+            )
+        ],
+    )
+    assert (await accounts.grant_account(_fixed("live-catalog-0")))["credited"] == Decimal("10")
+
+
+@pytest.mark.asyncio
+async def test_reused_event_conflict_and_duplicate_paid_period_conflict(store: FakeTx) -> None:
+    await accounts.grant_account(_fixed("purchase-1:0"))
+    with pytest.raises(HTTPException) as changed:
+        await accounts.grant_account(_fixed("purchase-1:0", index=1))
+    assert changed.value.status_code == 409
+    with pytest.raises(HTTPException) as duplicate_period:
+        await accounts.grant_account(_fixed("purchase-2:0"))
+    assert duplicate_period.value.status_code == 409
+    assert len(store.grants) == 1
+
+
+@pytest.mark.asyncio
+async def test_paid_period_neighbors_must_be_contiguous(store: FakeTx) -> None:
+    await accounts.grant_account(_fixed("first"))
+    with pytest.raises(HTTPException) as gap:
+        await accounts.grant_account(
+            _fixed(
+                "gap",
+                index=1,
+                start=datetime(2026, 3, 1, tzinfo=timezone.utc),
+                end=datetime(2026, 4, 1, tzinfo=timezone.utc),
+            )
+        )
+    assert gap.value.status_code == 409
+    await accounts.grant_account(
+        _fixed("next", index=1, start=PERIOD_END, end=datetime(2026, 3, 28, tzinfo=timezone.utc))
+    )
+    assert len(store.grants) == 2
+
+
+@pytest.mark.asyncio
+async def test_payg_exact_credit_and_policy_revision_and_summary(store: FakeTx) -> None:
+    payg: Final = accounts.GrantRequest(
+        user_id=ACCOUNT, idempotency_key="payment-123", plan_id="payg", kind="payg", topup_usd=Decimal("8.25")
+    )
+    assert (await accounts.grant_account(payg))["credited"] == Decimal("8.25")
+    policy: Final = accounts.PolicyRequest(
+        user_id=ACCOUNT,
+        idempotency_key="policy-1",
+        plan_id="payg",
+        models=["model-a"],
+        rpm_limit=20,
+        max_parallel_requests=2,
+        effective_at=PERIOD_END,
+    )
+    assert (await accounts.set_account_policy(policy))["duplicate"] is False
+    assert (await accounts.set_account_policy(policy))["duplicate"] is True
+    summary: Final = await accounts.account_summary(ACCOUNT)
+    assert summary["available_usd"] is None
+    assert summary["enforcement_active"] is False
+    assert summary["grants"][0]["amount_usd"] == Decimal("8.25")
+    assert summary["policies"][0]["models"] == ["model-a"]
+    assert store.policies["policy-1"]["effective_at"] == PERIOD_END.replace(tzinfo=None)
+
+
+@pytest.mark.asyncio
+async def test_bad_plan_amount_period_and_model_scope_fail_closed(store: FakeTx) -> None:
+    for request in (
+        accounts.GrantRequest(user_id=ACCOUNT, idempotency_key="u", plan_id="unknown", kind="fixed"),
+        accounts.GrantRequest(
+            user_id=ACCOUNT,
+            idempotency_key="m",
+            plan_id="medium",
+            kind="fixed",
+            subscription_id="s",
+            period_index=0,
+            period_start=PERIOD_START,
+            period_end=PERIOD_END,
+            topup_usd=Decimal("9"),
+        ),
+    ):
+        with pytest.raises(HTTPException) as denied:
+            await accounts.grant_account(request)
+        assert denied.value.status_code == 400
+    with pytest.raises(HTTPException) as bad_policy:
+        await accounts.set_account_policy(
+            accounts.PolicyRequest(
+                user_id=ACCOUNT,
+                idempotency_key="p",
+                plan_id="medium",
+                models=["*"],
+                rpm_limit=20,
+                max_parallel_requests=1,
+                effective_at=PERIOD_START,
+            )
+        )
+    assert bad_policy.value.status_code == 400
+    with pytest.raises(ValueError):
+        accounts.GrantRequest(
+            user_id=ACCOUNT, idempotency_key="n", plan_id="payg", kind="payg", topup_usd=Decimal("NaN")
+        )
+    assert not store.grants
+
+
+@pytest.mark.asyncio
+async def test_weekly_catalog_without_monthly_value_rejects_grant(
+    store: FakeTx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        accounts,
+        "load_plans",
+        lambda: [
+            TokeninPlan(
+                id="medium",
+                name="Medium",
+                kind="fixed",
+                rpm_limit=20,
+                max_parallel_requests=1,
+                max_budget=2.5,
+                budget_duration="7d",
+            )
+        ],
+    )
+    with pytest.raises(HTTPException) as denied:
+        await accounts.grant_account(_fixed("weekly-without-monthly-credit"))
+    assert denied.value.status_code == 400
+    assert not store.grants
+
+
+@pytest.mark.asyncio
+async def test_http_routes_reject_generic_key_and_accept_service_secret(store: FakeTx) -> None:
+    app: Final = FastAPI()
+    app.include_router(accounts.router)
+    transport: Final = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        unauthorized: Final = await client.post(
+            "/tokenin/account/grants",
+            headers={"Authorization": "Bearer generic-proxy-master-key"},
+            json=_fixed("http-purchase:0").model_dump(mode="json"),
+        )
+        assert unauthorized.status_code == 403
+        granted: Final = await client.post(
+            "/tokenin/account/grants",
+            headers={"Authorization": "Bearer very-long-test-secret-32-characters-minimum"},
+            json=_fixed("http-purchase:0").model_dump(mode="json"),
+        )
+        assert granted.status_code == 200
+        assert granted.json()["credited"] == 10.0
+        recovered: Final = await client.get(
+            "/tokenin/account/grants/http-purchase:0",
+            params={"user_id": ACCOUNT},
+            headers={"Authorization": "Bearer very-long-test-secret-32-characters-minimum"},
+        )
+        assert recovered.status_code == 200
+        assert recovered.json()["duplicate"] is True
+
+
+@pytest.mark.asyncio
+async def test_enrolled_account_calls_fail_closed_and_legacy_mode_is_unchanged(
+    store: FakeTx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db: Final = SimpleNamespace(db=store)
+    await accounts.grant_account(_fixed("enrollment"))
+    with pytest.raises(HTTPException) as denied:
+        await accounts.require_request_admission(db, ACCOUNT, None, "/v1/chat/completions")
+    assert denied.value.status_code == 503
+    with pytest.raises(HTTPException) as unowned:
+        await accounts.require_request_admission(db, None, FLAT_TEAM_ID, "/v1/chat/completions")
+    assert unowned.value.status_code == 503
+    with pytest.raises(HTTPException) as outage:
+        await accounts.require_request_admission(None, ACCOUNT, None, "/v1/chat/completions")
+    assert outage.value.status_code == 503
+    await accounts.require_request_admission(db, "unenrolled", None, "/v1/chat/completions")
+    monkeypatch.setenv("TOKENIN_ACCOUNT_V2_ENABLED", "false")
+    await accounts.require_request_admission(None, ACCOUNT, None, "/v1/chat/completions")
+    assert await accounts.is_managed_account(db, ACCOUNT) is False
+
+
+def _request(token: str) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/tokenin/account/grants",
+            "headers": [(b"authorization", f"Bearer {token}".encode())],
+        }
+    )
+
+
+def test_new_api_requires_separate_service_secret_and_feature_gate(
+    store: FakeTx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(HTTPException) as generic:
+        accounts._service_only(_request("generic-proxy-key"))
+    assert generic.value.status_code == 403
+    accounts._service_only(_request("very-long-test-secret-32-characters-minimum"))
+    monkeypatch.setenv("TOKENIN_ACCOUNT_V2_ENABLED", "false")
+    with pytest.raises(HTTPException) as disabled:
+        accounts._service_only(_request("very-long-test-secret-32-characters-minimum"))
+    assert disabled.value.status_code == 404

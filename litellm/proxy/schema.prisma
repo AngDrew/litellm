@@ -623,6 +623,46 @@ model LiteLLM_Config {
 }
 
 // View spend, model, api_key per request
+model LiteLLM_TokeninAccount {
+  user_id    String @id
+  created_at DateTime @default(now())
+  grants     LiteLLM_TokeninGrant[]
+  policies   LiteLLM_TokeninPolicy[]
+}
+
+model LiteLLM_TokeninGrant {
+  idempotency_key String @id
+  user_id         String
+  payload_hash    String
+  plan_id         String
+  kind            String
+  amount_nano     BigInt
+  subscription_id String?
+  period_index    Int?
+  period_start    DateTime?
+  period_end      DateTime?
+  created_at      DateTime @default(now())
+  account         LiteLLM_TokeninAccount @relation(fields: [user_id], references: [user_id])
+
+  @@unique([user_id, subscription_id, period_index])
+  @@index([user_id, period_start])
+}
+
+model LiteLLM_TokeninPolicy {
+  idempotency_key      String @id
+  user_id              String
+  payload_hash         String
+  plan_id              String
+  models               String[]
+  rpm_limit            Int
+  max_parallel_requests Int
+  effective_at         DateTime
+  created_at           DateTime @default(now())
+  account              LiteLLM_TokeninAccount @relation(fields: [user_id], references: [user_id])
+
+  @@index([user_id, effective_at])
+}
+
 model LiteLLM_SpendLogs {
   request_id          String @id
   call_type           String

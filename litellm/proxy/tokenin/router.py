@@ -26,6 +26,8 @@ from litellm.proxy.management_endpoints.key_management_endpoints import (
     _get_and_validate_existing_key,
     generate_key_helper_fn,
 )
+from litellm.proxy.tokenin.accounts import is_managed_account
+from litellm.proxy.tokenin.accounts import router as account_router
 from litellm.proxy.tokenin.plans import (
     FLAT_TEAM_ID,
     KEY_MODELS,
@@ -37,6 +39,7 @@ from litellm.proxy.tokenin.wallet import credit_wallet, ensure_wallet_user
 from litellm.proxy.utils import PrismaClient
 
 router = APIRouter()
+router.include_router(account_router)
 
 
 class TokeninGenerateRequest(LiteLLMPydanticObjectBase):
@@ -84,6 +87,8 @@ async def tokenin_generate_key(data: TokeninGenerateRequest) -> TokeninGenerated
     """Issue a key that spends from the account wallet. No credit moves here, so this is safe to repeat."""
     prisma_client: Final = _prisma_client_or_500()
     limits: Final = get_plan_by_id(data.plan_id)
+    if await is_managed_account(prisma_client=prisma_client, user_id=data.user_id):
+        raise HTTPException(status_code=409, detail="Managed accounts require service-only key provisioning")
 
     await ensure_wallet_user(prisma_client=prisma_client, user_id=data.user_id)
 
@@ -110,6 +115,8 @@ async def tokenin_wallet_topup(data: TokeninWalletTopupRequest) -> TokeninWallet
     """Credit the account wallet with one purchase. Creates, extends, and mutates no key."""
     prisma_client: Final = _prisma_client_or_500()
     plan: Final = get_plan_by_id(data.plan_id)
+    if await is_managed_account(prisma_client=prisma_client, user_id=data.user_id):
+        raise HTTPException(status_code=409, detail="Managed accounts require verified grant events")
 
     credit: Final = _purchase_credit(plan=plan, topup_usd=data.topup_usd)
     wallet_budget: Final = await credit_wallet(
@@ -141,6 +148,8 @@ async def tokenin_update_key(data: TokeninUpdateRequest) -> TokeninWalletCredit:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This key is not linked to an account wallet",
         )
+    if await is_managed_account(prisma_client=prisma_client, user_id=user_id):
+        raise HTTPException(status_code=409, detail="Managed accounts require verified grant events")
 
     credit: Final = _legacy_action_credit(plan=plan, action=data.action, topup_usd=data.topup_usd)
     wallet_budget: Final = await credit_wallet(
