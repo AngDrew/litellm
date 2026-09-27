@@ -46,3 +46,13 @@ Money and failure handling: estimated maximum cost is reserved under a `FOR UPDA
 Cutover prerequisites: keep `apply_user_budget_to_team_keys` **false** in the running proxy while V2 is enabled. V2 grants must never be written to `LiteLLM_UserTable.max_budget`, and managed keys must be account-bound and team-scoped so the legacy personal-wallet check stays skipped; the ledger is the only authority for V2 spend. Preflight should reject enabling V2 enforcement when live `general_settings` turns the global user-budget guard on, because `ensure_wallet_user` seeds `max_budget = 0` and would deny every V2 key. Old per-key caps stay in place for legacy keys until staged verification passes
 
 `tests/test_litellm/proxy/tokenin/test_ledger.py` exercises the pure rules and a transactional fake. `tests/test_litellm/proxy/tokenin/test_ledger_pg.py` runs the same path against an isolated local PostgreSQL when `TOKENIN_TEST_DATABASE_URL` points at a local `tokenin_local` database; it refuses any other host or database and is skipped without the variable
+
+## Cutover options
+
+Decision: one coordinated cutover. The live proxy still issues per-key budgets, and this branch issues account-wallet credit instead, so deploying this branch before the platform migrates would change money behavior for existing customers. Keep the new image undeployed until the platform is ready
+
+The rejected alternative was a legacy-compat shim: keep `f8f647f5dc:litellm/proxy/tokenin/router.py` (191 lines, per-key `max_budget`/`budget_duration` with plan limits) as the flag-off path and select it by an env flag. Estimated 4 to 6 hours including both-path tests, low build risk because the source is an intact git blob, but it leaves two live key paths to keep in step until the platform migrates. Take that route only if a proxy bugfix must reach the host before the platform is ready. Neither option changes product behavior until the platform migrates
+
+## Policy revisions
+
+`POST /tokenin/account/policy` takes an optional `expected_policy_id`: null succeeds only when the account has no policy yet, otherwise it must equal the account's newest-created policy, or the call returns 409 with `{"error": "stale_policy", "current_policy_id": ...}` and writes nothing. Identical retries of an already-applied policy still return `duplicate: true`. `GET /tokenin/account/summary` lists policies newest-created first with `policy_id` and `created_at`, and reports `latest_policy_id` for CAS. A policy revision that is not yet effective is recorded but inert, and `models` is validated against `GET /tokenin/account/models`

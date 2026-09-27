@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Final
@@ -75,6 +75,7 @@ class FakeTx:
                 "rpm_limit": rpm,
                 "max_parallel_requests": concurrent,
                 "effective_at": effective,
+                "created_at": datetime(2026, 1, 1) + timedelta(seconds=len(self.policies)),
             }
             return 1
         raise AssertionError(sql)
@@ -104,7 +105,12 @@ class FakeTx:
             if '"idempotency_key" = $1' in sql:
                 row = self.policies.get(str(values[0]))
                 return [row] if row is not None else []
-            return [row for row in self.policies.values() if row["user_id"] == values[0]]
+            newest_first: Final = sorted(
+                (row for row in self.policies.values() if row["user_id"] == values[0]),
+                key=lambda row: (row["created_at"], row["idempotency_key"]),
+                reverse=True,
+            )
+            return newest_first[:1] if "LIMIT 1" in sql else newest_first
         raise AssertionError(sql)
 
 
@@ -114,6 +120,9 @@ def store(monkeypatch: pytest.MonkeyPatch) -> FakeTx:
     monkeypatch.setenv("TOKENIN_ACCOUNT_V2_ENABLED", "true")
     monkeypatch.setenv("TOKENIN_ACCOUNT_SERVICE_TOKEN", "very-long-test-secret-32-characters-minimum")
     monkeypatch.setattr(accounts, "_db", lambda: SimpleNamespace(db=fake))
+    from litellm.proxy import proxy_server
+
+    monkeypatch.setattr(proxy_server, "llm_router", SimpleNamespace(get_model_names=lambda: ["model-a", "model-b"]))
     monkeypatch.setattr(
         accounts,
         "load_plans",
@@ -254,6 +263,55 @@ async def test_payg_exact_credit_and_policy_revision_and_summary(store: FakeTx) 
     assert summary["grants"][0]["amount_usd"] == Decimal("8.25")
     assert summary["policies"][0]["models"] == ["model-a"]
     assert store.policies["policy-1"]["effective_at"] == PERIOD_END.replace(tzinfo=None)
+
+
+@pytest.mark.asyncio
+async def test_policy_cas_binds_latest_created_revision_and_writes_nothing_when_stale(store: FakeTx) -> None:
+    first: Final = accounts.PolicyRequest(
+        user_id=ACCOUNT,
+        idempotency_key="policy-1",
+        plan_id="payg",
+        models=["model-a"],
+        rpm_limit=10,
+        max_parallel_requests=1,
+        effective_at=PERIOD_START,
+    )
+    assert (await accounts.set_account_policy(first))["policy_id"] == "policy-1"
+    summary: Final = await accounts.account_summary(ACCOUNT)
+    assert summary["latest_policy_id"] == "policy-1"
+    assert summary["policies"][0]["policy_id"] == "policy-1"
+    assert summary["policies"][0]["created_at"] is not None
+    applied: Final = accounts.PolicyRequest(
+        user_id=ACCOUNT,
+        idempotency_key="policy-2",
+        plan_id="payg",
+        models=["model-b"],
+        rpm_limit=10,
+        max_parallel_requests=1,
+        effective_at=PERIOD_END,
+        expected_policy_id="policy-1",
+    )
+    assert (await accounts.set_account_policy(applied))["duplicate"] is False
+    assert (await accounts.set_account_policy(applied))["duplicate"] is True
+    assert (await accounts.account_summary(ACCOUNT))["latest_policy_id"] == "policy-2"
+    stale: Final = accounts.PolicyRequest(
+        user_id=ACCOUNT,
+        idempotency_key="policy-3",
+        plan_id="payg",
+        models=["model-a"],
+        rpm_limit=10,
+        max_parallel_requests=1,
+        effective_at=PERIOD_END,
+        expected_policy_id="policy-1",
+    )
+    with pytest.raises(HTTPException) as conflict:
+        await accounts.set_account_policy(stale)
+    assert conflict.value.status_code == 409
+    assert conflict.value.detail == {"error": "stale_policy", "current_policy_id": "policy-2"}
+    assert "policy-3" not in store.policies
+    with pytest.raises(HTTPException) as unknown_alias:
+        await accounts.set_account_policy(stale.model_copy(update={"models": ["model-z"], "idempotency_key": "p4"}))
+    assert unknown_alias.value.status_code == 400
 
 
 @pytest.mark.asyncio

@@ -43,6 +43,14 @@ def _db() -> PrismaClient:
     return prisma_client
 
 
+def _configured_model_aliases() -> frozenset[str]:
+    from litellm.proxy.proxy_server import llm_router
+
+    if llm_router is None:
+        raise HTTPException(status_code=503, detail="Model catalog unavailable")
+    return frozenset(llm_router.get_model_names())
+
+
 def _plan(plan_id: str) -> TokeninPlan:
     for plan in load_plans():
         if plan.id == plan_id:
@@ -101,6 +109,10 @@ class PolicyRequest(BaseModel):
     rpm_limit: int = Field(gt=0)
     max_parallel_requests: int = Field(gt=0)
     effective_at: datetime
+    expected_policy_id: str | None = Field(
+        default=None,
+        description="Latest known policy_id; null succeeds only when the account has no policy yet",
+    )
 
 
 def _grant_details(data: GrantRequest) -> tuple[int, datetime | None, datetime | None, str]:
@@ -212,11 +224,7 @@ async def account_catalog() -> dict[str, object]:
 
 @router.get("/tokenin/account/models", dependencies=[Depends(_service_only)], tags=["tokenin"])
 async def account_models() -> dict[str, object]:
-    from litellm.proxy.proxy_server import llm_router
-
-    if llm_router is None:
-        raise HTTPException(status_code=503, detail="Model catalog unavailable")
-    return {"models": sorted(llm_router.get_model_names()), "enforcement_active": False}
+    return {"models": sorted(_configured_model_aliases()), "enforcement_active": False}
 
 
 @router.post("/tokenin/account/grants", dependencies=[Depends(_service_only)], tags=["tokenin"])
@@ -319,6 +327,9 @@ async def set_account_policy(data: PolicyRequest) -> dict[str, object]:
         not model or model in {"*", "all-team-models"} for model in data.models
     ):
         raise HTTPException(status_code=400, detail="Models must be explicit unique aliases")
+    unknown: Final = sorted(set(data.models) - _configured_model_aliases())
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unknown model aliases: {', '.join(unknown)}")
     fingerprint: Final = _fingerprint(
         {
             "user_id": data.user_id,
@@ -344,6 +355,17 @@ async def set_account_policy(data: PolicyRequest) -> dict[str, object]:
             if previous[0]["payload_hash"] != fingerprint:
                 raise HTTPException(status_code=409, detail="Policy ID reused with a different payload")
             return _policy_response(previous[0], duplicate=True)
+        latest: Final = await tx.query_raw(
+            'SELECT "idempotency_key" FROM "LiteLLM_TokeninPolicy" WHERE "user_id" = $1 '
+            'ORDER BY "created_at" DESC, "idempotency_key" DESC LIMIT 1',
+            data.user_id,
+        )
+        current_policy_id: Final = str(latest[0]["idempotency_key"]) if latest else None
+        if data.expected_policy_id != current_policy_id:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "stale_policy", "current_policy_id": current_policy_id},
+            )
         await tx.execute_raw(
             'INSERT INTO "LiteLLM_TokeninPolicy" '
             '("idempotency_key", "user_id", "payload_hash", "plan_id", "models", '
@@ -382,6 +404,8 @@ def _policy_response(row: Mapping[str, object], duplicate: bool) -> dict[str, ob
         "rpm_limit": row["rpm_limit"],
         "max_parallel_requests": row["max_parallel_requests"],
         "effective_at": _as_utc(row["effective_at"]),
+        "policy_id": row["idempotency_key"],
+        "created_at": _as_utc(row.get("created_at")),
         "enforcement_active": False,
     }
 
@@ -397,8 +421,8 @@ async def account_summary(user_id: str = Query(min_length=1)) -> dict[str, objec
     )
     policies: Final = await db.query_raw(
         'SELECT "idempotency_key", "plan_id", "models", "rpm_limit", '
-        '"max_parallel_requests", "effective_at" FROM "LiteLLM_TokeninPolicy" '
-        'WHERE "user_id" = $1 ORDER BY "effective_at", "created_at", "idempotency_key"',
+        '"max_parallel_requests", "effective_at", "created_at" FROM "LiteLLM_TokeninPolicy" '
+        'WHERE "user_id" = $1 ORDER BY "created_at" DESC, "idempotency_key" DESC',
         user_id,
     )
     if not grants and not policies and not await is_managed_account(_db(), user_id):
@@ -415,6 +439,7 @@ async def account_summary(user_id: str = Query(min_length=1)) -> dict[str, objec
             for row in grants
         ],
         "policies": [_policy_response(row, duplicate=False) for row in policies],
+        "latest_policy_id": policies[0]["idempotency_key"] if policies else None,
         "available_usd": None,
         "enforcement_active": False,
     }
