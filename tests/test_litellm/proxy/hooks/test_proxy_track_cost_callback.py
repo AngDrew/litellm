@@ -2154,3 +2154,75 @@ async def test_stream_end_success_settles_account_hold_with_the_actual_cost(monk
     await _ProxyDBLogger()._PROXY_track_cost_callback(kwargs, None, datetime.now(), datetime.now())
     settle.assert_awaited_once()
     assert settle.await_args.kwargs["actual_cost"] == pytest.approx(0.25)
+
+
+@pytest.mark.asyncio
+async def test_in_flight_stream_chunk_keeps_account_hold_reserved(monkeypatch):
+    """A chunk has no final cost yet, so a live stream must not look like an unknown outcome."""
+    from litellm.proxy import proxy_server
+
+    uncertain = AsyncMock()
+    settle = AsyncMock()
+    monkeypatch.setattr("litellm.proxy.hooks.proxy_track_cost_callback.mark_account_hold_uncertain", uncertain)
+    monkeypatch.setattr("litellm.proxy.hooks.proxy_track_cost_callback.settle_account_hold", settle)
+    monkeypatch.setattr(proxy_server, "update_cache", MagicMock(), raising=False)
+    monkeypatch.setattr(proxy_server, "increment_spend_counters", AsyncMock())
+    monkeypatch.setattr(
+        proxy_server,
+        "proxy_logging_obj",
+        MagicMock(
+            db_spend_update_writer=MagicMock(update_database=AsyncMock(return_value="req-1")),
+            slack_alerting_instance=MagicMock(customer_spend_alert=AsyncMock()),
+            failed_tracking_alert=AsyncMock(),
+        ),
+    )
+    kwargs = {
+        "model": "gpt-4",
+        "stream": True,
+        "litellm_params": {
+            "metadata": {
+                "user_api_key_tokenin_account_hold_id": "hold-1",
+                "user_api_key_user_id": "u-1",
+            }
+        },
+        "call_type": "acompletion",
+    }
+    await _ProxyDBLogger()._PROXY_track_cost_callback(kwargs, None, datetime.now(), datetime.now())
+    uncertain.assert_not_awaited()
+    settle.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_finished_stream_without_cost_still_marks_account_hold_uncertain(monkeypatch):
+    """A stream that reports itself complete and has no cost is a genuinely unknown outcome."""
+    from litellm.proxy import proxy_server
+
+    uncertain = AsyncMock()
+    monkeypatch.setattr("litellm.proxy.hooks.proxy_track_cost_callback.mark_account_hold_uncertain", uncertain)
+    monkeypatch.setattr(proxy_server, "update_cache", MagicMock(), raising=False)
+    monkeypatch.setattr(proxy_server, "increment_spend_counters", AsyncMock())
+    monkeypatch.setattr(
+        proxy_server,
+        "proxy_logging_obj",
+        MagicMock(
+            db_spend_update_writer=MagicMock(update_database=AsyncMock(return_value="req-1")),
+            slack_alerting_instance=MagicMock(customer_spend_alert=AsyncMock()),
+            failed_tracking_alert=AsyncMock(),
+        ),
+    )
+    kwargs = {
+        "model": "gpt-4",
+        "stream": True,
+        "complete_streaming_response": MagicMock(),
+        "litellm_params": {
+            "metadata": {
+                "user_api_key_tokenin_account_hold_id": "hold-1",
+                "user_api_key_user_id": "u-1",
+            }
+        },
+        "call_type": "acompletion",
+    }
+    await _ProxyDBLogger()._PROXY_track_cost_callback(kwargs, None, datetime.now(), datetime.now())
+    # Marked twice on this path: once for the missing cost, once by the cost-tracking failure
+    # below it. The reservation must survive either way.
+    assert uncertain.await_count >= 1
