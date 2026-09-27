@@ -5,7 +5,7 @@ import hmac
 import json
 import os
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Final, Literal
 from uuid import uuid4
@@ -13,6 +13,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from litellm._logging import verbose_proxy_logger
 from litellm.proxy.tokenin.plans import TokeninPlan, load_plans
 from litellm.proxy.utils import PrismaClient
 
@@ -20,6 +21,7 @@ router = APIRouter()
 _NANODOLLARS: Final = Decimal("1000000000")
 _MAX_NANODOLLARS: Final = 2**63 - 1
 _MANAGED_ADMISSION_ROUTES: Final = frozenset({"/chat/completions", "/v1/chat/completions"})
+_HOLD_STATES: Final = ("held", "settled", "uncertain", "cancelled")
 
 
 def account_v2_enabled() -> bool:
@@ -120,6 +122,12 @@ class PolicyRequest(BaseModel):
         default=None,
         description="Latest known policy_id; null succeeds only when the account has no policy yet",
     )
+
+
+class HoldResolution(BaseModel):
+    action: Literal["settle", "cancel", "uncertain"]
+    cost_usd: Decimal | None = Field(default=None, ge=0)
+    note: str = Field(min_length=1, description="Operator audit note recorded in the proxy log")
 
 
 def _grant_details(data: GrantRequest) -> tuple[int, datetime | None, datetime | None, str]:
@@ -458,6 +466,89 @@ def _policy_response(row: Mapping[str, object], duplicate: bool) -> dict[str, ob
         "policy_id": row["idempotency_key"],
         "created_at": _as_utc(row.get("created_at")),
         "enforcement_active": False,
+    }
+
+
+@router.get("/tokenin/account/holds", dependencies=[Depends(_service_only)], tags=["tokenin"])
+async def account_holds(
+    user_id: str = Query(min_length=1),
+    states: str = Query("held,uncertain"),
+    older_than_minutes: int = Query(default=0, ge=0),
+) -> dict[str, object]:
+    requested: Final = tuple(state.strip() for state in states.split(",") if state.strip())
+    if not requested or any(state not in _HOLD_STATES for state in requested):
+        raise HTTPException(status_code=400, detail=f"states must be a subset of {', '.join(_HOLD_STATES)}")
+    rows: Final = await _db().db.query_raw(
+        'SELECT h."request_id", h."state", h."model", h."estimated_nano", h."charged_nano", '
+        'h."admitted_at", h."settled_at", COALESCE(SUM(a."amount_nano"),0) AS "allocated_nano" '
+        'FROM "LiteLLM_TokeninHold" h LEFT JOIN "LiteLLM_TokeninAllocation" a '
+        'ON a."request_id" = h."request_id" WHERE h."user_id" = $1 '
+        'GROUP BY h."request_id" ORDER BY h."admitted_at"',
+        user_id,
+    )
+    cutoff: Final = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=older_than_minutes)
+    stale: Final = [
+        {
+            "request_id": row["request_id"],
+            "state": row["state"],
+            "model": row["model"],
+            "estimated_usd": float(_dollars(int(row["estimated_nano"]))),
+            "reserved_usd": float(_dollars(int(row["allocated_nano"]))),
+            "charged_usd": float(_dollars(int(row["charged_nano"]))) if row["charged_nano"] is not None else None,
+            "admitted_at": _as_utc(row["admitted_at"]),
+            "settled_at": _as_utc(row["settled_at"]),
+        }
+        for row in rows
+        if row["state"] in requested and row["admitted_at"] <= cutoff
+    ]
+    return {
+        "user_id": user_id,
+        "states": list(requested),
+        "older_than_minutes": older_than_minutes,
+        "holds": stale,
+        "reserved_usd": float(sum(Decimal(str(row["reserved_usd"])) for row in stale)),
+        "enforcement_active": account_spend_enabled(),
+    }
+
+
+@router.post("/tokenin/account/holds/{request_id}/resolve", dependencies=[Depends(_service_only)], tags=["tokenin"])
+async def resolve_account_hold(request_id: str, data: HoldResolution) -> dict[str, object]:
+    """Operator remedy for a stuck hold. Every outcome is audited in the proxy log."""
+
+    from litellm.proxy.tokenin.ledger import (
+        cancel_account_request,
+        mark_account_request_uncertain,
+        settle_account_request,
+    )
+
+    verbose_proxy_logger.warning(
+        "Tokenin hold %s resolved action=%s cost_usd=%s note=%s", request_id, data.action, data.cost_usd, data.note
+    )
+    client: Final = _db()
+    if data.action == "settle":
+        if data.cost_usd is None:
+            raise HTTPException(status_code=400, detail="settle requires cost_usd")
+        charged: Final = await settle_account_request(client, request_id, float(data.cost_usd))
+        return {
+            "request_id": request_id,
+            "state": "settled",
+            "charged_usd": float(_dollars(charged)),
+            "note": data.note,
+        }
+    if data.cost_usd is not None:
+        raise HTTPException(status_code=400, detail=f"{data.action} takes no cost_usd")
+    applied: Final = (
+        await mark_account_request_uncertain(client, request_id)
+        if data.action == "uncertain"
+        else await cancel_account_request(client, request_id)
+    )
+    if not applied:
+        raise HTTPException(status_code=409, detail="Hold does not exist or is already finalized")
+    return {
+        "request_id": request_id,
+        "state": "uncertain" if data.action == "uncertain" else "cancelled",
+        "charged_usd": None if data.action == "uncertain" else 0.0,
+        "note": data.note,
     }
 
 

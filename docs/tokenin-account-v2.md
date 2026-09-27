@@ -47,6 +47,18 @@ Cutover prerequisites: keep `apply_user_budget_to_team_keys` **false** in the ru
 
 `tests/test_litellm/proxy/tokenin/test_ledger.py` exercises the pure rules and a transactional fake. `tests/test_litellm/proxy/tokenin/test_ledger_pg.py` runs the same path against an isolated local PostgreSQL when `TOKENIN_TEST_DATABASE_URL` points at a local `tokenin_local` database; it refuses any other host or database and is skipped without the variable
 
+## Hold states and operator remedy
+
+A reservation is `held` from admission until the cost callback resolves it. `settled` records the charged amount (a later callback with a different amount is refused with 409). `cancelled` means the work never billed and the whole reservation was returned. `uncertain` means the outcome is unknown: every allocation stays reserved, so nothing is refunded for work the provider may already have billed
+
+`uncertain` is deliberate, and it is the reason credit can look pinned. Admission, a missing-cost success, a callback exception, and a failure with no recovered usage all leave the reservation in place rather than guessing. A failure that recovered partial stream cost settles that partial amount instead
+
+Operators clear pinned holds with the service-token-only reconciliation routes: `GET /tokenin/account/holds?user_id=...&states=held,uncertain&older_than_minutes=30` lists holds with their reserved and charged amounts, and `POST /tokenin/account/holds/{request_id}/resolve` with `{"action": "settle"|"cancel"|"uncertain", "cost_usd": ..., "note": "..."}` applies the decision. `settle` needs `cost_usd`, `cancel` refunds the whole reservation, and every resolution writes a warning-level proxy log line with the note as the audit record
+
+Account debt blocks new admissions until it is repaid from newly eligible credit, which happens automatically on the next admission once a grant is available. Debt is never written off by hand
+
+Spend is armed in two steps: `TOKENIN_ACCOUNT_V2_ENABLED=true` records grants and policies, and `TOKENIN_ACCOUNT_SPEND_ENABLED=true` lets enrolled accounts spend. With the second switch off, every enrolled request still fails closed with 503
+
 ## Cutover options
 
 Decision: one coordinated cutover. The live proxy still issues per-key budgets, and this branch issues account-wallet credit instead, so deploying this branch before the platform migrates would change money behavior for existing customers. Keep the new image undeployed until the platform is ready

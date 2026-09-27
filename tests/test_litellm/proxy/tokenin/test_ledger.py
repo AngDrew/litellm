@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from datetime import datetime, timedelta
+from decimal import Decimal
+from types import SimpleNamespace
 from typing import Final
 
 import pytest
@@ -126,6 +128,25 @@ class LedgerDB:
             return [{"user_id": ACCOUNT, "debt_nano": self.debt}] if values[0] == ACCOUNT else []
         if "clock_timestamp()" in sql:
             return [{"now": self.now}]
+        if '"LiteLLM_TokeninHold" h' in sql:
+            return [
+                {
+                    "request_id": hold["request_id"],
+                    "state": hold["state"],
+                    "model": hold["model"],
+                    "estimated_nano": hold["estimated_nano"],
+                    "charged_nano": hold["charged_nano"],
+                    "admitted_at": hold["admitted_at"],
+                    "settled_at": None,
+                    "allocated_nano": sum(
+                        amount
+                        for (request_id, _), amount in self.allocations.items()
+                        if request_id == hold["request_id"]
+                    ),
+                }
+                for hold in self.holds.values()
+                if hold["user_id"] == values[0]
+            ]
         if '"LiteLLM_TokeninHold" WHERE "request_id"' in sql:
             hold = self.holds.get(str(values[0]))
             return [hold] if hold is not None else []
@@ -264,6 +285,60 @@ async def test_expired_fixed_stops_at_boundary_without_renewal_but_payg_spends()
     with pytest.raises(HTTPException) as missing_payg_policy:
         await reserve_account_request(db, ACCOUNT, "missing-policy", "allowed", 1.0)
     assert missing_payg_policy.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_operator_reconciliation_lists_and_resolves_stuck_holds(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litellm.proxy.tokenin import accounts
+
+    db: Final = LedgerDB()
+    db.grants = {"paid": grant("paid", 2 * NANO, FEB28, MAR31, 1)}
+    monkeypatch.setattr(accounts, "_db", lambda: SimpleNamespace(db=db))
+    monkeypatch.setenv("TOKENIN_ACCOUNT_V2_ENABLED", "true")
+    monkeypatch.setenv("TOKENIN_ACCOUNT_SPEND_ENABLED", "true")
+    await reserve_account_request(db, ACCOUNT, "stuck", "allowed", 2.0)
+    listed: Final = await accounts.account_holds(user_id=ACCOUNT, states="held,uncertain", older_than_minutes=0)
+    assert [row["request_id"] for row in listed["holds"]] == ["stuck"]
+    assert listed["holds"][0]["state"] == "held"
+    assert listed["holds"][0]["reserved_usd"] == 2.0
+    assert listed["reserved_usd"] == 2.0
+    assert listed["enforcement_active"] is True
+    assert (await accounts.account_holds(user_id=ACCOUNT, states="settled", older_than_minutes=0))["holds"] == []
+    with pytest.raises(HTTPException) as bad_state:
+        await accounts.account_holds(user_id=ACCOUNT, states="held,nonsense", older_than_minutes=0)
+    assert bad_state.value.status_code == 400
+
+    cancelled: Final = await accounts.resolve_account_hold(
+        request_id="stuck", data=accounts.HoldResolution(action="cancel", note="provider never dispatched")
+    )
+    assert cancelled == {
+        "request_id": "stuck",
+        "state": "cancelled",
+        "charged_usd": 0.0,
+        "note": "provider never dispatched",
+    }
+    assert await reserve_account_request(db, ACCOUNT, "after", "allowed", 2.0) == (("paid", 2 * NANO),)
+    repeated: Final = await accounts.resolve_account_hold(
+        request_id="stuck", data=accounts.HoldResolution(action="cancel", note="retry")
+    )
+    assert repeated["state"] == "cancelled"
+    with pytest.raises(HTTPException) as missing_cost:
+        await accounts.resolve_account_hold(
+            request_id="after", data=accounts.HoldResolution(action="settle", note="no cost given")
+        )
+    assert missing_cost.value.status_code == 400
+    settled: Final = await accounts.resolve_account_hold(
+        request_id="after",
+        data=accounts.HoldResolution(action="settle", cost_usd=Decimal("0.5"), note="provider invoice"),
+    )
+    assert settled == {"request_id": "after", "state": "settled", "charged_usd": 0.5, "note": "provider invoice"}
+    assert db.allocations[("after", "paid")] == 500_000_000
+    with pytest.raises(HTTPException) as finalized:
+        await accounts.resolve_account_hold(
+            request_id="after", data=accounts.HoldResolution(action="cancel", note="too late to refund")
+        )
+    assert finalized.value.status_code == 409
+    assert (await accounts.account_holds(user_id=ACCOUNT, states="uncertain", older_than_minutes=0))["holds"] == []
 
 
 @pytest.mark.asyncio
