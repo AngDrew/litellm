@@ -109,6 +109,15 @@ def test_thinking_mode_active_bool_thinking_returns_false_without_crashing():
     assert config._thinking_mode_active(model="deepseek-reasoner", optional_params={"thinking": True}) is False
 
 
+def test_stream_options_are_only_forwarded_for_streaming_requests():
+    assert DeepSeekChatConfig._drop_stream_options_when_not_streaming(
+        {"stream": False, "stream_options": {"include_usage": True}}
+    ) == {"stream": False}
+    assert DeepSeekChatConfig._drop_stream_options_when_not_streaming(
+        {"stream": True, "stream_options": {"include_usage": True}}
+    ) == {"stream": True, "stream_options": {"include_usage": True}}
+
+
 class TestDeepSeekVisionMultimodalContent:
     """Image content lists are forwarded only for user messages on vision models."""
 

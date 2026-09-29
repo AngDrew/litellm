@@ -61,6 +61,13 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
 
         return optional_params
 
+    @staticmethod
+    def _drop_stream_options_when_not_streaming(optional_params: dict) -> dict:
+        # DeepSeek rejects stream_options unless stream is explicitly true.
+        if optional_params.get("stream") is not True:
+            optional_params.pop("stream_options", None)
+        return optional_params
+
     def _fill_reasoning_content(self, messages: list[AllMessageValues]) -> list[AllMessageValues]:
         """
         DeepSeek thinking mode requires `reasoning_content` to be passed back on
@@ -311,6 +318,7 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         like deepseek-v3.2 that support thinking as opt-in but not always-on.
         """
         optional_params = self._drop_unsupported_tools(optional_params)
+        optional_params = self._drop_stream_options_when_not_streaming(optional_params)
         if self._thinking_mode_active(model=model, optional_params=optional_params):
             messages = self._fill_reasoning_content(messages)
         return super().transform_request(
@@ -334,6 +342,7 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         fix for multi-turn thinking-mode conversations.
         """
         optional_params = self._drop_unsupported_tools(optional_params)
+        optional_params = self._drop_stream_options_when_not_streaming(optional_params)
         if self._thinking_mode_active(model=model, optional_params=optional_params):
             messages = self._fill_reasoning_content(messages)
         return await super().async_transform_request(
