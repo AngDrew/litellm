@@ -11,7 +11,6 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Final
 
 from fastapi import HTTPException
-from pydantic import TypeAdapter
 
 from litellm._logging import verbose_proxy_logger
 from litellm.proxy.utils import PrismaClient
@@ -25,19 +24,18 @@ TOKENIN_ACCOUNT_HOLD_AUTH_FIELD: Final = "tokenin_account_hold_id"
 # The hold is priced and policy-checked for ``model`` alone, so any other target
 # would spend credit on a model the account policy never approved.
 ACCOUNT_HOLD_FALLBACK_FIELDS: Final = ("fallbacks", "context_window_fallbacks", "content_policy_fallbacks")
-# A JSON body's override is a string-keyed object; validating it keeps the scan typed.
-_ROUTER_SETTINGS_OVERRIDE: Final = TypeAdapter(dict[str, object])
 
 
 def requests_model_fallbacks(request_data: Mapping[str, object]) -> bool:
-    """Whether the body, or a body-supplied ``router_settings_override``, names fallback targets."""
-    override: Final = request_data.get("router_settings_override")
-    sources: Final = (
-        (request_data, _ROUTER_SETTINGS_OVERRIDE.validate_python(override))
-        if isinstance(override, Mapping)
-        else (request_data,)
+    """Whether the body names fallback targets or carries a ``router_settings_override`` of any shape.
+
+    The override is refused whole rather than parsed: ``route_llm_request`` merges its
+    ``fallbacks`` into the router call, and every other setting in it is operator
+    policy, never client input. Only an absent override is accepted.
+    """
+    return request_data.get("router_settings_override") is not None or any(
+        _names_targets(request_data.get(field)) for field in ACCOUNT_HOLD_FALLBACK_FIELDS
     )
-    return any(_names_targets(source.get(field)) for source in sources for field in ACCOUNT_HOLD_FALLBACK_FIELDS)
 
 
 def _names_targets(value: object) -> bool:

@@ -272,7 +272,9 @@ async def reserve_managed_request(
 
     if requests_model_fallbacks(request_data):
         # The ledger approves and prices ``model`` only; a fallback target would be neither.
-        raise HTTPException(status_code=400, detail="Managed accounts cannot request model fallbacks")
+        raise HTTPException(
+            status_code=400, detail="Managed accounts cannot request model fallbacks or router overrides"
+        )
 
     estimated: Final = await estimate_account_max_cost(
         request_body=dict(request_data), route=route, llm_router=llm_router

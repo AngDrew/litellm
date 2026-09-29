@@ -242,14 +242,19 @@ async def test_pinned_request_ignores_router_configured_fallbacks() -> None:
         {"content_policy_fallbacks": [{"model-a": ["model-b"]}]},
         {"router_settings_override": {"fallbacks": [{"model-a": ["model-b"]}]}},
         {"fallbacks": "model-b"},
+        {"router_settings_override": {}},
+        {"router_settings_override": {"num_retries": 5}},
+        {"router_settings_override": ["fallbacks"]},
+        {"router_settings_override": "fallbacks"},
+        {"router_settings_override": 0},
     ],
 )
-def test_any_named_fallback_target_is_detected(body: dict[str, object]) -> None:
+def test_any_named_fallback_target_or_router_override_is_detected(body: dict[str, object]) -> None:
     assert enforcement.requests_model_fallbacks({"model": "model-a", **body})
 
 
 def test_absent_or_empty_fallbacks_are_not_a_request_for_one() -> None:
     assert not enforcement.requests_model_fallbacks({"model": "model-a"})
     assert not enforcement.requests_model_fallbacks(
-        {"model": "model-a", "fallbacks": [], "context_window_fallbacks": None, "router_settings_override": {}}
+        {"model": "model-a", "fallbacks": [], "context_window_fallbacks": None, "router_settings_override": None}
     )

@@ -33,6 +33,8 @@ SERVICE_TOKEN: Final = "e2e-service-token-32-characters-minimum"
 MASTER_KEY: Final = "sk-e2e-master-key"
 STUB_MODEL: Final = "gpt-4o-mini"
 OTHER_MODEL: Final = "other-priced-model"
+# Always fails upstream, and the router is configured to fall back from it to OTHER_MODEL.
+FAILING_MODEL: Final = "failing-priced-model"
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("TOKENIN_E2E_DATABASE_URL"),
@@ -59,7 +61,20 @@ def _config(database_url: str) -> dict[str, Any]:
                     "mock_response": "stubbed reply",
                 },
             },
+            {
+                "model_name": FAILING_MODEL,
+                "litellm_params": {
+                    "model": "openai/gpt-4o-mini",
+                    "api_key": "sk-stub-provider",
+                    "mock_response": "litellm.InternalServerError",
+                },
+            },
         ],
+        "router_settings": {
+            "fallbacks": [{FAILING_MODEL: [OTHER_MODEL]}],
+            "context_window_fallbacks": [{FAILING_MODEL: [OTHER_MODEL]}],
+            "content_policy_fallbacks": [{FAILING_MODEL: [OTHER_MODEL]}],
+        },
         "general_settings": {"master_key": MASTER_KEY, "database_url": database_url},
         "litellm_settings": {"num_retries": 0},
         "tokenin_plans": [
@@ -310,6 +325,43 @@ async def test_model_outside_the_account_policy_is_denied_for_every_key(client, 
     for key in (key_one, key_two):
         denied: Final = await _chat(client, key)
         assert denied.status_code == 403, denied.text
+
+
+@pytest.mark.parametrize(
+    "routing",
+    [
+        {"fallbacks": [OTHER_MODEL]},
+        {"context_window_fallbacks": [{STUB_MODEL: [OTHER_MODEL]}]},
+        {"router_settings_override": {"fallbacks": [{STUB_MODEL: [OTHER_MODEL]}]}},
+        {"router_settings_override": ["fallbacks"]},
+    ],
+)
+@pytest.mark.asyncio(loop_scope="module")
+async def test_client_fallbacks_and_router_overrides_are_refused_before_any_hold(client, prisma, routing) -> None:
+    user_id, key = await _enrolled_account(client, prisma, models=[STUB_MODEL])
+    await _grant(client, user_id, "0.01")
+    refused: Final = await client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": STUB_MODEL, "messages": [{"role": "user", "content": "hi"}], **routing},
+    )
+    assert refused.status_code == 400, refused.text
+    assert (await _account_state(prisma, user_id))["holds"] == []
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_router_configured_fallback_never_serves_a_model_outside_the_hold(client, prisma) -> None:
+    user_id, key = await _enrolled_account(client, prisma, models=[FAILING_MODEL])
+    await _grant(client, user_id, "0.01")
+    failed: Final = await _chat(client, key, model=FAILING_MODEL)
+    assert failed.status_code >= 500, failed.text
+    served: Final = await prisma.db.query_raw(
+        'SELECT "model_group" FROM "LiteLLM_SpendLogs" WHERE "user" = $1 AND "status" = \'success\'', user_id
+    )
+    assert served == [], served
+    state: Final = await _await_open_holds_closed(prisma, user_id)
+    assert [row["state"] for row in state["holds"]] == ["uncertain"], state
+    assert state["charged_nano"] == 0, state
 
 
 @pytest.mark.asyncio(loop_scope="module")
