@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Final
 from unittest.mock import AsyncMock
@@ -277,6 +278,58 @@ async def test_held_route_refuses_alias_and_default_fallback_but_nonheld_routes(
         await route_request({**request, "model": "model-b"}, direct, None, "acompletion", held)
     with pytest.raises(HTTPException):
         await route_request({**request, "user_config": {"model_list": deployment}}, direct, None, "acompletion", held)
+
+
+@pytest.mark.asyncio
+async def test_held_request_refuses_silent_model_before_sending_a_copy() -> None:
+    import litellm
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.route_llm_request import route_request
+
+    router: Final = litellm.Router(
+        model_list=[
+            {
+                "model_name": "model-a",
+                "litellm_params": {
+                    "model": "openai/gpt-4o-mini",
+                    "api_key": "fake",
+                    "mock_response": "primary",
+                    "silent_model": "model-b",
+                },
+            },
+            {
+                "model_name": "model-b",
+                "litellm_params": {"model": "openai/gpt-4o", "api_key": "fake", "mock_response": "mirror"},
+            },
+        ],
+        num_retries=0,
+    )
+    request: Final = {"model": "model-a", "messages": [{"role": "user", "content": "private input"}]}
+    held: Final = UserAPIKeyAuth(api_key="hashed", tokenin_account_hold_id=HOLD, tokenin_account_hold_model="model-a")
+    with pytest.raises(HTTPException) as blocked:
+        await route_request(dict(request), router, None, "acompletion", held)
+    assert blocked.value.status_code == 503
+    assert router.total_calls["openai/gpt-4o-mini"] == 0
+    assert router.total_calls["openai/gpt-4o"] == 0
+
+    mixed: Final = litellm.Router(
+        model_list=[
+            {"model_name": "model-a", "litellm_params": {"model": "openai/gpt-4o-mini", "mock_response": "safe"}},
+            *router.get_model_list(),
+        ]
+    )
+    with pytest.raises(HTTPException) as mixed_blocked:
+        await route_request(dict(request), mixed, None, "acompletion", held)
+    assert mixed_blocked.value.status_code == 503
+
+    normal: Final = await (await route_request(dict(request), router, None, "acompletion"))
+    assert isinstance(normal, litellm.ModelResponse)
+    assert normal.choices[0].message.content == "primary"
+    for _ in range(40):
+        if router.total_calls["openai/gpt-4o"]:
+            break
+        await asyncio.sleep(0.01)
+    assert router.total_calls["openai/gpt-4o"] == 1
 
 
 @pytest.mark.parametrize(
