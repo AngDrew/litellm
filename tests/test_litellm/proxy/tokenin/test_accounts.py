@@ -39,6 +39,9 @@ class FakeTx:
         self.accounts: set[str] = set()
         self.grants: dict[str, dict[str, object]] = {}
         self.policies: dict[str, dict[str, object]] = {}
+        self.allocations: dict[tuple[str, str], int] = {}
+        self.debt: dict[str, int] = {}
+        self.now: datetime = datetime(2026, 2, 1)
 
     def tx(self) -> FakeTx:
         return self
@@ -93,7 +96,24 @@ class FakeTx:
 
     async def query_raw(self, sql: str, *values: object) -> list[dict[str, object]]:
         if '"LiteLLM_TokeninAccount"' in sql:
-            return [{"user_id": values[0]}] if values[0] in self.accounts else []
+            return (
+                [{"user_id": values[0], "debt_nano": self.debt.get(str(values[0]), 0)}]
+                if values[0] in self.accounts
+                else []
+            )
+        if "clock_timestamp()" in sql:
+            return [{"now": self.now.isoformat() + "+00:00"}]
+        if '"LiteLLM_TokeninGrant" g LEFT JOIN "LiteLLM_TokeninAllocation"' in sql:
+            return [
+                {
+                    **row,
+                    "allocated_nano": sum(
+                        amount for (_, grant_id), amount in self.allocations.items() if grant_id == key
+                    ),
+                }
+                for key, row in self.grants.items()
+                if row["user_id"] == values[0]
+            ]
         if '"LiteLLM_TokeninGrant"' in sql:
             if '"period_index" IN' in sql:
                 user_id, sub, kind, before, after = values
@@ -918,3 +938,165 @@ def test_new_api_requires_separate_service_secret_and_feature_gate(
     with pytest.raises(HTTPException) as disabled:
         accounts._service_only(_request("very-long-test-secret-32-characters-minimum"))
     assert disabled.value.status_code == 404
+
+
+NANO: Final = 1_000_000_000
+MAR31: Final = datetime(2026, 3, 31, tzinfo=timezone.utc)
+APR30: Final = datetime(2026, 4, 30, tzinfo=timezone.utc)
+SERVICE_AUTH: Final = {"Authorization": "Bearer very-long-test-secret-32-characters-minimum"}
+
+
+def _payg(key: str, amount: str) -> accounts.GrantRequest:
+    return accounts.GrantRequest(
+        user_id=ACCOUNT, idempotency_key=key, plan_id="payg", kind="payg", topup_usd=Decimal(amount)
+    )
+
+
+async def _paid_months(*indexes: int) -> None:
+    bounds: Final = (PERIOD_START, PERIOD_END, MAR31, APR30)
+    for index in indexes:
+        await accounts.grant_account(_fixed(f"p-{index}", index=index, start=bounds[index], end=bounds[index + 1]))
+
+
+def _buckets(balance: dict[str, object]) -> dict[str, dict[str, object]]:
+    rows: Final = balance["buckets"]
+    assert isinstance(rows, list)
+    return {str(row["grant_id"]): row for row in rows}
+
+
+@pytest.mark.asyncio
+async def test_balance_current_month_only_expires_at_its_period_end(store: FakeTx) -> None:
+    await _paid_months(0)
+    store.now = datetime(2026, 2, 1)
+    balance: Final = await accounts.account_balance(ACCOUNT)
+    bucket: Final = _buckets(balance)["p-0"]
+    assert bucket["state"] == "active"
+    assert bucket["expires_at"] == PERIOD_END
+    assert bucket["period_start"] == PERIOD_START
+    assert (bucket["amount_usd"], bucket["used_usd"], bucket["remaining_usd"]) == (10.0, 0.0, 10.0)
+    assert balance["as_of"] == datetime(2026, 2, 1, tzinfo=timezone.utc)
+    assert balance["fixed_available_usd"] == balance["available_usd"] == 10.0
+    assert balance["payg_available_usd"] == balance["debt_usd"] == 0.0
+    assert balance["enforcement_active"] is False
+
+
+@pytest.mark.asyncio
+async def test_balance_paid_next_month_extends_expiry_and_is_upcoming_until_boundary(store: FakeTx) -> None:
+    await _paid_months(0, 1)
+    store.now = datetime(2026, 2, 1)
+    before: Final = await accounts.account_balance(ACCOUNT)
+    assert _buckets(before)["p-0"]["state"] == "active"
+    assert _buckets(before)["p-0"]["expires_at"] == MAR31
+    assert _buckets(before)["p-1"]["state"] == "upcoming"
+    assert _buckets(before)["p-1"]["expires_at"] == MAR31
+    assert before["fixed_available_usd"] == 10.0
+    store.now = PERIOD_END.replace(tzinfo=None)
+    after: Final = await accounts.account_balance(ACCOUNT)
+    assert {row["state"] for row in _buckets(after).values()} == {"active"}
+    assert after["fixed_available_usd"] == 20.0
+
+
+@pytest.mark.asyncio
+async def test_balance_after_boundary_with_three_paid_months_expires_the_first(store: FakeTx) -> None:
+    from litellm.proxy.tokenin.ledger import eligible_grants, load_grants
+
+    await _paid_months(0, 1, 2)
+    store.now = MAR31.replace(tzinfo=None)
+    balance: Final = await accounts.account_balance(ACCOUNT)
+    buckets: Final = _buckets(balance)
+    assert (buckets["p-0"]["state"], buckets["p-0"]["expires_at"]) == ("expired", MAR31)
+    assert (buckets["p-1"]["state"], buckets["p-1"]["expires_at"]) == ("active", APR30)
+    assert (buckets["p-2"]["state"], buckets["p-2"]["expires_at"]) == ("active", APR30)
+    assert balance["fixed_available_usd"] == balance["available_usd"] == 20.0
+    # Spending and the balance read share one window rule, so they can never disagree.
+    spendable: Final = eligible_grants(await load_grants(store, ACCOUNT), store.now)
+    assert {grant.grant_id for grant in spendable} == {key for key, row in buckets.items() if row["state"] == "active"}
+
+
+@pytest.mark.asyncio
+async def test_balance_payment_gap_expires_at_own_period_end(store: FakeTx) -> None:
+    await _paid_months(0, 2)
+    store.now = PERIOD_END.replace(tzinfo=None)
+    buckets: Final = _buckets(await accounts.account_balance(ACCOUNT))
+    assert (buckets["p-0"]["state"], buckets["p-0"]["expires_at"]) == ("expired", PERIOD_END)
+    assert (buckets["p-2"]["state"], buckets["p-2"]["expires_at"]) == ("upcoming", APR30)
+
+
+@pytest.mark.asyncio
+async def test_balance_payg_is_always_active_without_expiry(store: FakeTx) -> None:
+    await accounts.grant_account(_payg("topup-1", "8.25"))
+    for now in (datetime(2020, 1, 1), datetime(2099, 1, 1)):
+        store.now = now
+        balance = await accounts.account_balance(ACCOUNT)
+        bucket = _buckets(balance)["topup-1"]
+        assert (bucket["state"], bucket["expires_at"], bucket["period_start"]) == ("active", None, None)
+        assert balance["payg_available_usd"] == balance["available_usd"] == 8.25
+        assert balance["fixed_available_usd"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_balance_counts_held_reservations_as_used(store: FakeTx) -> None:
+    await _paid_months(0)
+    await accounts.grant_account(_payg("topup-1", "5"))
+    store.allocations[("held-request", "p-0")] = 3 * NANO
+    store.allocations[("settled-request", "p-0")] = NANO // 2
+    store.allocations[("overrun", "topup-1")] = 6 * NANO
+    balance: Final = await accounts.account_balance(ACCOUNT)
+    buckets: Final = _buckets(balance)
+    assert (buckets["p-0"]["used_usd"], buckets["p-0"]["remaining_usd"]) == (3.5, 6.5)
+    assert (buckets["topup-1"]["used_usd"], buckets["topup-1"]["remaining_usd"]) == (6.0, 0.0)
+    assert balance["fixed_available_usd"] == balance["available_usd"] == 6.5
+
+
+@pytest.mark.asyncio
+async def test_balance_debt_reduces_available_and_floors_at_zero(store: FakeTx) -> None:
+    await _paid_months(0)
+    await accounts.grant_account(_payg("topup-1", "2"))
+    store.debt[ACCOUNT] = 4 * NANO
+    owed: Final = await accounts.account_balance(ACCOUNT)
+    assert (owed["debt_usd"], owed["available_usd"]) == (4.0, 8.0)
+    assert (owed["fixed_available_usd"], owed["payg_available_usd"]) == (10.0, 2.0)
+    store.debt[ACCOUNT] = 50 * NANO
+    assert (await accounts.account_balance(ACCOUNT))["available_usd"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_balance_unknown_account_is_404_but_enrolled_account_reads_zero(store: FakeTx) -> None:
+    with pytest.raises(HTTPException) as missing:
+        await accounts.account_balance("nobody")
+    assert (missing.value.status_code, missing.value.detail) == (404, "Account not found")
+    store.accounts.add(ACCOUNT)
+    empty: Final = await accounts.account_balance(ACCOUNT)
+    assert (empty["available_usd"], empty["debt_usd"], empty["buckets"]) == (0.0, 0.0, [])
+
+
+@pytest.mark.asyncio
+async def test_balance_http_route_is_service_only(store: FakeTx, monkeypatch: pytest.MonkeyPatch) -> None:
+    await _paid_months(0)
+    app: Final = FastAPI()
+    app.include_router(accounts.router)
+    transport: Final = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        anonymous: Final = await client.get("/tokenin/account/balance", params={"user_id": ACCOUNT})
+        assert anonymous.status_code == 403
+        generic: Final = await client.get(
+            "/tokenin/account/balance",
+            params={"user_id": ACCOUNT},
+            headers={"Authorization": "Bearer generic-proxy-master-key"},
+        )
+        assert generic.status_code == 403
+        served: Final = await client.get("/tokenin/account/balance", params={"user_id": ACCOUNT}, headers=SERVICE_AUTH)
+        assert served.status_code == 200
+        body: Final = served.json()
+        assert body["as_of"].endswith("Z")
+        assert body["buckets"][0]["expires_at"] == "2026-02-28T00:00:00Z"
+        assert body["available_usd"] == 10.0
+        missing: Final = await client.get(
+            "/tokenin/account/balance", params={"user_id": "nobody"}, headers=SERVICE_AUTH
+        )
+        assert missing.status_code == 404
+        monkeypatch.setenv("TOKENIN_ACCOUNT_V2_ENABLED", "false")
+        disabled: Final = await client.get(
+            "/tokenin/account/balance", params={"user_id": ACCOUNT}, headers=SERVICE_AUTH
+        )
+        assert disabled.status_code == 404

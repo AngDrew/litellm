@@ -25,7 +25,8 @@ _GRANTS_WITH_SPEND_QUERY: Final = (
     'COALESCE(SUM(a."amount_nano"),0) AS "allocated_nano" '
     'FROM "LiteLLM_TokeninGrant" g LEFT JOIN "LiteLLM_TokeninAllocation" a '
     'ON a."grant_id" = g."idempotency_key" WHERE g."user_id" = $1 '
-    'GROUP BY g."idempotency_key"'
+    'GROUP BY g."idempotency_key" '
+    'ORDER BY g."period_start" NULLS LAST, g."created_at", g."idempotency_key"'
 )
 
 
@@ -85,36 +86,45 @@ def as_sql_timestamp(value: datetime | str) -> str:
     return moment.isoformat()
 
 
-def eligible_grants(grants: Sequence[GrantBalance], now: datetime) -> tuple[GrantBalance, ...]:
-    following: Final = {
+FixedPeriods = Mapping[tuple[str | None, int | None], GrantBalance]
+
+
+def fixed_periods(grants: Sequence[GrantBalance]) -> FixedPeriods:
+    """Paid fixed periods keyed by ``(subscription_id, period_index)``, for next-period lookups."""
+    return {
         (grant.subscription_id, grant.period_index): grant
         for grant in grants
         if grant.kind == "fixed" and grant.subscription_id is not None and grant.period_index is not None
     }
-    eligible: Final = (
-        grant
-        for grant in grants
-        if grant.available_nano > 0
-        and (
-            grant.kind == "payg"
-            or (
-                grant.kind == "fixed"
-                and grant.period_start is not None
-                and grant.period_end is not None
-                and grant.period_index is not None
-                and (
-                    grant.period_start <= now < grant.period_end
-                    or (
-                        (next_grant := following.get((grant.subscription_id, grant.period_index + 1))) is not None
-                        and next_grant.period_start == grant.period_end
-                        and next_grant.period_start is not None
-                        and next_grant.period_end is not None
-                        and next_grant.period_start <= now < next_grant.period_end
-                    )
-                )
-            )
-        )
-    )
+
+
+def fixed_spend_window(grant: GrantBalance, periods: FixedPeriods) -> tuple[datetime, datetime] | None:
+    """Half-open ``[start, end)`` in which a fixed grant may be spent: its own paid period,
+    extended to the end of the immediately following period only when that period is also
+    paid and starts exactly where this one ends. ``None`` when the grant has no usable period.
+
+    The single source of the expiry rule: spending and the balance read both use it.
+    """
+    if grant.period_start is None or grant.period_end is None or grant.period_index is None:
+        return None
+    next_grant: Final = periods.get((grant.subscription_id, grant.period_index + 1))
+    if next_grant is not None and next_grant.period_start == grant.period_end and next_grant.period_end is not None:
+        return grant.period_start, next_grant.period_end
+    return grant.period_start, grant.period_end
+
+
+def _spendable_at(grant: GrantBalance, periods: FixedPeriods, now: datetime) -> bool:
+    if grant.kind == "payg":
+        return True
+    if grant.kind != "fixed":
+        return False
+    window: Final = fixed_spend_window(grant, periods)
+    return window is not None and window[0] <= now < window[1]
+
+
+def eligible_grants(grants: Sequence[GrantBalance], now: datetime) -> tuple[GrantBalance, ...]:
+    periods: Final = fixed_periods(grants)
+    eligible: Final = (grant for grant in grants if grant.available_nano > 0 and _spendable_at(grant, periods, now))
     return tuple(
         sorted(
             eligible,
@@ -140,6 +150,12 @@ def allocate_fifo(grants: Sequence[GrantBalance], amount_nano: int) -> tuple[tup
     if remaining > 0:
         raise HTTPException(status_code=402, detail="Insufficient account credit")
     return tuple(allocations)
+
+
+async def load_grants(tx: Any, user_id: str) -> tuple[GrantBalance, ...]:
+    """Every grant of one account with its allocated total, in summary order, inside the caller's tx."""
+    rows: Final = await tx.query_raw(_GRANTS_WITH_SPEND_QUERY, user_id)
+    return tuple(_grant(row) for row in rows)
 
 
 async def _now(tx: Any) -> datetime:
@@ -227,8 +243,7 @@ async def reserve_account_request(
             )
             return tuple((str(row["grant_id"]), int(row["amount_nano"])) for row in existing)
 
-        raw_grants: Final = await tx.query_raw(_GRANTS_WITH_SPEND_QUERY, user_id)
-        grants: Final = tuple(_grant(row) for row in raw_grants)
+        grants: Final = await load_grants(tx, user_id)
         debt: Final = int(account[0]["debt_nano"])
         debt_allocation: Final = allocate_fifo(eligible_grants(grants=grants, now=now), debt) if debt else ()
         if debt:
@@ -340,8 +355,7 @@ async def settle_account_request(
             )
             remaining -= spent  # rebind-ok: refund any unused reservation after FIFO actual charge
         if remaining:
-            fresh_grants: Final = await tx.query_raw(_GRANTS_WITH_SPEND_QUERY, user_id)
-            eligible: Final = eligible_grants(tuple(_grant(row) for row in fresh_grants), await _now(tx))
+            eligible: Final = eligible_grants(await load_grants(tx, user_id), await _now(tx))
             payable: Final = min(remaining, sum(grant.available_nano for grant in eligible))
             if payable:
                 for grant_id, amount in allocate_fifo(eligible, payable):

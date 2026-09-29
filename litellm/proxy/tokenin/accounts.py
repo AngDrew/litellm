@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from litellm._logging import verbose_proxy_logger
+from litellm.proxy.tokenin import ledger
 from litellm.proxy.tokenin.ledger import as_naive_utc
 from litellm.proxy.tokenin.plans import TokeninPlan, load_plans
 from litellm.proxy.utils import PrismaClient
@@ -681,4 +682,75 @@ async def account_summary(user_id: str = Query(min_length=1)) -> dict[str, objec
         "latest_policy_id": policies[0]["idempotency_key"] if policies else None,
         "available_usd": None,
         "enforcement_active": account_spend_enabled(),
+    }
+
+
+def _bucket_state(
+    grant: ledger.GrantBalance, periods: ledger.FixedPeriods, now: datetime
+) -> tuple[Literal["active", "upcoming", "expired"], datetime | None]:
+    """State and expiry of one credit bucket, from the same window the ledger spends by."""
+    if grant.kind == "payg":
+        return "active", None
+    window: Final = ledger.fixed_spend_window(grant, periods) if grant.kind == "fixed" else None
+    if window is None:
+        return "expired", None
+    start, end = window
+    if start <= now < end:
+        return "active", end
+    return ("upcoming" if now < start else "expired"), end
+
+
+@router.get("/tokenin/account/balance", dependencies=[Depends(_service_only)], tags=["tokenin"])
+async def account_balance(user_id: str = Query(min_length=1)) -> dict[str, object]:
+    """Spendable credit split into plan (fixed) and PAYG buckets, read at one database instant.
+
+    ``used_usd`` includes held and uncertain reservations: pending spend counts as used.
+    """
+    async with _db().db.tx() as tx:
+        now: Final = await ledger._now(tx)
+        grants: Final = await ledger.load_grants(tx, user_id)
+        account: Final = await tx.query_raw(
+            'SELECT "debt_nano" FROM "LiteLLM_TokeninAccount" WHERE "user_id" = $1', user_id
+        )
+    # An account row is exactly what is_managed_account checks (the route is already V2-gated),
+    # so this is the summary's not-found rule without leaving the transaction.
+    if not grants and not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    debt_nano: Final = int(account[0]["debt_nano"]) if account else 0
+    periods: Final = ledger.fixed_periods(grants)
+    buckets: Final[list[dict[str, object]]] = []
+    fixed_nano = 0
+    payg_nano = 0
+    for grant in grants:
+        state, expires_at = _bucket_state(grant, periods, now)
+        remaining = grant.available_nano
+        if grant.kind == "payg":
+            payg_nano += remaining  # rebind-ok: running bucket total
+        elif state == "active":
+            fixed_nano += remaining  # rebind-ok: running bucket total
+        buckets.append(
+            {
+                "grant_id": grant.grant_id,
+                "kind": grant.kind,
+                "plan_id": grant.plan_id,
+                "subscription_id": grant.subscription_id,
+                "period_index": grant.period_index,
+                "period_start": _as_utc(grant.period_start),
+                "period_end": _as_utc(grant.period_end),
+                "amount_usd": float(_dollars(grant.amount_nano)),
+                "used_usd": float(_dollars(grant.allocated_nano)),
+                "remaining_usd": float(_dollars(remaining)),
+                "state": state,
+                "expires_at": _as_utc(expires_at),
+            }
+        )
+    return {
+        "user_id": user_id,
+        "as_of": _as_utc(now),
+        "enforcement_active": account_spend_enabled(),
+        "debt_usd": float(_dollars(debt_nano)),
+        "fixed_available_usd": float(_dollars(fixed_nano)),
+        "payg_available_usd": float(_dollars(payg_nano)),
+        "available_usd": float(_dollars(max(fixed_nano + payg_nano - debt_nano, 0))),
+        "buckets": buckets,
     }
