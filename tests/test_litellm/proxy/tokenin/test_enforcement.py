@@ -233,6 +233,52 @@ async def test_pinned_request_ignores_router_configured_fallbacks() -> None:
         )
 
 
+@pytest.mark.parametrize("alias", [True, False])
+@pytest.mark.asyncio
+async def test_held_route_refuses_alias_and_default_fallback_but_nonheld_routes(alias: bool) -> None:
+    import litellm
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.route_llm_request import route_request
+
+    deployment: Final = [
+        {
+            "model_name": "model-b",
+            "litellm_params": {"model": "openai/gpt-4o-mini", "api_key": "fake", "mock_response": "model-b"},
+        }
+    ]
+    held: Final = UserAPIKeyAuth(api_key="hashed", tokenin_account_hold_id=HOLD, tokenin_account_hold_model="model-a")
+    direct_deployment: Final = {
+        "model_name": "model-a",
+        "litellm_params": {"model": "openai/gpt-4o-mini", "api_key": "fake", "mock_response": "model-a"},
+    }
+    router: Final = (
+        litellm.Router(model_list=[direct_deployment, *deployment], model_group_alias={"model-a": "model-b"})
+        if alias
+        else litellm.Router(model_list=deployment, default_fallbacks=["model-b"])
+    )
+    request: Final = {"model": "model-a", "messages": [{"role": "user", "content": "hi"}]}
+    with pytest.raises(HTTPException) as blocked:
+        await route_request(dict(request), router, None, "acompletion", held)
+    assert blocked.value.status_code == 503
+    if alias:
+        aliased: Final = await (await route_request(dict(request), router, None, "acompletion"))
+        assert isinstance(aliased, litellm.ModelResponse)
+        assert aliased.choices[0].message.content == "model-b"
+    else:
+        fallback: Final = await router.acompletion(model="model-a", messages=[{"role": "user", "content": "hi"}])
+        assert isinstance(fallback, litellm.ModelResponse)
+        assert fallback.choices[0].message.content == "model-b"
+
+    direct: Final = litellm.Router(model_list=[direct_deployment])
+    allowed: Final = await (await route_request(dict(request), direct, None, "acompletion", held))
+    assert isinstance(allowed, litellm.ModelResponse)
+    assert allowed.choices[0].message.content == "model-a"
+    with pytest.raises(HTTPException):
+        await route_request({**request, "model": "model-b"}, direct, None, "acompletion", held)
+    with pytest.raises(HTTPException):
+        await route_request({**request, "user_config": {"model_list": deployment}}, direct, None, "acompletion", held)
+
+
 @pytest.mark.parametrize(
     "body",
     [

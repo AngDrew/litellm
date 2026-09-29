@@ -430,6 +430,18 @@ async def route_request(
     """
     Common helper to route the request
     """
+    if user_api_key_dict is not None and user_api_key_dict.tokenin_account_hold_id is not None:
+        from litellm.proxy.tokenin.enforcement import require_direct_held_model
+
+        if "user_config" in data:
+            raise HTTPException(status_code=503, detail="Managed account custom routing is unavailable")
+        requested_model: Final[object] = data.get("model")  # pyright: ignore[reportUnknownMemberType]  # legacy request dict is untyped
+        require_direct_held_model(
+            approved_model=user_api_key_dict.tokenin_account_hold_model,
+            model=requested_model,
+            router=llm_router,
+            team_id=user_api_key_dict.team_id,
+        )
     try:
         return await _route_request_single_attempt(
             data=data,

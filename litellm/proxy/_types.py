@@ -2893,6 +2893,7 @@ class UserAPIKeyAuth(LiteLLM_VerificationTokenView):  # the expected response ob
         exclude=True,
         description="Account-ledger reservation created at admission for an enrolled Tokenin account",
     )
+    tokenin_account_hold_model: str | None = Field(default=None, exclude=True)
     matched_model_access_groups: list[str] | None = Field(default=None, exclude=True)
     budget_throttle_pct: float | None = Field(default=None, exclude=True)
     user: Any | None = None  # Expanded user object when expand=user is used

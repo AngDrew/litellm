@@ -58,6 +58,34 @@ def pin_account_hold_to_requested_model(
     data.update(emptied, disable_fallbacks=True)
 
 
+def require_direct_held_model(
+    *,
+    approved_model: str | None,
+    model: object,
+    router: Router | None,
+    team_id: str | None,
+) -> None:
+    """Reject held requests that could route to a model group other than the one priced at admission."""
+    import litellm
+
+    if (
+        not approved_model
+        or not isinstance(model, str)
+        or model != approved_model
+        or router is None
+        or model in router.model_group_alias
+        or model in litellm.model_alias_map
+        or router.has_model_id(model)
+        or (team_id is not None and router.map_team_model(model, team_id) not in (None, model))
+        or not router._get_all_deployments(  # pyright: ignore[reportPrivateUsage]  # only exact-name lookup avoids wildcard/default routes
+            model_name=approved_model, team_id=team_id
+        )
+    ):
+        raise HTTPException(
+            status_code=503, detail="Managed account model cannot be routed without an alias or fallback"
+        )
+
+
 def account_hold_id(metadata: Mapping[str, object] | None) -> str | None:
     if not metadata:
         return None

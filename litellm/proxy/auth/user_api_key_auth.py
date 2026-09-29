@@ -2815,6 +2815,10 @@ async def _authorize_authenticated_request(
         )
         if account_hold_id is not None:
             user_api_key_auth_obj.tokenin_account_hold_id = account_hold_id
+            approved_model: Final[object] = request_data.get("model")  # pyright: ignore[reportUnknownMemberType]  # legacy request dict is untyped
+            user_api_key_auth_obj.tokenin_account_hold_model = (  # rebind-ok: stamp the reserved model on the auth object
+                approved_model if isinstance(approved_model, str) else None
+            )
     except Exception as e:
         from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
         from litellm.proxy.tokenin.accounts import account_v2_enabled
