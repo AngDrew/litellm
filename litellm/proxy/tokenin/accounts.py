@@ -267,7 +267,11 @@ async def reserve_managed_request(
     if not isinstance(model, str) or not model:
         raise HTTPException(status_code=503, detail="Managed account request has no model")
     from litellm.proxy.proxy_server import llm_router
-    from litellm.proxy.tokenin.enforcement import estimate_account_max_cost, requests_model_fallbacks
+    from litellm.proxy.tokenin.enforcement import (
+        estimate_account_max_cost,
+        requests_model_fallbacks,
+        require_direct_held_model,
+    )
     from litellm.proxy.tokenin.ledger import reserve_account_request
 
     if requests_model_fallbacks(request_data):
@@ -275,6 +279,8 @@ async def reserve_managed_request(
         raise HTTPException(
             status_code=400, detail="Managed accounts cannot request model fallbacks or router overrides"
         )
+
+    require_direct_held_model(approved_model=model, model=model, router=llm_router, team_id=team_id)
 
     estimated: Final = await estimate_account_max_cost(
         request_body=dict(request_data), route=route, llm_router=llm_router

@@ -153,6 +153,20 @@ def store(monkeypatch: pytest.MonkeyPatch) -> FakeTx:
     return fake
 
 
+@pytest.fixture
+def managed_router(store: FakeTx, monkeypatch: pytest.MonkeyPatch) -> None:
+    import litellm
+    from litellm.proxy import proxy_server
+
+    router: Final = litellm.Router(
+        model_list=[
+            {"model_name": name, "litellm_params": {"model": "openai/gpt-4o-mini", "api_key": "fake"}}
+            for name in ("model-a", "model-b")
+        ]
+    )
+    monkeypatch.setattr(proxy_server, "llm_router", router)
+
+
 def _fixed(
     key: str, index: int = 0, start: datetime = PERIOD_START, end: datetime = PERIOD_END
 ) -> accounts.GrantRequest:
@@ -366,6 +380,7 @@ async def test_managed_admission_scopes_routes_and_requires_the_spend_switch(
     assert await accounts.require_request_admission(client, ACCOUNT, FLAT_TEAM_ID, "/user/info") is None
 
 
+@pytest.mark.usefixtures("managed_router")
 @pytest.mark.asyncio
 async def test_managed_reservation_binds_key_model_and_worst_case_cost(
     store: FakeTx, monkeypatch: pytest.MonkeyPatch
@@ -420,6 +435,7 @@ async def test_managed_reservation_binds_key_model_and_worst_case_cost(
         {"router_settings_override": {"fallbacks": [{"model-a": ["model-b"]}]}},
     ],
 )
+@pytest.mark.usefixtures("managed_router")
 @pytest.mark.asyncio
 async def test_managed_reservation_refuses_client_fallbacks_before_holding_credit(
     store: FakeTx, monkeypatch: pytest.MonkeyPatch, fallback: dict[str, object]
@@ -446,6 +462,62 @@ async def test_managed_reservation_refuses_client_fallbacks_before_holding_credi
         client, ACCOUNT, FLAT_TEAM_ID, "/chat/completions", {"model": "model-a", "fallbacks": []}, "sk-abc"
     )
     assert reserve.await_count == 1
+
+
+@pytest.mark.parametrize("config", ["alias", "silent_model"])
+@pytest.mark.asyncio
+async def test_managed_static_routing_mismatch_creates_no_hold(
+    store: FakeTx, monkeypatch: pytest.MonkeyPatch, config: str
+) -> None:
+    import litellm
+    from litellm.proxy import proxy_server
+
+    store.accounts.add(ACCOUNT)
+    monkeypatch.setenv("TOKENIN_ACCOUNT_SPEND_ENABLED", "true")
+    model_a: Final = {
+        "model_name": "model-a",
+        "litellm_params": {
+            "model": "openai/gpt-4o-mini",
+            "api_key": "fake",
+            **({"silent_model": "model-b"} if config == "silent_model" else {}),
+        },
+    }
+    router: Final = litellm.Router(
+        model_list=[
+            model_a,
+            {"model_name": "model-b", "litellm_params": {"model": "openai/gpt-4o-mini", "api_key": "fake"}},
+        ],
+        model_group_alias={"model-a": "model-b"} if config == "alias" else None,
+    )
+    monkeypatch.setattr(proxy_server, "llm_router", router)
+    estimator: Final = AsyncMock(return_value=1.0)
+    reserve: Final = AsyncMock()
+    monkeypatch.setattr("litellm.proxy.tokenin.enforcement.estimate_account_max_cost", estimator)
+    monkeypatch.setattr("litellm.proxy.tokenin.ledger.reserve_account_request", reserve)
+    client: Final = SimpleNamespace(db=store)
+    with pytest.raises(HTTPException) as rejected:
+        await accounts.reserve_managed_request(
+            client,  # pyright: ignore[reportArgumentType]  # FakeTx-backed Prisma stand-in
+            ACCOUNT,
+            FLAT_TEAM_ID,
+            "/chat/completions",
+            {"model": "model-a"},
+            "sk-abc",
+        )
+    assert rejected.value.status_code == 503
+    estimator.assert_not_awaited()
+    reserve.assert_not_awaited()
+    assert (
+        await accounts.reserve_managed_request(
+            client,  # pyright: ignore[reportArgumentType]  # FakeTx-backed Prisma stand-in
+            "not-enrolled",
+            FLAT_TEAM_ID,
+            "/chat/completions",
+            {"model": "model-a"},
+            "sk-abc",
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -715,6 +787,59 @@ async def test_account_auth_denial_cannot_use_db_outage_fallback_or_admin_role(
             api_key="managed-key",
         )
     assert denied.value.code == "503"
+
+
+@pytest.mark.parametrize("v2_enabled", [True, False])
+@pytest.mark.asyncio
+async def test_early_auth_db_fallback_identity_cannot_skip_v2_admission(
+    store: FakeTx, monkeypatch: pytest.MonkeyPatch, v2_enabled: bool
+) -> None:
+    from litellm.proxy import proxy_server
+    from litellm.proxy.auth import user_api_key_auth as auth_module
+    from litellm.proxy.auth.auth_exception_handler import (
+        DB_UNAVAILABLE_FALLBACK_USER_ID,
+        UserAPIKeyAuthExceptionHandler,
+    )
+
+    monkeypatch.setenv("TOKENIN_ACCOUNT_V2_ENABLED", "true" if v2_enabled else "false")
+    monkeypatch.setenv("TOKENIN_ACCOUNT_SPEND_ENABLED", "true")
+    monkeypatch.setattr(proxy_server, "prisma_client", SimpleNamespace(db=store))
+    monkeypatch.setattr(proxy_server, "general_settings", {"allow_requests_on_db_unavailable": True})
+    monkeypatch.setattr(
+        proxy_server,
+        "proxy_logging_obj",
+        SimpleNamespace(
+            post_call_failure_hook=AsyncMock(return_value=None),
+            service_logging_obj=SimpleNamespace(service_failure_hook=MagicMock()),
+        ),
+    )
+    monkeypatch.setattr(auth_module, "_run_centralized_common_checks", AsyncMock(return_value=None))
+    reserve: Final = AsyncMock()
+    monkeypatch.setattr("litellm.proxy.tokenin.ledger.reserve_account_request", reserve)
+    request: Final = _request("managed-key")
+    recovered: Final = await UserAPIKeyAuthExceptionHandler._handle_authentication_error(  # pyright: ignore[reportPrivateUsage]  # exercise the builder's DB fallback handler
+        e=httpx.ConnectError("database unreachable"),
+        request=request,
+        request_data={"model": "model-a"},
+        route="/v1/chat/completions",
+        parent_otel_span=None,
+        api_key="managed-key",
+    )
+    assert recovered.user_id == DB_UNAVAILABLE_FALLBACK_USER_ID
+    admission: Final = _authorize_authenticated_request(
+        user_api_key_auth_obj=recovered,
+        request=request,
+        request_data={"model": "model-a"},
+        route="/v1/chat/completions",
+        api_key="managed-key",
+    )
+    if v2_enabled:
+        with pytest.raises(ProxyException) as refused:
+            await admission
+        assert refused.value.code == "503"
+    else:
+        assert await admission is None
+    reserve.assert_not_awaited()
 
 
 @pytest.mark.parametrize("v2_enabled", [True, False])

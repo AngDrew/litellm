@@ -22,12 +22,15 @@ import tempfile
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 import httpx
 import pytest
 import pytest_asyncio
 import yaml
+
+if TYPE_CHECKING:
+    from litellm.proxy.utils import PrismaClient
 
 SERVICE_TOKEN: Final = "e2e-service-token-32-characters-minimum"
 MASTER_KEY: Final = "sk-e2e-master-key"
@@ -149,7 +152,6 @@ async def proxy_app():
 @pytest.fixture(autouse=True)
 def _restore_app_globals(proxy_app) -> None:
     import litellm
-
     from litellm.proxy import proxy_server
 
     for name, value in _APP_GLOBALS.items():
@@ -346,6 +348,37 @@ async def test_client_fallbacks_and_router_overrides_are_refused_before_any_hold
         json={"model": STUB_MODEL, "messages": [{"role": "user", "content": "hi"}], **routing},
     )
     assert refused.status_code == 400, refused.text
+    assert (await _account_state(prisma, user_id))["holds"] == []
+
+
+@pytest.mark.parametrize("configured_route", ["alias", "silent_model"])
+@pytest.mark.asyncio(loop_scope="module")
+async def test_configured_model_rewrite_or_mirror_is_refused_without_a_hold(
+    client: httpx.AsyncClient, prisma: PrismaClient, configured_route: str
+) -> None:
+    from litellm.proxy import proxy_server
+
+    user_id, key = await _enrolled_account(client, prisma, models=[STUB_MODEL])
+    await _grant(client, user_id, "0.01")
+    router: Final = proxy_server.llm_router
+    assert router is not None
+    deployments: Final = router._get_all_deployments(  # pyright: ignore[reportPrivateUsage]  # inspect exact deployment in proxy test
+        model_name=STUB_MODEL
+    )
+    assert len(deployments) == 1
+    deployment: Final = deployments[0]
+    if configured_route == "alias":
+        router.model_group_alias[STUB_MODEL] = OTHER_MODEL
+    else:
+        deployment["litellm_params"]["silent_model"] = OTHER_MODEL  # pyright: ignore[reportGeneralTypeIssues]  # router accepts this extra config key
+    try:
+        refused: Final = await _chat(client, key)
+    finally:
+        if configured_route == "alias":
+            del router.model_group_alias[STUB_MODEL]
+        else:
+            del deployment["litellm_params"]["silent_model"]  # pyright: ignore[reportGeneralTypeIssues]  # undo the test's config
+    assert refused.status_code == 503, refused.text
     assert (await _account_state(prisma, user_id))["holds"] == []
 
 
