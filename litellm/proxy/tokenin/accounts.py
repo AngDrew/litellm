@@ -267,8 +267,12 @@ async def reserve_managed_request(
     if not isinstance(model, str) or not model:
         raise HTTPException(status_code=503, detail="Managed account request has no model")
     from litellm.proxy.proxy_server import llm_router
-    from litellm.proxy.tokenin.enforcement import estimate_account_max_cost
+    from litellm.proxy.tokenin.enforcement import estimate_account_max_cost, requests_model_fallbacks
     from litellm.proxy.tokenin.ledger import reserve_account_request
+
+    if requests_model_fallbacks(request_data):
+        # The ledger approves and prices ``model`` only; a fallback target would be neither.
+        raise HTTPException(status_code=400, detail="Managed accounts cannot request model fallbacks")
 
     estimated: Final = await estimate_account_max_cost(
         request_body=dict(request_data), route=route, llm_router=llm_router

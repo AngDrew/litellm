@@ -2230,6 +2230,13 @@ async def add_litellm_data_to_request(
         llm_router=llm_router,
     )
 
+    # Last, so no key metadata (``disable_fallbacks``) or earlier stage can re-enable
+    # a fallback to a model the account hold was never priced or approved for.
+    if user_api_key_dict.tokenin_account_hold_id is not None:
+        from litellm.proxy.tokenin.enforcement import pin_account_hold_to_requested_model
+
+        pin_account_hold_to_requested_model(data)
+
     ## ENFORCED PARAMS CHECK
     # loop through each enforced param
     # example enforced_params ['user', 'metadata', 'metadata.generation_name']

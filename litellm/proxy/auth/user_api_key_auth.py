@@ -2816,8 +2816,19 @@ async def _authorize_authenticated_request(
         if account_hold_id is not None:
             user_api_key_auth_obj.tokenin_account_hold_id = account_hold_id
     except Exception as e:
+        from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
+        from litellm.proxy.tokenin.accounts import account_v2_enabled
+
+        # With Tokenin accounts armed, a DB outage here must not mint the restricted
+        # fallback identity: it would carry no account hold, so an enrolled account's
+        # request would reach the provider without reserving or settling any credit.
+        failure: Final = (
+            HTTPException(status_code=503, detail="Managed account authorization unavailable")
+            if account_v2_enabled() and PrismaDBExceptionHandler.is_database_connection_error(e)
+            else e
+        )
         return await UserAPIKeyAuthExceptionHandler._handle_authentication_error(
-            e=e,
+            e=failure,
             request=request,
             request_data=request_data,
             route=route,

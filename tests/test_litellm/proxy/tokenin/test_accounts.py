@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Final
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -411,6 +411,43 @@ async def test_managed_reservation_binds_key_model_and_worst_case_cost(
     assert no_model.value.status_code == 503
 
 
+@pytest.mark.parametrize(
+    "fallback",
+    [
+        {"fallbacks": ["model-b"]},
+        {"context_window_fallbacks": [{"model-a": ["model-b"]}]},
+        {"content_policy_fallbacks": [{"model-a": ["model-b"]}]},
+        {"router_settings_override": {"fallbacks": [{"model-a": ["model-b"]}]}},
+    ],
+)
+@pytest.mark.asyncio
+async def test_managed_reservation_refuses_client_fallbacks_before_holding_credit(
+    store: FakeTx, monkeypatch: pytest.MonkeyPatch, fallback: dict[str, object]
+) -> None:
+    store.accounts.add(ACCOUNT)
+    monkeypatch.setenv("TOKENIN_ACCOUNT_SPEND_ENABLED", "true")
+    reserve: Final = AsyncMock(return_value=(("paid", 1),))
+    monkeypatch.setattr("litellm.proxy.tokenin.ledger.reserve_account_request", reserve)
+    monkeypatch.setattr("litellm.proxy.tokenin.enforcement.estimate_account_max_cost", AsyncMock(return_value=2.5))
+    client: Final = SimpleNamespace(db=store)
+    with pytest.raises(HTTPException) as refused:
+        await accounts.reserve_managed_request(
+            client, ACCOUNT, FLAT_TEAM_ID, "/chat/completions", {"model": "model-a", **fallback}, "sk-abc"
+        )
+    assert refused.value.status_code == 400
+    assert not reserve.await_count
+    assert (
+        await accounts.reserve_managed_request(
+            client, "not-enrolled", FLAT_TEAM_ID, "/chat/completions", {"model": "model-a", **fallback}, "sk-abc"
+        )
+        is None
+    )
+    assert await accounts.reserve_managed_request(
+        client, ACCOUNT, FLAT_TEAM_ID, "/chat/completions", {"model": "model-a", "fallbacks": []}, "sk-abc"
+    )
+    assert reserve.await_count == 1
+
+
 @pytest.mark.asyncio
 async def test_account_key_issuance_derives_identity_and_carries_no_limits(
     store: FakeTx, monkeypatch: pytest.MonkeyPatch
@@ -678,6 +715,48 @@ async def test_account_auth_denial_cannot_use_db_outage_fallback_or_admin_role(
             api_key="managed-key",
         )
     assert denied.value.code == "503"
+
+
+@pytest.mark.parametrize("v2_enabled", [True, False])
+@pytest.mark.asyncio
+async def test_db_outage_during_account_reservation_never_mints_the_fallback_identity(
+    store: FakeTx, monkeypatch: pytest.MonkeyPatch, v2_enabled: bool
+) -> None:
+    from litellm.proxy import proxy_server
+    from litellm.proxy.auth import user_api_key_auth as auth_module
+    from litellm.proxy.auth.auth_exception_handler import DB_UNAVAILABLE_FALLBACK_USER_ID
+
+    monkeypatch.setenv("TOKENIN_ACCOUNT_V2_ENABLED", "true" if v2_enabled else "false")
+    monkeypatch.setattr(proxy_server, "prisma_client", SimpleNamespace(db=store))
+    monkeypatch.setattr(proxy_server, "general_settings", {"allow_requests_on_db_unavailable": True})
+    monkeypatch.setattr(
+        proxy_server,
+        "proxy_logging_obj",
+        SimpleNamespace(
+            post_call_failure_hook=AsyncMock(return_value=None),
+            service_logging_obj=SimpleNamespace(service_failure_hook=MagicMock()),
+        ),
+    )
+    monkeypatch.setattr(auth_module, "_run_centralized_common_checks", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        "litellm.proxy.tokenin.accounts.reserve_managed_request",
+        AsyncMock(side_effect=httpx.ConnectError("database unreachable")),
+    )
+    managed: Final = UserAPIKeyAuth(user_id=ACCOUNT, team_id=FLAT_TEAM_ID)
+    call: Final = _authorize_authenticated_request(
+        user_api_key_auth_obj=managed,
+        request=_request("managed-key"),
+        request_data={"model": "model-a", "messages": []},
+        route="/v1/chat/completions",
+        api_key="managed-key",
+    )
+    if v2_enabled:
+        with pytest.raises(ProxyException) as denied:
+            await call
+        assert denied.value.code == "503"
+    else:
+        recovered: Final = await call
+        assert recovered is not None and recovered.user_id == DB_UNAVAILABLE_FALLBACK_USER_ID
 
 
 @pytest.mark.parametrize(
