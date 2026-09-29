@@ -265,3 +265,51 @@ def test_anthropic_format_returns_public_team_model_name(
     assert response.status_code == 200
     assert [m["id"] for m in response.json()["data"]] == ["gpt-4-team"]
     assert internal_name not in response.text
+
+
+@pytest.mark.parametrize("path", ["/v1/models", "/models"])
+def test_get_models_exposes_capabilities_end_to_end(
+    client, auth_as, monkeypatch, local_model_cost_map, path
+):
+    """Pins: capabilities reach the HTTP body, not just the helper - cost-map
+    models and config-declared (`model_info` in config.yaml) ones alike."""
+    from litellm import Router
+
+    router = Router(
+        model_list=[
+            {"model_name": "gpt-4o", "litellm_params": {"model": "openai/gpt-4o"}},
+            {
+                "model_name": "my-vllm",
+                "litellm_params": {
+                    "model": "hosted_vllm/llama-3.1-8b",
+                    "api_base": "http://vllm:8000/v1",
+                },
+                "model_info": {
+                    "mode": "chat",
+                    "supports_vision": True,
+                    "supports_function_calling": False,
+                },
+            },
+        ]
+    )
+    monkeypatch.setattr(proxy_server, "llm_router", router)
+    monkeypatch.setattr(proxy_server, "prisma_client", MagicMock())
+    monkeypatch.setattr(proxy_server, "user_model", None)
+
+    async def _available_models_for_user(**_kwargs):
+        return ["gpt-4o", "my-vllm"]
+
+    monkeypatch.setattr(
+        proxy_utils, "get_available_models_for_user", _available_models_for_user
+    )
+
+    with auth_as():
+        response = client.get(path)
+
+    assert response.status_code == 200
+    models = {m["id"]: m for m in response.json()["data"]}
+    assert models["gpt-4o"]["supports_vision"] is True
+    assert models["gpt-4o"]["supports_tool_choice"] is True
+    assert models["my-vllm"]["mode"] == "chat"
+    assert models["my-vllm"]["supports_vision"] is True
+    assert models["my-vllm"]["supports_function_calling"] is False

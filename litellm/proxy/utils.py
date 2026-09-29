@@ -193,6 +193,7 @@ if TYPE_CHECKING:
     from litellm.proxy.db.spend_log_tool_index import ToolUsageTransaction
     from litellm.repositories.prisma_protocols import TableActions
     from litellm.types.proxy.policy_engine.pipeline_types import GuardrailPipeline
+    from litellm.types.router import Deployment
 
     Span = _Span | object
 else:
@@ -7490,18 +7491,36 @@ def create_model_info_response(
     """
     Create a standardized OpenAI-compatible model object.
 
+    Capability flags (supports_vision, supports_function_calling, ...) the cost
+    map defines for the model are copied through verbatim, so clients can
+    auto-detect what a model can do without a second lookup. Capabilities
+    declared on the deployment's own `model_info` (config.yaml, /model/new) win
+    over the cost map, so self-hosted and renamed models can declare them too.
+
     When include_metadata is true, attaches the model's configured fallbacks
     (resolved via the router under fallback_type, defaulting to "general").
     Raises HTTPException(400) for an unknown fallback_type.
     """
     from litellm.proxy.auth.model_checks import get_all_fallbacks
 
-    base: Final[ModelInfoResponse] = {
+    base: Final[dict[str, object]] = {
         "id": model_id,
         "object": "model",
         "created": DEFAULT_MODEL_CREATED_AT_TIME,
         "owned_by": provider,
     }
+
+    deployment: Deployment | None = None
+    if llm_router is not None:
+        # O(1) index lookup, the same one Router.get_configured_token_limits uses.
+        try:
+            deployment = llm_router.get_deployment_by_model_group_name(model_group_name=model_id)
+        except Exception as e:
+            verbose_proxy_logger.debug(
+                "create_model_info_response: deployment lookup failed for %s: %s",
+                model_id,
+                e,
+            )
 
     try:
         model_cost_info: ModelInfo | None = get_model_info(model_id)
@@ -7513,6 +7532,18 @@ def create_model_info_response(
         )
         model_cost_info = None
 
+    if model_cost_info is None and deployment is not None:
+        # Proxy-published names (``model_name: gpt-4o-prod`` -> ``openai/gpt-4o``)
+        # are not cost-map keys; use the model the deployment actually runs.
+        try:
+            model_cost_info = get_model_info(deployment.litellm_params.model)
+        except Exception as e:
+            verbose_proxy_logger.debug(
+                "create_model_info_response: cost map lookup failed for deployment model %s: %s",
+                deployment.litellm_params.model,
+                e,
+            )
+
     max_input_tokens: int | None = None
     max_output_tokens: int | None = None
     if model_cost_info is not None:
@@ -7521,6 +7552,9 @@ def create_model_info_response(
         mode: Final = model_cost_info.get("mode")
         if isinstance(mode, str):
             base["mode"] = mode
+        for capability, supported in model_cost_info.items():
+            if capability.startswith("supports_") and isinstance(supported, bool):
+                base[capability] = supported
 
     if llm_router is not None:
         configured_input, configured_output = llm_router.get_configured_token_limits(model_id)
@@ -7529,13 +7563,32 @@ def create_model_info_response(
         if configured_output is not None:
             max_output_tokens = configured_output
 
+    if deployment is not None:
+        # `model_info` in config.yaml / /model/new is admin-declared truth, so it
+        # beats the cost map here just as it does for the token limits above.
+        declared: Mapping[str, object] = {}
+        try:
+            declared = deployment.model_info.model_dump()
+        except Exception as e:
+            verbose_proxy_logger.debug(
+                "create_model_info_response: unreadable model_info for %s: %s", model_id, e
+            )
+        base.update(
+            {
+                key: value
+                for key, value in declared.items()
+                if (key == "mode" and isinstance(value, str))
+                or (key.startswith("supports_") and isinstance(value, bool))
+            }
+        )
+
     if max_input_tokens is not None:
         base["max_input_tokens"] = max_input_tokens
     if max_output_tokens is not None:
         base["max_output_tokens"] = max_output_tokens
 
     if not include_metadata:
-        return base
+        return cast(ModelInfoResponse, base)  # cast-ok: dynamic supports_* capability keys
 
     effective_fallback_type: Final = fallback_type if fallback_type is not None else "general"
 
@@ -7551,7 +7604,9 @@ def create_model_info_response(
         llm_router=llm_router,
         fallback_type=effective_fallback_type,
     )
-    return {**base, "metadata": {"fallbacks": fallbacks}}
+    return cast(  # cast-ok: dynamic supports_* capability keys
+        ModelInfoResponse, {**base, "metadata": {"fallbacks": fallbacks}}
+    )
 
 
 def validate_model_access(

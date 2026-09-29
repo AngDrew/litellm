@@ -911,6 +911,29 @@ def test_create_model_info_response_includes_max_tokens_from_lookup():
     assert response["max_output_tokens"] == 16384
 
 
+def test_create_model_info_response_exposes_cost_map_capabilities():
+    """Clients auto-detect abilities off /v1/models, so every supports_* boolean
+    the cost map holds is copied through and nothing else leaks."""
+    response = create_model_info_response(
+        model_id="gpt-4o",
+        provider="openai",
+        llm_router=None,
+        get_model_info=lambda _model: _fake_model_info(
+            mode="chat",
+            supports_vision=True,
+            supports_function_calling=True,
+            supports_reasoning=False,
+            input_cost_per_token=1e-06,
+        ),
+    )
+
+    assert response["mode"] == "chat"
+    assert response["supports_vision"] is True
+    assert response["supports_function_calling"] is True
+    assert response["supports_reasoning"] is False
+    assert "input_cost_per_token" not in response
+
+
 def test_create_model_info_response_does_not_call_router_group_info():
     router = MagicMock()
     router.get_configured_token_limits.return_value = (None, None)
@@ -1878,3 +1901,105 @@ async def test_proxy_only_error_5xx_keeps_traceback_and_runs_sync_callbacks(monk
         Logging.failure_handler = orig_sync_failure
 
     assert "test_proxy_utils" in captured["async_traceback"]
+
+
+def test_create_model_info_response_resolves_renamed_deployment_capabilities(local_model_cost_map):
+    """A proxy that publishes a renamed deployment (model_name: gpt-4o-prod ->
+    openai/gpt-4o) is not a cost-map key, so the listing has to resolve the
+    deployment's underlying model to report capabilities at all."""
+    from litellm import Router
+
+    router = Router(
+        model_list=[
+            {"model_name": "gpt-4o-prod", "litellm_params": {"model": "openai/gpt-4o"}}
+        ]
+    )
+
+    response = create_model_info_response(
+        model_id="gpt-4o-prod", provider="openai", llm_router=router
+    )
+
+    assert response["mode"] == "chat"
+    assert response["supports_vision"] is True
+    assert response["supports_function_calling"] is True
+
+
+def test_create_model_info_response_survives_unknown_model_without_router():
+    """A name nothing knows about still yields the base object, no capabilities."""
+    response = create_model_info_response(
+        model_id="totally-unknown-model", provider="openai", get_model_info=_raise_unmapped
+    )
+
+    assert response["id"] == "totally-unknown-model"
+    assert not any(key.startswith("supports_") for key in response)
+
+
+def test_create_model_info_response_uses_config_declared_capabilities(local_model_cost_map):
+    """Self-hosted endpoints aren't in the cost map, so config.yaml declares the
+    capabilities in model_info and the listing has to surface them."""
+    from litellm import Router
+
+    router = Router(
+        model_list=[
+            {
+                "model_name": "my-vllm",
+                "litellm_params": {"model": "hosted_vllm/llama-3.1-8b", "api_base": "http://vllm:8000/v1"},
+                "model_info": {
+                    "mode": "chat",
+                    "supports_vision": True,
+                    "supports_function_calling": False,
+                    "max_input_tokens": 131072,
+                },
+            }
+        ]
+    )
+
+    response = create_model_info_response(
+        model_id="my-vllm", provider="openai", llm_router=router
+    )
+
+    assert response["mode"] == "chat"
+    assert response["supports_vision"] is True
+    assert response["supports_function_calling"] is False
+    assert response["max_input_tokens"] == 131072
+
+
+def test_create_model_info_response_config_capabilities_beat_cost_map(local_model_cost_map):
+    """Declared values win over the cost map, same precedence as configured token
+    limits: gpt-4o's cost map says vision+tool calling, config says otherwise."""
+    from litellm import Router
+
+    router = Router(
+        model_list=[
+            {
+                "model_name": "gpt-4o",
+                "litellm_params": {"model": "openai/gpt-4o"},
+                "model_info": {"supports_vision": False, "mode": "responses"},
+            }
+        ]
+    )
+
+    response = create_model_info_response(
+        model_id="gpt-4o", provider="openai", llm_router=router
+    )
+
+    assert response["supports_vision"] is False
+    assert response["mode"] == "responses"
+    assert response["supports_function_calling"] is True
+
+
+def test_create_model_info_response_ignores_non_capability_model_info():
+    """Cost/pricing/identity keys must not leak into the model object, and an
+    unreadable model_info must not fail the listing."""
+    router = MagicMock()
+    router.get_configured_token_limits.return_value = (None, None)
+    router.get_deployment_by_model_group_name.return_value = MagicMock()
+
+    response = create_model_info_response(
+        model_id="some-model",
+        provider="openai",
+        llm_router=router,
+        get_model_info=_raise_unmapped,
+    )
+
+    assert set(response) == {"id", "object", "created", "owned_by"}
