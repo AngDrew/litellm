@@ -660,7 +660,7 @@ async def account_summary(user_id: str = Query(min_length=1)) -> dict[str, objec
         user_id,
     )
     policies: Final = await db.query_raw(
-        'SELECT "idempotency_key", "plan_id", "models", "rpm_limit", '
+        'SELECT "idempotency_key", "user_id", "plan_id", "models", "rpm_limit", '
         '"max_parallel_requests", "effective_at", "created_at" FROM "LiteLLM_TokeninPolicy" '
         'WHERE "user_id" = $1 ORDER BY "created_at" DESC, "idempotency_key" DESC',
         user_id,

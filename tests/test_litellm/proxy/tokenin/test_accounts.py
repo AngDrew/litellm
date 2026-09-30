@@ -141,7 +141,11 @@ class FakeTx:
                 key=lambda row: (row["created_at"], row["idempotency_key"]),
                 reverse=True,
             )
-            return newest_first[:1] if "LIMIT 1" in sql else newest_first
+            selected: Final = newest_first[:1] if "LIMIT 1" in sql else newest_first
+            projection: Final = sql.split("FROM", 1)[0]
+            if "*" in projection:
+                return selected
+            return [{key: value for key, value in row.items() if f'"{key}"' in projection} for row in selected]
         raise AssertionError(sql)
 
 
@@ -307,6 +311,8 @@ async def test_payg_exact_credit_and_policy_revision_and_summary(store: FakeTx) 
     assert summary["enforcement_active"] is False
     assert summary["grants"][0]["amount_usd"] == Decimal("8.25")
     assert summary["policies"][0]["models"] == ["model-a"]
+    assert summary["policies"][0]["user_id"] == ACCOUNT
+    assert summary["policies"][0]["idempotency_key"] == "policy-1"
     assert store.policies["policy-1"]["effective_at"] == PERIOD_END.replace(tzinfo=None)
 
 
