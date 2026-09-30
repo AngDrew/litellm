@@ -9098,6 +9098,169 @@ def test_model_group_info_intersects_supported_reasoning_efforts():
     assert result.supported_reasoning_efforts == ("minimal", "low", "medium", "high")
 
 
+def test_model_group_info_ors_each_declared_capability():
+    """A group advertises what any deployment declares, and null means nothing declared it, so a
+    client can tell "this group cannot" from "this proxy does not know"."""
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "media-group",
+                "litellm_params": {"model": "openai/gpt-5-mini"},
+                "model_info": {"id": "audio-deployment"},
+            },
+            {
+                "model_name": "media-group",
+                "litellm_params": {"model": "openai/gpt-5-mini"},
+                "model_info": {"id": "documents-deployment"},
+            },
+        ]
+    )
+
+    def _model_info(model_id: str, model_name: str):
+        if model_id == "audio-deployment":
+            return {
+                "key": model_name,
+                "litellm_provider": "openai",
+                "mode": "chat",
+                "supports_audio_input": True,
+                "supports_pdf_input": False,
+                "supported_openai_params": ["response_format"],
+                "default_reasoning_effort": "medium",
+            }
+        return {
+            "key": model_name,
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "supports_pdf_input": True,
+            "supports_video_input": True,
+            "supported_openai_params": ["temperature"],
+            "default_reasoning_effort": "medium",
+        }
+
+    with patch.object(router, "get_deployment_model_info", side_effect=_model_info):
+        result = router._set_model_group_info(
+            model_group="media-group",
+            user_facing_model_group_name="media-group",
+        )
+
+    assert result is not None
+    assert result.supports_audio_input is True
+    assert result.supports_documents is True
+    assert result.supports_video_input is True
+    # One deployment reads response_format, the other does not: the capability is the union.
+    assert result.supports_structured_output is True
+    assert result.default_reasoning_effort == "medium"
+
+
+def test_model_group_info_leaves_undeclared_capabilities_unknown():
+    """Nothing declares these, so they stay null rather than false, which is the only way a client
+    can tell an unknown capability from a refused one."""
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "plain-group",
+                "litellm_params": {"model": "openai/gpt-5-mini"},
+                "model_info": {"id": "plain-deployment"},
+            }
+        ]
+    )
+
+    with patch.object(
+        router,
+        "get_deployment_model_info",
+        side_effect=lambda model_id, model_name: {
+            "key": model_name,
+            "litellm_provider": "openai",
+            "mode": "chat",
+        },
+    ):
+        result = router._set_model_group_info(
+            model_group="plain-group",
+            user_facing_model_group_name="plain-group",
+        )
+
+    assert result is not None
+    assert result.supports_audio_input is None
+    assert result.supports_documents is None
+    assert result.supports_video_input is None
+    assert result.supports_structured_output is None
+    assert result.default_reasoning_effort is None
+
+
+def test_model_group_info_keeps_a_refusal_and_drops_a_disputed_default_effort():
+    """A false that nothing contradicts is the group's answer, an unreadable parameter list is not
+    an answer at all, and siblings naming different defaults leave the group with no default."""
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "refusing-group",
+                "litellm_params": {"model": "openai/gpt-5-mini"},
+                "model_info": {"id": "first-deployment"},
+            },
+            {
+                "model_name": "refusing-group",
+                "litellm_params": {"model": "openai/gpt-5-mini"},
+                "model_info": {"id": "second-deployment"},
+            },
+        ]
+    )
+
+    def _model_info(model_id: str, model_name: str):
+        if model_id == "first-deployment":
+            return {
+                "key": model_name,
+                "litellm_provider": "openai",
+                "mode": "chat",
+                "supports_audio_input": False,
+                "default_reasoning_effort": "high",
+            }
+        return {
+            "key": model_name,
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "supports_audio_input": False,
+            "supported_openai_params": ["temperature"],
+            "default_reasoning_effort": "low",
+        }
+
+    with patch.object(router, "get_deployment_model_info", side_effect=_model_info):
+        result = router._set_model_group_info(
+            model_group="refusing-group",
+            user_facing_model_group_name="refusing-group",
+        )
+
+    assert result is not None
+    assert result.supports_audio_input is False
+    assert result.supports_structured_output is False
+    assert result.supports_documents is None
+    assert result.default_reasoning_effort is None
+
+
+def test_model_group_info_surfaces_levels_and_default_declared_in_config():
+    """An operator states an off-map deployment's levels in its model_info, and the group reports
+    them along with the default, so effort chips never depend on the bundled map knowing the model."""
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "custom-group",
+                "litellm_params": {"model": "openai/not-in-the-model-map", "api_key": "sk-test"},
+                "model_info": {
+                    "id": "custom-deployment",
+                    "supports_reasoning": True,
+                    "reasoning_effort_levels": ["low", "high"],
+                    "default_reasoning_effort": "low",
+                },
+            }
+        ]
+    )
+
+    result = router.get_model_group_info("custom-group")
+
+    assert result is not None
+    assert result.supported_reasoning_efforts == ("low", "high")
+    assert result.default_reasoning_effort == "low"
+
+
 def test_model_group_info_reasoning_efforts_ignore_a_deployment_off_the_map():
     """The router fills every ModelInfo key, so a deployment absent from the model map arrives with
     supports_reasoning None rather than with the key missing. Its synthesized entry carries no mode,

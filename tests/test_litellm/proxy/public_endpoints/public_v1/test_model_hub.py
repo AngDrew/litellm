@@ -164,6 +164,43 @@ def test_a_health_read_that_returns_nothing_still_serves_the_page(monkeypatch):
     assert _groups(response) == ["model-000", "model-001", "model-002"]
 
 
+@pytest.mark.parametrize("path", [MODEL_HUB_PATH, LEGACY_MODEL_HUB_PATH])
+def test_the_capability_profile_survives_to_the_wire(monkeypatch, path: str):
+    _publish(
+        monkeypatch,
+        (
+            _info(
+                "capable",
+                supports_audio_input=True,
+                supports_documents=False,
+                supports_video_input=True,
+                supports_structured_output=True,
+                supported_reasoning_efforts=("low", "high"),
+                default_reasoning_effort="low",
+            ),
+            _info("unknown"),
+        ),
+    )
+
+    body = client.get(path).json()
+    rows = {row["model_group"]: row for row in (body["data"] if isinstance(body, dict) else body)}
+
+    assert rows["capable"]["supports_audio_input"] is True
+    assert rows["capable"]["supports_documents"] is False
+    assert rows["capable"]["supports_video_input"] is True
+    assert rows["capable"]["supports_structured_output"] is True
+    assert rows["capable"]["supported_reasoning_efforts"] == ["low", "high"]
+    assert rows["capable"]["default_reasoning_effort"] == "low"
+    for field in (
+        "supports_audio_input",
+        "supports_documents",
+        "supports_video_input",
+        "supports_structured_output",
+        "default_reasoning_effort",
+    ):
+        assert rows["unknown"][field] is None
+
+
 def test_rows_are_alphabetical_by_default(monkeypatch):
     _publish(monkeypatch, (_info("zeta"), _info("alpha"), _info("mid")))
 

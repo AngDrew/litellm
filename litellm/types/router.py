@@ -623,6 +623,18 @@ class AlertingConfig(BaseModel):
 
 
 class ModelGroupInfo(BaseModel):
+    """What one model group can do, aggregated across its deployments.
+
+    Seeded from the first deployment: mode, provider-derived defaults and any field not merged below
+    come from it, so a config author chooses the group's anchor by ordering the deployments.
+    Flags are ORed across deployments and limits take the maximum. The tri-state capability fields
+    (audio input, documents, video input, structured output) are None when no deployment declares
+    them, which means unknown rather than unsupported. supports_documents reads the cost map's
+    supports_pdf_input. supports_structured_output is true when a deployment accepts response_format.
+    supported_reasoning_efforts is the intersection of the deployments' levels and
+    default_reasoning_effort is set only when every declaring deployment names the same one.
+    """
+
     model_group: str
     providers: list[str]
     max_input_tokens: float | None = None
@@ -645,7 +657,12 @@ class ModelGroupInfo(BaseModel):
     supports_url_context: bool = Field(default=False)
     supports_reasoning: bool = Field(default=False)
     supports_function_calling: bool = Field(default=False)
+    supports_audio_input: bool | None = Field(default=None)
+    supports_documents: bool | None = Field(default=None)
+    supports_video_input: bool | None = Field(default=None)
+    supports_structured_output: bool | None = Field(default=None)
     supported_reasoning_efforts: tuple[str, ...] | None = Field(default=None)
+    default_reasoning_effort: str | None = Field(default=None)
     supported_openai_params: list[str] | None = Field(default=[])
     configurable_clientside_auth_params: CONFIGURABLE_CLIENTSIDE_AUTH_PARAMS = None
 

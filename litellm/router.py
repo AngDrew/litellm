@@ -309,6 +309,20 @@ def _cost_value_as_float(value: str | float | None) -> float | None:
         return None
 
 
+def _aggregate_declared_flag(current: bool | None, declared: object) -> bool | None:
+    """A capability a group's deployments OR, still None while none of them declares it.
+
+    None is not False: a deployment off the model map arrives carrying no flags at all, and reading
+    that as a refusal would hide a capability its mapped siblings share. An explicit False survives
+    only while nothing in the group claims True.
+    """
+    if current is True or declared is True:
+        return True
+    if current is False or declared is False:
+        return False
+    return None
+
+
 def model_info_is_active_for_environment(model_info: Mapping[str, object] | None) -> bool:
     """Single owner of the environment-gating rule: a deployment whose model_info names
     `supported_environments` loads only on pods whose LITELLM_ENVIRONMENT is in that list.
@@ -9926,6 +9940,7 @@ class Router:
         total_itpm: int | None = None
         total_otpm: int | None = None
         configurable_clientside_auth_params: CONFIGURABLE_CLIENTSIDE_AUTH_PARAMS = None
+        declared_default_efforts: tuple[str, ...] = ()
         model_list: Final = self.get_model_list(model_name=model_group)
         if model_list is None:
             return None
@@ -10035,6 +10050,7 @@ class Router:
                         "providers": [llm_provider],
                         **model_info,
                         "supported_reasoning_efforts": None,
+                        "default_reasoning_effort": None,
                     }
                 )
             else:
@@ -10117,6 +10133,31 @@ class Router:
                 resolve_supported_reasoning_efforts(model_info, deployment_is_mapped=deployment_is_mapped),
             )
 
+            # Capabilities the per-deployment flags above do not cover are ORed here rather than in
+            # the merge branch, so the first deployment of a group counts like every later one.
+            model_group_info.supports_audio_input = _aggregate_declared_flag(
+                model_group_info.supports_audio_input, model_info.get("supports_audio_input")
+            )
+            model_group_info.supports_documents = _aggregate_declared_flag(
+                model_group_info.supports_documents, model_info.get("supports_pdf_input")
+            )
+            model_group_info.supports_video_input = _aggregate_declared_flag(
+                model_group_info.supports_video_input, model_info.get("supports_video_input")
+            )
+            _declared_params: Final = model_info.get("supported_openai_params")
+            model_group_info.supports_structured_output = _aggregate_declared_flag(
+                model_group_info.supports_structured_output,
+                None if not isinstance(_declared_params, list) else "response_format" in _declared_params,
+            )
+            # Only a level every deployment of the group agrees on is a default the group can state:
+            # one that a sibling would ignore is worse than none.
+            _default_effort: Final = model_info.get("default_reasoning_effort")
+            declared_default_efforts = (
+                declared_default_efforts + (_default_effort,)
+                if isinstance(_default_effort, str)
+                else declared_default_efforts
+            )
+
             if _deployment_tpm is not None:
                 if total_tpm is None:
                     total_tpm = 0
@@ -10137,6 +10178,11 @@ class Router:
                     total_otpm = 0
                 total_otpm += _deployment_otpm
         if model_group_info is not None:
+            ## UPDATE WITH THE LEVEL EVERY DEPLOYMENT OF THE GROUP AGREES ON AS ITS DEFAULT
+            declared_default_values: Final = frozenset(declared_default_efforts)
+            if len(declared_default_values) == 1:
+                model_group_info.default_reasoning_effort = next(iter(declared_default_values))
+
             ## UPDATE WITH TOTAL TPM/RPM FOR MODEL GROUP
             if total_tpm is not None:
                 model_group_info.tpm = total_tpm
