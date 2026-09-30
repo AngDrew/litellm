@@ -24,19 +24,33 @@ ACCOUNT: Final = "account-1"
 GRANT_ID: Final = f"legacy-carry:{ACCOUNT}"
 
 
-class FakeDB:
-    """Prisma-shaped stand-in that honours the grant primary key and nothing else."""
+TEAM_MODELS: Final = ["model-b", "model-a"]
 
-    def __init__(self, keys: list[dict[str, object]], grants: dict[str, int] | None = None) -> None:
+
+class FakeDB:
+    """Prisma-shaped stand-in honouring the team filter, the grant key and one policy per user."""
+
+    def __init__(
+        self,
+        keys: list[dict[str, object]],
+        grants: dict[str, int] | None = None,
+        team_models: list[str] | None = TEAM_MODELS,
+        policies: dict[str, dict[str, object]] | None = None,
+    ) -> None:
         self.keys = keys
         self.grants = dict(grants or {})
+        self.team_models = team_models
+        self.policies = dict(policies or {})  # user_id -> policy
         self.accounts: set[str] = set()
         self.cleared_tokens: list[object] = []
         self.executed: list[str] = []
 
     async def query_raw(self, sql: str, *values: object) -> list[dict[str, object]]:
         if '"LiteLLM_VerificationToken"' in sql:
-            return [dict(row) for row in self.keys]
+            return [dict(row) for row in self.keys if row["team_id"] == values[0]]
+        if '"LiteLLM_TeamTable"' in sql:
+            assert values[0] == migration.FLAT_TEAM_ID
+            return [] if self.team_models is None else [{"models": list(self.team_models)}]
         if '"LiteLLM_TokeninGrant"' in sql:
             return [{"idempotency_key": key, "amount_nano": amount} for key, amount in self.grants.items()]
         raise AssertionError(sql)
@@ -45,6 +59,13 @@ class FakeDB:
         self.executed.append(sql)
         if 'INSERT INTO "LiteLLM_TokeninAccount"' in sql:
             self.accounts.add(str(values[0]))
+        elif 'INSERT INTO "LiteLLM_TokeninPolicy"' in sql:
+            key, user_id, _hash, plan_id, models, rpm, parallel, effective = values
+            self.policies.setdefault(  # WHERE NOT EXISTS (any policy for the user)
+                str(user_id),
+                {"idempotency_key": key, "plan_id": plan_id, "models": models, "rpm_limit": rpm,
+                 "max_parallel_requests": parallel, "effective_at": effective},
+            )
         elif 'INSERT INTO "LiteLLM_TokeninGrant"' in sql:
             grant_id, _user_id, _hash, _plan, _kind, amount = values
             self.grants.setdefault(str(grant_id), int(amount))  # ON CONFLICT DO NOTHING
@@ -59,8 +80,16 @@ def _key(
     spend: float,
     expires: datetime | None = None,
     user_id: str = ACCOUNT,
+    team_id: str | None = None,
 ) -> dict[str, object]:
-    return {"token": token, "user_id": user_id, "max_budget": budget, "spend": spend, "expires": expires}
+    return {
+        "token": token,
+        "user_id": user_id,
+        "team_id": migration.FLAT_TEAM_ID if team_id is None else team_id,
+        "max_budget": budget,
+        "spend": spend,
+        "expires": expires,
+    }
 
 
 @pytest.mark.asyncio
@@ -203,6 +232,58 @@ async def test_carrying_account_keeps_exactly_its_carried_amount_and_only_credit
     assert summary["carry_usd"] == "6"
     assert summary["accounts_detail"][0]["keys"] == ["sk-live"]
     assert sorted(db.cleared_tokens) == ["sk-live", "sk-overdrawn"]
+
+
+@pytest.mark.asyncio
+async def test_internal_keys_outside_the_flat_team_are_never_carried_enrolled_or_cleared() -> None:
+    db: Final = FakeDB(
+        [
+            _key("sk-customer", 10.0, 4.0),
+            _key("sk-dashboard", 50.0, 0.0, user_id="admin", team_id="litellm-dashboard"),
+        ]
+    )
+    summary: Final = await migration.migrate(
+        client=db, apply=True, clear_legacy_key_budgets=True, now=NOW, log=lambda _line: None
+    )
+    assert db.accounts == {ACCOUNT}
+    assert db.grants == {GRANT_ID: 6_000_000_000}
+    assert db.cleared_tokens == ["sk-customer"]
+    assert set(db.policies) == {ACCOUNT}
+    assert summary["carry_usd"] == "6"
+
+
+@pytest.mark.asyncio
+async def test_every_enrolled_account_gets_a_payg_policy_with_the_flat_team_models_once() -> None:
+    db: Final = FakeDB([_key("sk-live", 10.0, 4.0), _key("sk-zero", 3.0, 3.0, user_id="account-2")])
+    for _ in range(2):
+        await migration.migrate(client=db, apply=True, clear_legacy_key_budgets=False, now=NOW, log=lambda _line: None)
+    assert set(db.policies) == {ACCOUNT, "account-2"}
+    policy: Final = db.policies[ACCOUNT]
+    assert policy["idempotency_key"] == f"legacy-carry-policy:{ACCOUNT}"
+    assert policy["plan_id"] == "payg"
+    assert policy["models"] == ["model-a", "model-b"]
+    assert (policy["rpm_limit"], policy["max_parallel_requests"]) == (120, 5)
+    assert policy["effective_at"] == NOW.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_an_existing_account_policy_is_kept() -> None:
+    admin_policy: Final = {"idempotency_key": "admin-set", "models": ["model-a"]}
+    db: Final = FakeDB([_key("sk-live", 10.0, 4.0)], policies={ACCOUNT: admin_policy})
+    await migration.migrate(client=db, apply=True, clear_legacy_key_budgets=False, now=NOW, log=lambda _line: None)
+    assert db.policies == {ACCOUNT: admin_policy}
+
+
+@pytest.mark.asyncio
+async def test_apply_refuses_to_enrol_when_the_flat_team_has_no_models() -> None:
+    db: Final = FakeDB([_key("sk-live", 10.0, 4.0)], team_models=[])
+    dry: Final = await migration.migrate(
+        client=db, apply=False, clear_legacy_key_budgets=False, now=NOW, log=lambda _line: None
+    )
+    assert dry["policy_models"] == []
+    with pytest.raises(RuntimeError, match="no models"):
+        await migration.migrate(client=db, apply=True, clear_legacy_key_budgets=True, now=NOW, log=lambda _line: None)
+    assert db.executed == []
 
 
 def test_non_local_target_needs_force_prod_and_an_explicit_acknowledgement(

@@ -22,6 +22,15 @@ then on, which is intended.
 Clearing covers the active capped keys of enrolled accounts. Uncapped keys have no cap to
 clear and are never touched, and expired keys are excluded so they cannot be revived.
 
+Scope: only keys of the Tokenin flat team are legacy customer keys. Enrolment makes every key
+of a user account-managed, so internal keys (dashboard, admin, other teams) are never read,
+carried, enrolled, or cleared.
+
+Policy: an enrolled account without a policy is refused by the ledger ("Account plan policy is
+not active"), so each enrolled account also gets a PAYG policy unless it already has one. Its
+models are the flat team's models, which is exactly what the legacy `all-team-models` keys
+could reach.
+
 Idempotency: the grant id and payload hash are fixed, so a re-run inserts nothing and
 reports the existing amount. A corrected amount needs a new idempotency key; never reuse
 an idempotency key with a changed payload.
@@ -56,10 +65,26 @@ GRANT_PLAN: Final = "payg"
 # different result is a reconciliation finding, not a payload change to accept.
 PAYLOAD_HASH: Final = "legacy-carry:v1"
 _LOCAL_HOSTS: Final = frozenset({"", "localhost", "127.0.0.1", "::1", "[::1]"})
+# Mirrors litellm/proxy/tokenin/plans.py; kept local because this script imports no litellm.
+FLAT_TEAM_ID: Final = "ac0b4e54-71a7-4e1f-bfaf-32fad13c09e9"
+# ponytail: mirrors the tokenin_plans `payg` entry (rpm 120, parallel 5); pass them in if the catalogue diverges.
+PAYG_RPM_LIMIT: Final = 120
+PAYG_MAX_PARALLEL: Final = 5
+POLICY_PAYLOAD_HASH: Final = "legacy-carry-policy:v1"
 
 _LEGACY_KEYS_QUERY: Final = (
     'SELECT "token", "user_id", "max_budget", "spend", "expires" FROM "LiteLLM_VerificationToken" '
-    'WHERE "user_id" IS NOT NULL ORDER BY "user_id", "token"'
+    'WHERE "user_id" IS NOT NULL AND "team_id" = $1 ORDER BY "user_id", "token"'
+)
+_FLAT_TEAM_MODELS_QUERY: Final = 'SELECT "models" FROM "LiteLLM_TeamTable" WHERE "team_id" = $1'
+# Never replaces a policy the account already has (an admin-set model list wins).
+_INSERT_POLICY_SQL: Final = (
+    'INSERT INTO "LiteLLM_TokeninPolicy" '
+    '("idempotency_key", "user_id", "payload_hash", "plan_id", "models", '
+    '"rpm_limit", "max_parallel_requests", "effective_at") '
+    "SELECT $1, $2, $3, $4, $5::text[], $6::int, $7::int, $8::timestamp "
+    'WHERE NOT EXISTS (SELECT 1 FROM "LiteLLM_TokeninPolicy" WHERE "user_id" = $2) '
+    'ON CONFLICT ("idempotency_key") DO NOTHING'
 )
 _CLEAR_LEGACY_KEY_BUDGETS_SQL: Final = (
     'UPDATE "LiteLLM_VerificationToken" SET "max_budget" = NULL, "budget_duration" = NULL, '
@@ -215,7 +240,9 @@ async def migrate(
     log: Callable[[str], None] = print,
 ) -> dict[str, object]:
     moment: Final = now or datetime.now(timezone.utc).replace(tzinfo=None)
-    rows: Final = await client.query_raw(_LEGACY_KEYS_QUERY)
+    rows: Final = await client.query_raw(_LEGACY_KEYS_QUERY, FLAT_TEAM_ID)
+    team_rows: Final = await client.query_raw(_FLAT_TEAM_MODELS_QUERY, FLAT_TEAM_ID)
+    models: Final = sorted({str(model) for model in (team_rows[0]["models"] or [])}) if team_rows else []
     existing_rows: Final = await client.query_raw(
         'SELECT "idempotency_key", "amount_nano" FROM "LiteLLM_TokeninGrant" '
         "WHERE \"idempotency_key\" LIKE 'legacy-carry:%'"
@@ -229,12 +256,27 @@ async def migrate(
             f"active_keys={len(plan.active_keys)} credited_keys={len(plan.keys)} {plan.detail}"
         )
 
+    if apply and not models and any(plan.enrol and plan.action != "conflict" for plan in plans):
+        # An enrolled account with no policy models is refused on every request.
+        raise RuntimeError(f"Flat team {FLAT_TEAM_ID} has no models; refusing to enrol accounts without a policy")
+
     if apply:
         for plan in plans:
             if plan.action == "conflict" or not plan.enrol:
                 continue
             await client.execute_raw(
                 'INSERT INTO "LiteLLM_TokeninAccount" ("user_id") VALUES ($1) ON CONFLICT DO NOTHING', plan.user_id
+            )
+            await client.execute_raw(
+                _INSERT_POLICY_SQL,
+                f"legacy-carry-policy:{plan.user_id}",
+                plan.user_id,
+                POLICY_PAYLOAD_HASH,
+                GRANT_PLAN,
+                models,
+                PAYG_RPM_LIMIT,
+                PAYG_MAX_PARALLEL,
+                moment.isoformat(),
             )
             if plan.amount_nano > 0:
                 await client.execute_raw(
@@ -256,6 +298,7 @@ async def migrate(
         "applied": apply,
         "cleared_legacy_key_budgets": bool(apply and clear_legacy_key_budgets),
         "accounts": len(plans),
+        "policy_models": models,
         "keys": sum(len(plan.keys) for plan in plans),
         "active_keys": sum(len(plan.active_keys) for plan in plans),
         "uncapped_accounts": [plan.user_id for plan in plans if plan.uncapped_only],
