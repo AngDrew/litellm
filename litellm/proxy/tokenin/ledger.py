@@ -6,6 +6,8 @@ parameters reach Postgres untyped. They convert through :func:`as_naive_utc` and
 """
 
 import math
+import os
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -15,10 +17,26 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
+from litellm._logging import verbose_proxy_logger
 from litellm.proxy.utils import PrismaClient
 
 _SCALE: Final = Decimal(1_000_000_000)
 _MAX_NANO: Final = 2**63 - 1
+HOLD_INFLIGHT_TTL_SECONDS: Final = max(int(os.environ.get("TOKENIN_ACCOUNT_HOLD_INFLIGHT_TTL_SECONDS", "900")), 1)
+CONCURRENCY_DENIAL_ALERT_THRESHOLD: Final = max(int(os.environ.get("TOKENIN_ACCOUNT_CONCURRENCY_DENIAL_ALERT_THRESHOLD", "3")), 1)
+_DENIAL_CACHE: dict[str, list[float]] = {}
+
+
+def _log_concurrency_denial(user_id: str) -> None:
+    now: Final = time.monotonic()
+    recent: Final = [moment for moment in _DENIAL_CACHE.get(user_id, []) if now - moment < 300]
+    recent.append(now)
+    _DENIAL_CACHE[user_id] = recent
+    for account, moments in tuple(_DENIAL_CACHE.items()):
+        if not moments:
+            del _DENIAL_CACHE[account]  # mutable-ok: bounded per-active-account process memory
+    if len(recent) >= CONCURRENCY_DENIAL_ALERT_THRESHOLD:
+        verbose_proxy_logger.warning("Tokenin account %s concurrency refusals=%s in 300s", user_id, len(recent))
 _GRANTS_WITH_SPEND_QUERY: Final = (
     'SELECT g."idempotency_key", g."kind", g."plan_id", g."amount_nano", '
     'g."subscription_id", g."period_index", g."period_start", g."period_end", '
@@ -202,6 +220,26 @@ def _matching_policy(
     return max(candidates, key=lambda candidate: candidate[0])[1]
 
 
+def _effective_limits(policies: Sequence[Mapping[str, object]], now: datetime) -> tuple[int, int] | None:
+    active: Final = tuple(
+        policy
+        for policy in policies
+        if policy["plan_id"] == "payg" and (effective := as_naive_utc(policy["effective_at"])) is not None and effective <= now
+    )
+    if not active:
+        return None
+    selected: Final = dict(max((as_naive_utc(policy["effective_at"]), policy) for policy in active)[1])
+    return int(selected["rpm_limit"]), int(selected["max_parallel_requests"])
+
+
+def _reserve_limits(policies: Sequence[Mapping[str, object]], policy: Mapping[str, object], now: datetime) -> tuple[int, int]:
+    rpm, concurrent = int(policy["rpm_limit"]), int(policy["max_parallel_requests"])
+    payg_limits: Final = _effective_limits(policies, now) if policy["plan_id"] != "payg" else None
+    if payg_limits is not None:
+        rpm, concurrent = max(rpm, payg_limits[0]), max(concurrent, payg_limits[1])  # rebind-ok: payg floors, never lowers
+    return rpm, concurrent
+
+
 async def reserve_account_request(
     prisma_client: PrismaClient,
     user_id: str,
@@ -282,16 +320,20 @@ async def reserve_account_request(
         policy: Final = _matching_policy(policies=policies, plan_id=plan_id, now=now, period_start=period_start)
         if model not in policy["models"]:
             raise HTTPException(status_code=403, detail="Model not allowed by account plan")
+        rpm_limit, max_parallel_requests = _reserve_limits(policies=policies, policy=policy, now=now)
         limits: Final = await tx.query_raw(
             "SELECT COUNT(*) FILTER (WHERE \"admitted_at\" > $2::timestamp - INTERVAL '60 seconds') AS rpm, "
-            "COUNT(*) FILTER (WHERE \"state\" IN ('held', 'uncertain')) AS concurrent "
+            "COUNT(*) FILTER (WHERE \"state\" = 'held' "
+            "AND \"admitted_at\" > $2::timestamp - ($3 * INTERVAL '1 second')) AS concurrent "
             'FROM "LiteLLM_TokeninHold" WHERE "user_id" = $1',
             user_id,
             as_sql_timestamp(now),
+            HOLD_INFLIGHT_TTL_SECONDS,
         )
-        if int(limits[0]["rpm"]) >= int(policy["rpm_limit"]):
+        if int(limits[0]["rpm"]) >= rpm_limit:
             raise HTTPException(status_code=429, detail="Account RPM limit exceeded")
-        if int(limits[0]["concurrent"]) >= int(policy["max_parallel_requests"]):
+        if int(limits[0]["concurrent"]) >= max_parallel_requests:
+            _log_concurrency_denial(user_id)
             raise HTTPException(status_code=429, detail="Account concurrency limit exceeded")
         allocation: Final = allocate_fifo(eligible_grants(grants=remaining_grants, now=now), estimated_nano)
         await tx.execute_raw(
@@ -318,73 +360,78 @@ async def reserve_account_request(
 async def settle_account_request(
     prisma_client: PrismaClient, request_id: str, actual_cost: float, *, allow_uncertain: bool = False
 ) -> int:
-    charged_nano: Final = to_nano_ceil(actual_cost, allow_zero=True)
     async with prisma_client.db.tx() as tx:
-        identity: Final = await tx.query_raw(
-            'SELECT "user_id" FROM "LiteLLM_TokeninHold" WHERE "request_id" = $1', request_id
-        )
-        if not identity:
-            raise HTTPException(status_code=503, detail="Account reservation is missing")
-        user_id: Final = identity[0]["user_id"]
-        account: Final = await tx.query_raw(
-            'SELECT "user_id", "debt_nano" FROM "LiteLLM_TokeninAccount" WHERE "user_id" = $1 FOR UPDATE', user_id
-        )
-        existing: Final = await tx.query_raw(
-            'SELECT "state", "charged_nano" FROM "LiteLLM_TokeninHold" WHERE "request_id" = $1', request_id
-        )
-        if existing[0]["state"] == "settled":
-            if int(existing[0]["charged_nano"]) != charged_nano:
-                raise HTTPException(status_code=409, detail="Request cost changed after settlement")
-            return charged_nano
-        if existing[0]["state"] != "held" and not (allow_uncertain and existing[0]["state"] == "uncertain"):
-            raise HTTPException(status_code=503, detail="Reservation needs manual reconciliation")
-        allocation: Final = await tx.query_raw(
-            'SELECT a."grant_id", a."amount_nano" FROM "LiteLLM_TokeninAllocation" a '
-            'JOIN "LiteLLM_TokeninGrant" g ON g."idempotency_key" = a."grant_id" '
-            'WHERE a."request_id" = $1 ORDER BY g."period_start" NULLS LAST, g."created_at", g."idempotency_key"',
-            request_id,
-        )
-        remaining = charged_nano
-        for entry in allocation:
-            spent: Final = min(remaining, int(entry["amount_nano"]))
-            await tx.execute_raw(
-                'UPDATE "LiteLLM_TokeninAllocation" SET "amount_nano" = $3 WHERE "request_id" = $1 AND "grant_id" = $2',
-                request_id,
-                entry["grant_id"],
-                spent,
-            )
-            remaining -= spent  # rebind-ok: refund any unused reservation after FIFO actual charge
-        if remaining:
-            eligible: Final = eligible_grants(await load_grants(tx, user_id), await _now(tx))
-            payable: Final = min(remaining, sum(grant.available_nano for grant in eligible))
-            if payable:
-                for grant_id, amount in allocate_fifo(eligible, payable):
-                    await tx.execute_raw(
-                        'INSERT INTO "LiteLLM_TokeninAllocation" ("request_id", "grant_id", "amount_nano") '
-                        'VALUES ($1,$2,$3) ON CONFLICT ("request_id", "grant_id") DO UPDATE '
-                        'SET "amount_nano" = "LiteLLM_TokeninAllocation"."amount_nano" + EXCLUDED."amount_nano"',
-                        request_id,
-                        grant_id,
-                        amount,
-                    )
-                remaining -= payable  # rebind-ok: settle excess from currently eligible credit before debt
-        if remaining:
-            if int(account[0]["debt_nano"]) + remaining > _MAX_NANO:
-                raise HTTPException(status_code=503, detail="Account debt exceeds supported range")
-            await tx.execute_raw(
-                'UPDATE "LiteLLM_TokeninAccount" SET "debt_nano" = "debt_nano" + $2 WHERE "user_id" = $1',
-                user_id,
-                remaining,
-            )
-        await tx.execute_raw(
-            'UPDATE "LiteLLM_TokeninHold" SET "state" = \'settled\', '
-            '"charged_nano" = $2, "settled_at" = clock_timestamp() AT TIME ZONE \'UTC\' '
-            'WHERE "request_id" = $1',
-            request_id,
-            charged_nano,
-        )
-        return charged_nano
+        return await settle_account_request_tx(tx, request_id, actual_cost, allow_uncertain=allow_uncertain)
 
+
+async def settle_account_request_tx(
+    tx: Any, request_id: str, actual_cost: float, *, allow_uncertain: bool = False
+) -> int:
+    charged_nano: Final = to_nano_ceil(actual_cost, allow_zero=True)
+    identity: Final = await tx.query_raw(
+        'SELECT "user_id" FROM "LiteLLM_TokeninHold" WHERE "request_id" = $1', request_id
+    )
+    if not identity:
+        raise HTTPException(status_code=503, detail="Account reservation is missing")
+    user_id: Final = identity[0]["user_id"]
+    account: Final = await tx.query_raw(
+        'SELECT "user_id", "debt_nano" FROM "LiteLLM_TokeninAccount" WHERE "user_id" = $1 FOR UPDATE', user_id
+    )
+    existing: Final = await tx.query_raw(
+        'SELECT "state", "charged_nano" FROM "LiteLLM_TokeninHold" WHERE "request_id" = $1', request_id
+    )
+    if existing[0]["state"] == "settled":
+        if int(existing[0]["charged_nano"]) != charged_nano:
+            raise HTTPException(status_code=409, detail="Request cost changed after settlement")
+        return charged_nano
+    if existing[0]["state"] != "held" and not (allow_uncertain and existing[0]["state"] == "uncertain"):
+        raise HTTPException(status_code=503, detail="Reservation needs manual reconciliation")
+    allocation: Final = await tx.query_raw(
+        'SELECT a."grant_id", a."amount_nano" FROM "LiteLLM_TokeninAllocation" a '
+        'JOIN "LiteLLM_TokeninGrant" g ON g."idempotency_key" = a."grant_id" '
+        'WHERE a."request_id" = $1 ORDER BY g."period_start" NULLS LAST, g."created_at", g."idempotency_key"',
+        request_id,
+    )
+    remaining = charged_nano
+    for entry in allocation:
+        spent: Final = min(remaining, int(entry["amount_nano"]))
+        await tx.execute_raw(
+            'UPDATE "LiteLLM_TokeninAllocation" SET "amount_nano" = $3 WHERE "request_id" = $1 AND "grant_id" = $2',
+            request_id,
+            entry["grant_id"],
+            spent,
+        )
+        remaining -= spent  # rebind-ok: refund any unused reservation after FIFO actual charge
+    if remaining:
+        eligible: Final = eligible_grants(await load_grants(tx, user_id), await _now(tx))
+        payable: Final = min(remaining, sum(grant.available_nano for grant in eligible))
+        if payable:
+            for grant_id, amount in allocate_fifo(eligible, payable):
+                await tx.execute_raw(
+                    'INSERT INTO "LiteLLM_TokeninAllocation" ("request_id", "grant_id", "amount_nano") '
+                    'VALUES ($1,$2,$3) ON CONFLICT ("request_id", "grant_id") DO UPDATE '
+                    'SET "amount_nano" = "LiteLLM_TokeninAllocation"."amount_nano" + EXCLUDED."amount_nano"',
+                    request_id,
+                    grant_id,
+                    amount,
+                )
+            remaining -= payable  # rebind-ok: settle excess from currently eligible credit before debt
+    if remaining:
+        if int(account[0]["debt_nano"]) + remaining > _MAX_NANO:
+            raise HTTPException(status_code=503, detail="Account debt exceeds supported range")
+        await tx.execute_raw(
+            'UPDATE "LiteLLM_TokeninAccount" SET "debt_nano" = "debt_nano" + $2 WHERE "user_id" = $1',
+            user_id,
+            remaining,
+        )
+    await tx.execute_raw(
+        'UPDATE "LiteLLM_TokeninHold" SET "state" = \'settled\', '
+        '"charged_nano" = $2, "settled_at" = clock_timestamp() AT TIME ZONE \'UTC\' '
+        'WHERE "request_id" = $1',
+        request_id,
+        charged_nano,
+    )
+    return charged_nano
 
 async def cancel_account_request(
     prisma_client: PrismaClient, request_id: str, *, allow_uncertain: bool = False
@@ -422,29 +469,31 @@ async def cancel_account_request(
         return True
 
 
+async def mark_account_request_uncertain_tx(tx: Any, request_id: str) -> bool:
+    identity: Final = await tx.query_raw(
+        'SELECT "user_id" FROM "LiteLLM_TokeninHold" WHERE "request_id" = $1', request_id
+    )
+    if not identity:
+        return False
+    await tx.query_raw(
+        'SELECT "user_id" FROM "LiteLLM_TokeninAccount" WHERE "user_id" = $1 FOR UPDATE',
+        identity[0]["user_id"],
+    )
+    current: Final = await tx.query_raw('SELECT "state" FROM "LiteLLM_TokeninHold" WHERE "request_id" = $1', request_id)
+    if not current:
+        return False
+    state: Final = current[0]["state"]
+    if state == "uncertain":
+        return True
+    if state != "held":
+        return False
+    await tx.execute_raw(
+        'UPDATE "LiteLLM_TokeninHold" SET "state" = \'uncertain\' WHERE "request_id" = $1', request_id
+    )
+    return True
+
+
 async def mark_account_request_uncertain(prisma_client: PrismaClient, request_id: str) -> bool:
     """Keep the reservation when billing outcome is unknown, so nothing is refunded speculatively."""
     async with prisma_client.db.tx() as tx:
-        identity: Final = await tx.query_raw(
-            'SELECT "user_id" FROM "LiteLLM_TokeninHold" WHERE "request_id" = $1', request_id
-        )
-        if not identity:
-            return False
-        await tx.query_raw(
-            'SELECT "user_id" FROM "LiteLLM_TokeninAccount" WHERE "user_id" = $1 FOR UPDATE',
-            identity[0]["user_id"],
-        )
-        current: Final = await tx.query_raw(
-            'SELECT "state" FROM "LiteLLM_TokeninHold" WHERE "request_id" = $1', request_id
-        )
-        if not current:
-            return False
-        state: Final = current[0]["state"]
-        if state == "uncertain":
-            return True
-        if state != "held":
-            return False
-        await tx.execute_raw(
-            'UPDATE "LiteLLM_TokeninHold" SET "state" = \'uncertain\' WHERE "request_id" = $1', request_id
-        )
-        return True
+        return await mark_account_request_uncertain_tx(tx, request_id)

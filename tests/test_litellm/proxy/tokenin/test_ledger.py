@@ -185,7 +185,10 @@ class LedgerDB:
             return [
                 {
                     "rpm": sum(hold["admitted_at"] > self.now - timedelta(seconds=60) for hold in self.holds.values()),
-                    "concurrent": sum(hold["state"] in ("held", "uncertain") for hold in self.holds.values()),
+                    "concurrent": sum(
+                        hold["state"] == "held" and hold["admitted_at"] > self.now - timedelta(seconds=int(values[2]))
+                        for hold in self.holds.values()
+                    ),
                 }
             ]
         if '"LiteLLM_TokeninAllocation"' in sql and "JOIN" in sql:
@@ -269,6 +272,7 @@ async def test_policy_model_and_rpm_reject_across_keys_and_future_policy_is_igno
     db: Final = LedgerDB()
     db.grants = {"paid": grant("paid", 5 * NANO, FEB28, MAR31, 1)}
     db.policies[0]["rpm_limit"] = 1
+    db.policies[1]["rpm_limit"] = 1
     db.policies.append(
         {
             "plan_id": "medium",

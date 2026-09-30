@@ -9358,6 +9358,18 @@ class ProxyStartupEvent:
             misfire_grace_time=APSCHEDULER_MISFIRE_GRACE_TIME,
         )
 
+        from litellm.proxy.tokenin.holds import HOLD_REAPER_INTERVAL_SECONDS, account_hold_reaper
+
+        scheduler.add_job(
+            account_hold_reaper,
+            "interval",
+            seconds=HOLD_REAPER_INTERVAL_SECONDS,
+            args=[prisma_client],
+            id="tokenin_account_hold_reaper_job",
+            replace_existing=True,
+            misfire_grace_time=APSCHEDULER_MISFIRE_GRACE_TIME,
+        )
+
         ### MONITOR SPEND LOGS QUEUE (queue-size-based job) ###
         if general_settings.get("disable_spend_logs", False) is False:
             from litellm.proxy.utils import _monitor_spend_logs_queue

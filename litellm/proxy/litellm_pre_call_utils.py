@@ -1388,6 +1388,11 @@ class LiteLLMProxyRequestSetup:
                 _bucket: Final = data.setdefault(_bucket_name, {})
                 if isinstance(_bucket, dict):
                     _bucket["user_api_key_tokenin_account_hold_id"] = user_api_key_dict.tokenin_account_hold_id
+            request_metadata: Final = data.setdefault("metadata", {})
+            if isinstance(request_metadata, dict):
+                spend_logs_bucket: Final = request_metadata.setdefault("spend_logs_metadata", {})
+                if isinstance(spend_logs_bucket, dict):
+                    spend_logs_bucket["tokenin_account_hold_id"] = user_api_key_dict.tokenin_account_hold_id
         if user_api_key_dict.matched_model_access_groups:
             data[_metadata_variable_name][MODEL_ACCESS_GROUP_METADATA_KEY] = (
                 user_api_key_dict.matched_model_access_groups
