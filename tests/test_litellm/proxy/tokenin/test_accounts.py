@@ -806,6 +806,25 @@ async def test_managed_model_lists_are_request_local_policy_scopes(store: FakeTx
     assert token.team_models == []
 
 
+def test_dynamic_model_read_route_is_info_for_common_checks() -> None:
+    from litellm.proxy.auth.route_checks import RouteChecks
+
+    token: Final = UserAPIKeyAuth(user_id=ACCOUNT, team_id=FLAT_TEAM_ID, user_role=None, models=[])
+    request: Final = Request({"type": "http", "method": "GET", "path": "/v1/models/model-a", "headers": []})
+    for route in ("/v1/models/model-a", "/models/model-a"):
+        assert RouteChecks.is_info_route(route) is True
+        assert RouteChecks.is_llm_api_route(route) is False
+        RouteChecks.non_proxy_admin_allowed_routes_check(
+            user_obj=None,
+            _user_role=None,
+            route=route,
+            request=request,
+            valid_token=token,
+            request_data={},
+        )
+    assert RouteChecks.is_info_route("/v1/models/model-a/nested") is False
+
+
 @pytest.mark.asyncio
 async def test_managed_model_detail_filters_to_policy_without_admin_model_info(
     store: FakeTx, monkeypatch: pytest.MonkeyPatch

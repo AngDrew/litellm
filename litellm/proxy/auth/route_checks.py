@@ -453,9 +453,9 @@ class RouteChecks:
     @staticmethod
     def is_info_route(route: str) -> bool:
         """
-        Check if route is an info route
+        Check if route is an info route, including low-cardinality dynamic templates.
         """
-        return route in LiteLLMRoutes.info_routes.value
+        return RouteChecks.check_route_access(route=route, allowed_routes=LiteLLMRoutes.info_routes.value)
 
     @staticmethod
     def _is_azure_openai_route(route: str) -> bool:

@@ -605,6 +605,8 @@ class LiteLLMRoutes(enum.Enum):
         "/user/filter/ui",
         "/models",
         "/v1/models",
+        "/models/{model_id}",
+        "/v1/models/{model_id}",
         "/sso/get/ui_settings",
         "/get/user_banner",
     ]
