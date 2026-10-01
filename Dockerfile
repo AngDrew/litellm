@@ -37,6 +37,7 @@ USER root
 COPY --from=uvbin /uv /usr/local/bin/uv
 COPY --from=uvbin /uvx /usr/local/bin/uvx
 
+# nodejs is pinned to OpenSSL 3.x for the same reason as in the runtime stage.
 RUN apk add --no-cache \
     bash \
     gcc \
@@ -45,7 +46,9 @@ RUN apk add --no-cache \
     rust \
     openssl \
     openssl-dev \
-    nodejs \
+    nodejs-26 \
+    '!openssl-4.0-libcrypto' \
+    '!openssl-4.0-libssl' \
     npm \
     libsndfile
 
@@ -101,8 +104,11 @@ FROM $LITELLM_RUNTIME_IMAGE AS runtime
 
 USER root
 
-# node (without npm) is required by the prisma CLI at runtime
-RUN apk add --no-cache bash openssl tzdata nodejs python-3.13 libsndfile
+# node (without npm) is required by the prisma CLI at runtime.
+# Newer nodejs-26 revisions link OpenSSL 4.0, whose libcrypto package owns the
+# same /etc/ssl files as `openssl` 3.x and aborts the install. Forbidding the
+# 4.0 libs keeps node, python and prisma on the OpenSSL 3.x the base ships.
+RUN apk add --no-cache bash openssl tzdata nodejs-26 '!openssl-4.0-libcrypto' '!openssl-4.0-libssl' python-3.13 libsndfile
 
 WORKDIR /app
 ENV PATH="/app/.venv/bin:${PATH}" \
