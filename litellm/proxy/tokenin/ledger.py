@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
+from litellm._logging import verbose_proxy_logger
 from litellm.proxy.utils import PrismaClient
 
 _SCALE: Final = Decimal(1_000_000_000)
@@ -202,6 +203,21 @@ def _matching_policy(
     return max(candidates, key=lambda candidate: candidate[0])[1]
 
 
+def _with_live_payg_limits(policy: Mapping[str, object]) -> Mapping[str, object]:
+    """PAYG has no period to re-snapshot on, so its rate limits follow the configured payg plan.
+    Fixed plans keep the snapshot taken at purchase; the next period's purchase picks up config changes."""
+    from litellm.proxy.tokenin.plans import load_plans
+
+    try:
+        live: Final = next((plan for plan in load_plans() if plan.id == "payg"), None)
+    except Exception:
+        verbose_proxy_logger.exception("Tokenin payg plan unreadable; using stored policy limits")
+        return policy
+    if live is None:
+        return policy
+    return {**policy, "rpm_limit": live.rpm_limit, "max_parallel_requests": live.max_parallel_requests}
+
+
 async def reserve_account_request(
     prisma_client: PrismaClient,
     user_id: str,
@@ -279,12 +295,17 @@ async def reserve_account_request(
             user_id,
             as_sql_timestamp(now),
         )
-        policy: Final = _matching_policy(policies=policies, plan_id=plan_id, now=now, period_start=period_start)
+        matched: Final = _matching_policy(policies=policies, plan_id=plan_id, now=now, period_start=period_start)
+        policy: Final = _with_live_payg_limits(matched) if plan_id == "payg" else matched
         if model not in policy["models"]:
             raise HTTPException(status_code=403, detail="Model not allowed by account plan")
         limits: Final = await tx.query_raw(
             "SELECT COUNT(*) FILTER (WHERE \"admitted_at\" > $2::timestamp - INTERVAL '60 seconds') AS rpm, "
-            "COUNT(*) FILTER (WHERE \"state\" IN ('held', 'uncertain')) AS concurrent "
+            # Concurrency counts in-flight work only. 'uncertain' requests already ended (credit stays
+            # reserved via allocations), and a 'held' row past the window was orphaned by a crash/restart.
+            # ponytail: fixed 30-minute window, make it configurable if legit streams run longer
+            "COUNT(*) FILTER (WHERE \"state\" = 'held' "
+            "AND \"admitted_at\" > $2::timestamp - INTERVAL '30 minutes') AS concurrent "
             'FROM "LiteLLM_TokeninHold" WHERE "user_id" = $1',
             user_id,
             as_sql_timestamp(now),

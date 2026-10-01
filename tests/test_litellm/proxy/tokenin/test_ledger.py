@@ -185,7 +185,10 @@ class LedgerDB:
             return [
                 {
                     "rpm": sum(hold["admitted_at"] > self.now - timedelta(seconds=60) for hold in self.holds.values()),
-                    "concurrent": sum(hold["state"] in ("held", "uncertain") for hold in self.holds.values()),
+                    "concurrent": sum(
+                        hold["state"] == "held" and hold["admitted_at"] > self.now - timedelta(minutes=30)
+                        for hold in self.holds.values()
+                    ),
                 }
             ]
         if '"LiteLLM_TokeninAllocation"' in sql and "JOIN" in sql:
@@ -262,6 +265,46 @@ async def test_shared_two_key_reservations_atomic_and_refund_after_settlement() 
     assert await reserve_account_request(db, ACCOUNT, "key-3", "allowed", 1.0) == (("old", NANO),)
     assert db.allocations[("key-1", "old")] == 2 * NANO
     assert db.allocations[("key-2", "old")] == NANO
+
+
+@pytest.mark.asyncio
+async def test_uncertain_and_orphaned_holds_free_concurrency_but_keep_credit_reserved() -> None:
+    db: Final = LedgerDB()
+    db.grants = {"paid": grant("paid", 5 * NANO, FEB28, MAR31, 1)}
+    await reserve_account_request(db, ACCOUNT, "stream-died", "allowed", 1.0)
+    await reserve_account_request(db, ACCOUNT, "orphaned", "allowed", 1.0)
+    with pytest.raises(HTTPException) as full:
+        await reserve_account_request(db, ACCOUNT, "blocked", "allowed", 1.0)
+    assert full.value.status_code == 429
+    assert await mark_account_request_uncertain(db, "stream-died")
+    db.holds["orphaned"]["admitted_at"] = db.now - timedelta(minutes=31)
+    await reserve_account_request(db, ACCOUNT, "next", "allowed", 1.0)
+    assert db.allocations[("stream-died", "paid")] == NANO
+    assert db.allocations[("orphaned", "paid")] == NANO
+
+
+@pytest.mark.asyncio
+async def test_payg_limits_follow_config_but_fixed_plan_keeps_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litellm.proxy.tokenin import plans
+
+    live = [
+        plans.TokeninPlan(id="payg", name="PAYG", kind="payg", rpm_limit=10, max_parallel_requests=3, max_budget=0),
+        plans.TokeninPlan(id="medium", name="M", kind="fixed", rpm_limit=10, max_parallel_requests=9, max_budget=1),
+    ]
+    monkeypatch.setattr(plans, "load_plans", lambda: live)
+    payg: Final = LedgerDB()
+    payg.grants = {"prepaid": grant("prepaid", 5 * NANO, kind="payg")}
+    for request_id in ("a", "b", "c"):  # stored payg policy says 2, config says 3
+        await reserve_account_request(payg, ACCOUNT, request_id, "allowed", 1.0)
+    with pytest.raises(HTTPException):
+        await reserve_account_request(payg, ACCOUNT, "d", "allowed", 1.0)
+
+    fixed: Final = LedgerDB()
+    fixed.grants = {"paid": grant("paid", 5 * NANO, FEB28, MAR31, 1)}
+    for request_id in ("a", "b"):  # medium snapshot of 2 wins over config's 9
+        await reserve_account_request(fixed, ACCOUNT, request_id, "allowed", 1.0)
+    with pytest.raises(HTTPException):
+        await reserve_account_request(fixed, ACCOUNT, "c", "allowed", 1.0)
 
 
 @pytest.mark.asyncio
