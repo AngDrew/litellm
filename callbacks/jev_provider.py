@@ -250,7 +250,7 @@ class TypeSafeDecisions(CustomLLM):
     def streaming(self, *args: Any, **kwargs: Any) -> Any:
         raise CustomLLMError(status_code=400, message="decisions answers are typed, not streamed")
 
-    async def astreaming(self, *args: Any, **kwargs: Any) -> Any:
+    def astreaming(self, *args: Any, **kwargs: Any) -> Any:
         raise CustomLLMError(status_code=400, message="decisions answers are typed, not streamed")
 
 
