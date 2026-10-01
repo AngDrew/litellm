@@ -2796,6 +2796,7 @@ async def _authorize_authenticated_request(
             user_id=user_api_key_auth_obj.user_id,
             team_id=user_api_key_auth_obj.team_id,
             route=route,
+            method=request.method,
         )
         await _run_centralized_common_checks(
             user_api_key_auth_obj=user_api_key_auth_obj,

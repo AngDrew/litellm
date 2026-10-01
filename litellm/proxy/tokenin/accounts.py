@@ -8,7 +8,7 @@ import hashlib
 import hmac
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Final, Literal
@@ -26,7 +26,23 @@ from litellm.proxy.utils import PrismaClient
 router = APIRouter()
 _NANODOLLARS: Final = Decimal("1000000000")
 _MAX_NANODOLLARS: Final = 2**63 - 1
-_MANAGED_ADMISSION_ROUTES: Final = frozenset({"/chat/completions", "/v1/chat/completions"})
+_MANAGED_ADMISSION_ROUTES: Final = frozenset(
+    {
+        "/chat/completions",
+        "/v1/chat/completions",
+        "/responses",
+        "/v1/responses",
+        "/embeddings",
+        "/v1/embeddings",
+        "/v1/messages",
+        "/images/generations",
+        "/v1/images/generations",
+    }
+)
+_MANAGED_MODEL_READ_ROUTES: Final = frozenset({"/models", "/v1/models"})
+_MANAGED_ADMIN_MODEL_ROUTES: Final = frozenset(
+    {"/model/info", "/v1/model/info", "/v2/model/info", "/model_group/info", "/model/new", "/model/update", "/model/delete"}
+)
 _HOLD_STATES: Final = ("held", "settled", "uncertain", "cancelled")
 
 
@@ -205,8 +221,52 @@ async def is_managed_account(prisma_client: PrismaClient, user_id: str | None) -
     return bool(rows)
 
 
+async def _account_policy_models(prisma_client: PrismaClient, user_id: str) -> tuple[str, ...]:
+    """Current account-policy aliases for request-local model reads."""
+    async with prisma_client.db.tx() as tx:
+        grants: Final = await ledger.load_grants(tx, user_id)
+        now: Final = await ledger._now(tx)  # pyright: ignore[reportPrivateUsage]  # same-owned clock as admission
+        plan_id, period_start = ledger._active_plan(grants=grants, now=now)  # pyright: ignore[reportPrivateUsage]
+        policies: Final = await tx.query_raw(
+            'SELECT "plan_id", "models", "rpm_limit", "max_parallel_requests", "effective_at" '
+            'FROM "LiteLLM_TokeninPolicy" WHERE "user_id" = $1 AND "effective_at" <= $2::timestamp',
+            user_id,
+            ledger.as_sql_timestamp(now),
+        )
+        policy: Final = ledger._matching_policy(  # pyright: ignore[reportPrivateUsage]
+            policies=policies, plan_id=plan_id, now=now, period_start=period_start
+        )
+    models: object = policy["models"]
+    if not isinstance(models, Sequence) or isinstance(models, str):
+        raise HTTPException(status_code=503, detail="Managed account policy is unavailable")
+    return tuple(model for model in models if isinstance(model, str) and model)
+
+
+async def current_account_models(prisma_client: PrismaClient | None, user_id: str | None) -> tuple[str, ...] | None:
+    """Return the live account policy's model aliases, or None when the key is unmanaged."""
+    if prisma_client is None or not await is_managed_account(prisma_client, user_id):
+        return None
+    return await _account_policy_models(prisma_client=prisma_client, user_id=user_id) if user_id is not None else None
+
+
+def is_account_model_read_route(route: str, method: str | None) -> bool:
+    if method is None or method.upper() != "GET":
+        return False
+    if route in _MANAGED_MODEL_READ_ROUTES:
+        return True
+    for prefix in ("/models/", "/v1/models/"):
+        if route.startswith(prefix):
+            value: Final = route[len(prefix) :]
+            return bool(value) and "/" not in value
+    return False
+
+
 async def require_request_admission(
-    prisma_client: PrismaClient | None, user_id: str | None, team_id: str | None, route: str
+    prisma_client: PrismaClient | None,
+    user_id: str | None,
+    team_id: str | None,
+    route: str,
+    method: str | None = None,
 ) -> None:
     if not account_v2_enabled():
         return
@@ -214,7 +274,8 @@ async def require_request_admission(
     from litellm.proxy.auth.route_checks import RouteChecks
     from litellm.proxy.tokenin.plans import FLAT_TEAM_ID
 
-    if not RouteChecks.is_llm_api_route(route):
+    account_model_read: Final = is_account_model_read_route(route=route, method=method)
+    if not RouteChecks.is_llm_api_route(route) and not account_model_read:
         # Pass-through routes forward to a real provider with the proxy's credentials, so
         # an enrolled account must not reach them either: they would spend outside the
         # ledger. Every other non-LLM route is unrelated to account spend and passes.
@@ -222,7 +283,7 @@ async def require_request_admission(
             InitPassThroughEndpointHelpers,
         )
 
-        if not (
+        if route not in _MANAGED_ADMIN_MODEL_ROUTES and not (
             InitPassThroughEndpointHelpers.is_registered_pass_through_route(route=route)
             or RouteChecks.is_auth_enforced_pass_through_route(route)
         ):
@@ -241,8 +302,10 @@ async def require_request_admission(
                 status_code=503,
                 detail="Managed account spend conflicts with apply_user_budget_to_team_keys",
             )
+        if account_model_read:
+            return
         if route not in _MANAGED_ADMISSION_ROUTES:
-            raise HTTPException(status_code=503, detail="Managed accounts support only chat completions in this phase")
+            raise HTTPException(status_code=503, detail="Managed accounts support only approved account routes")
 
 
 async def reserve_managed_request(
@@ -326,7 +389,7 @@ async def account_status() -> dict[str, object]:
         "v2_enabled": account_v2_enabled(),
         "spend_enabled": account_spend_enabled(),
         "enforcement_active": account_spend_enabled(),
-        "supported_routes": sorted(_MANAGED_ADMISSION_ROUTES),
+        "supported_routes": sorted(_MANAGED_ADMISSION_ROUTES | _MANAGED_MODEL_READ_ROUTES),
     }
 
 

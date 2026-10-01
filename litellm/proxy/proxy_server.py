@@ -10091,6 +10091,18 @@ class ProxyStartupEvent:
 
 
 #### API ENDPOINTS ####
+async def _account_policy_auth(
+    user_api_key_dict: UserAPIKeyAuth,
+) -> tuple[tuple[str, ...], UserAPIKeyAuth] | None:
+    """Request-local authority for managed-account model reads; it never widens spend permissions."""
+    from litellm.proxy.tokenin.accounts import current_account_models
+
+    models: Final = await current_account_models(prisma_client=prisma_client, user_id=user_api_key_dict.user_id)
+    if models is None:
+        return None
+    return models, user_api_key_dict.model_copy(update={"models": list(models), "team_models": list(models)})
+
+
 @router.get("/v1/models", dependencies=[Depends(user_api_key_auth)], tags=["model management"])
 @router.get(
     "/models", dependencies=[Depends(user_api_key_auth)], tags=["model management"]
@@ -10161,9 +10173,15 @@ async def model_list(
             detail=f"Invalid scope parameter. Only 'expand' is currently supported. Received: {scope}",
         )
 
-    # Check if scope=expand is requested and user has admin privileges
+    account_policy: Final = await _account_policy_auth(user_api_key_dict=user_api_key_dict)
+    if account_policy is not None:
+        policy_models, user_api_key_dict = account_policy
+    else:
+        policy_models = None
+
+    # Check if scope=expand is requested and an unrestricted user has admin privileges
     should_expand_scope = False
-    if scope == "expand":
+    if scope == "expand" and policy_models is None:
         should_expand_scope = _user_has_admin_view(user_api_key_dict) or await _user_has_admin_privileges(
             user_api_key_dict=user_api_key_dict,
             prisma_client=prisma_client,
@@ -10258,6 +10276,10 @@ async def model_list(
         user_api_key_cache=user_api_key_cache,
     )
 
+    if policy_models is not None:
+        allowed: Final = set(policy_models)
+        all_models = [model for model in all_models if model in allowed]
+
     # Hide paused/unhealthy models from the public listing
     if hidden_names:
         all_models = [m for m in all_models if m not in hidden_names]
@@ -10326,6 +10348,12 @@ async def model_info(
         validate_model_access,
     )
 
+    account_policy: Final = await _account_policy_auth(user_api_key_dict=user_api_key_dict)
+    if account_policy is not None:
+        policy_models, user_api_key_dict = account_policy
+    else:
+        policy_models = None
+
     all_models = await get_available_models_for_user(
         user_api_key_dict=user_api_key_dict,
         llm_router=llm_router,
@@ -10351,6 +10379,8 @@ async def model_info(
     hidden_names: Final = blocked_names | unhealthy_names
     if hidden_names:
         all_models = [m for m in all_models if m not in hidden_names]
+    if policy_models is not None:
+        all_models = [model for model in all_models if model in set(policy_models)]
 
     internal_to_public: Final = TeamModelNameTranslator.build_internal_to_public_map(llm_router, settings)
     resolved_model_id: Final = TeamModelNameTranslator.resolve_public_name(

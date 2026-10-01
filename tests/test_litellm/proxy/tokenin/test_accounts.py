@@ -387,9 +387,18 @@ async def test_managed_admission_scopes_routes_and_requires_the_spend_switch(
     assert conflicting.value.status_code == 503
     assert "apply_user_budget_to_team_keys" in conflicting.value.detail
     monkeypatch.setattr(proxy_server, "general_settings", {})
-    with pytest.raises(HTTPException) as unsupported:
-        await accounts.require_request_admission(client, ACCOUNT, FLAT_TEAM_ID, "/v1/embeddings")
-    assert unsupported.value.status_code == 503
+    assert await accounts.require_request_admission(client, ACCOUNT, FLAT_TEAM_ID, "/v1/embeddings", "POST") is None
+    for read_route in ("/models", "/v1/models", "/models/model-a", "/v1/models/model-a"):
+        assert await accounts.require_request_admission(client, ACCOUNT, FLAT_TEAM_ID, read_route, "GET") is None
+    with pytest.raises(HTTPException) as write_read:
+        await accounts.require_request_admission(client, ACCOUNT, FLAT_TEAM_ID, "/v1/models", "POST")
+    assert write_read.value.status_code == 503
+    with pytest.raises(HTTPException) as model_info:
+        await accounts.require_request_admission(client, ACCOUNT, FLAT_TEAM_ID, "/model/info", "GET")
+    assert model_info.value.status_code == 503
+    with pytest.raises(HTTPException) as audio:
+        await accounts.require_request_admission(client, ACCOUNT, FLAT_TEAM_ID, "/v1/audio/transcriptions", "POST")
+    assert audio.value.status_code == 503
     # A pass-through route reaches a provider with the proxy's own credentials, so it
     # must not be a way around the ledger either.
     from litellm.proxy.pass_through_endpoints import pass_through_endpoints
@@ -428,9 +437,10 @@ async def test_managed_reservation_binds_key_model_and_worst_case_cost(
         await accounts.reserve_managed_request(client, "not-enrolled", FLAT_TEAM_ID, "/chat/completions", body, "sk")
         is None
     )
-    assert (
-        await accounts.reserve_managed_request(client, ACCOUNT, FLAT_TEAM_ID, "/v1/embeddings", body, "sk-abc") is None
+    embedded_hold: Final = await accounts.reserve_managed_request(
+        client, ACCOUNT, FLAT_TEAM_ID, "/v1/embeddings", body, "sk-abc"
     )
+    assert embedded_hold is not None and embedded_hold.startswith("tokenin-")
     hold_id: Final = await accounts.reserve_managed_request(
         client, ACCOUNT, FLAT_TEAM_ID, "/chat/completions", body, "sk-abc"
     )
@@ -732,11 +742,109 @@ async def test_status_reports_the_switches_that_gate_account_spend(
             "v2_enabled": True,
             "spend_enabled": False,
             "enforcement_active": False,
-            "supported_routes": ["/chat/completions", "/v1/chat/completions"],
+            "supported_routes": [
+                "/chat/completions",
+                "/embeddings",
+                "/images/generations",
+                "/models",
+                "/responses",
+                "/v1/chat/completions",
+                "/v1/embeddings",
+                "/v1/images/generations",
+                "/v1/messages",
+                "/v1/models",
+                "/v1/responses",
+            ],
         }
         monkeypatch.setenv("TOKENIN_ACCOUNT_SPEND_ENABLED", "true")
         armed: Final = await client.get("/tokenin/account/status", headers=auth)
         assert armed.json()["enforcement_active"] is True
+
+
+@pytest.mark.asyncio
+async def test_managed_model_lists_are_request_local_policy_scopes(store: FakeTx, monkeypatch: pytest.MonkeyPatch) -> None:
+    from litellm.proxy import proxy_server
+
+    await accounts.grant_account(_fixed("model-list"))
+    assert (await accounts.set_account_policy(
+        accounts.PolicyRequest(
+            user_id=ACCOUNT,
+            idempotency_key="model-list-policy",
+            plan_id="medium",
+            models=["model-a"],
+            rpm_limit=20,
+            max_parallel_requests=1,
+            effective_at=PERIOD_START,
+            expected_policy_id=None,
+        )
+    ))["duplicate"] is False
+    router: Final = SimpleNamespace(
+        get_model_names=lambda: ["model-a", "model-b"],
+        get_model_access_groups=lambda: {},
+        get_fully_blocked_model_names=lambda: set(),
+        get_model_list=lambda: [],
+        get_configured_token_limits=lambda model: (None, None),
+    )
+    token: Final = UserAPIKeyAuth(user_id=ACCOUNT, team_id=FLAT_TEAM_ID, models=[*KEY_MODELS], team_models=[])
+    request: Final = Request({"type": "http", "method": "GET", "path": "/v1/models", "headers": []})
+    monkeypatch.setenv("TOKENIN_ACCOUNT_SPEND_ENABLED", "true")
+    monkeypatch.setattr(proxy_server, "prisma_client", SimpleNamespace(db=store))
+    monkeypatch.setattr(proxy_server, "llm_router", router)
+    monkeypatch.setattr(proxy_server, "general_settings", {})
+    monkeypatch.setattr(proxy_server, "user_model", None)
+    monkeypatch.setattr(proxy_server, "get_hidden_unhealthy_model_names", AsyncMock(return_value=set()))
+
+    for path in ("/v1/models", "/models"):
+        listed: Final = await proxy_server.model_list(request=request, user_api_key_dict=token)
+        assert [entry["id"] for entry in listed["data"]] == ["model-a"]
+        assert path in accounts._MANAGED_MODEL_READ_ROUTES  # pyright: ignore[reportPrivateUsage]
+    expanded: Final = await proxy_server.model_list(
+        request=request, user_api_key_dict=token, scope="expand", include_model_access_groups=True
+    )
+    assert [entry["id"] for entry in expanded["data"]] == ["model-a"]
+    assert token.models == [*KEY_MODELS]
+    assert token.team_models == []
+
+
+@pytest.mark.asyncio
+async def test_managed_model_detail_filters_to_policy_without_admin_model_info(
+    store: FakeTx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.proxy import proxy_server
+
+    await accounts.grant_account(_fixed("model-detail"))
+    await accounts.set_account_policy(
+        accounts.PolicyRequest(
+            user_id=ACCOUNT,
+            idempotency_key="model-detail-policy",
+            plan_id="medium",
+            models=["model-a"],
+            rpm_limit=20,
+            max_parallel_requests=1,
+            effective_at=PERIOD_START,
+        )
+    )
+    token: Final = UserAPIKeyAuth(user_id=ACCOUNT, team_id=FLAT_TEAM_ID, models=[*KEY_MODELS], team_models=[])
+    router: Final = SimpleNamespace(
+        get_model_names=lambda: ["model-a", "model-b"],
+        get_model_access_groups=lambda: {},
+        get_fully_blocked_model_names=lambda: set(),
+        get_model_list=lambda: [],
+        get_configured_token_limits=lambda model: (None, None),
+        get_deployment_by_model_group_name=lambda model: SimpleNamespace(
+            litellm_params=SimpleNamespace(model=f"openai/{model}"), model_info={}
+        ),
+    )
+    monkeypatch.setattr(proxy_server, "prisma_client", SimpleNamespace(db=store))
+    monkeypatch.setattr(proxy_server, "llm_router", router)
+    monkeypatch.setattr(proxy_server, "general_settings", {})
+    monkeypatch.setattr(proxy_server, "user_model", None)
+    monkeypatch.setattr(proxy_server, "get_hidden_unhealthy_model_names", AsyncMock(return_value=set()))
+    detail: Final = await proxy_server.model_info(model_id="model-a", user_api_key_dict=token)
+    assert detail["id"] == "model-a"
+    with pytest.raises(HTTPException) as denied:
+        await proxy_server.model_info(model_id="model-b", user_api_key_dict=token)
+    assert denied.value.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -910,16 +1018,35 @@ async def test_db_outage_during_account_reservation_never_mints_the_fallback_ide
         assert recovered is not None and recovered.user_id == DB_UNAVAILABLE_FALLBACK_USER_ID
 
 
+@pytest.mark.parametrize("route", ["/v1/audio/transcriptions", "/v1/audio/speech", "/model/info"])
+@pytest.mark.asyncio
+async def test_paid_llm_route_fails_closed_for_enrolled_account(store: FakeTx, monkeypatch: pytest.MonkeyPatch, route: str) -> None:
+    await accounts.grant_account(_fixed("route-scope"))
+    monkeypatch.setenv("TOKENIN_ACCOUNT_SPEND_ENABLED", "true")
+    with pytest.raises(HTTPException) as denied:
+        await accounts.require_request_admission(
+            SimpleNamespace(db=store), ACCOUNT, FLAT_TEAM_ID, route, "GET" if route == "/model/info" else "POST"
+        )
+    assert denied.value.status_code == 503
+
+
 @pytest.mark.parametrize(
     "route",
-    ["/v1/chat/completions", "/v1/embeddings", "/v1/responses", "/v1/images/generations", "/v1/messages"],
+    [
+        "/v1/chat/completions",
+        "/v1/embeddings",
+        "/v1/responses",
+        "/v1/images/generations",
+        "/v1/messages",
+    ],
 )
 @pytest.mark.asyncio
-async def test_paid_llm_route_fails_closed_for_enrolled_account(store: FakeTx, route: str) -> None:
+async def test_paid_estimable_llm_routes_admit_enrolled_account(
+    store: FakeTx, monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
     await accounts.grant_account(_fixed("route-scope"))
-    with pytest.raises(HTTPException) as denied:
-        await accounts.require_request_admission(SimpleNamespace(db=store), ACCOUNT, FLAT_TEAM_ID, route)
-    assert denied.value.status_code == 503
+    monkeypatch.setenv("TOKENIN_ACCOUNT_SPEND_ENABLED", "true")
+    assert await accounts.require_request_admission(SimpleNamespace(db=store), ACCOUNT, FLAT_TEAM_ID, route, "POST") is None
 
 
 def _request(token: str) -> Request:
