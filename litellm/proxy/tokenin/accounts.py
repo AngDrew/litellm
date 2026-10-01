@@ -18,6 +18,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from litellm._logging import verbose_proxy_logger
+from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.tokenin import ledger
 from litellm.proxy.tokenin.ledger import as_naive_utc
 from litellm.proxy.tokenin.plans import TokeninPlan, load_plans
@@ -769,6 +771,23 @@ async def account_balance(user_id: str = Query(min_length=1)) -> dict[str, objec
 
     ``used_usd`` includes held and uncertain reservations: pending spend counts as used.
     """
+    return await _read_account_balance(user_id)
+
+
+@router.get("/tokenin/account/me/balance", tags=["tokenin"])
+async def my_account_balance(
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+) -> dict[str, object]:
+    """The caller's own balance. The account comes from the authenticated key, never from input."""
+    if not account_v2_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+    user_id: Final = user_api_key_dict.user_id
+    if not user_id:
+        raise HTTPException(status_code=404, detail="This key is not linked to an account")
+    return await _read_account_balance(user_id)
+
+
+async def _read_account_balance(user_id: str) -> dict[str, object]:
     async with _db().db.tx() as tx:
         now: Final = await ledger._now(tx)
         grants: Final = await ledger.load_grants(tx, user_id)

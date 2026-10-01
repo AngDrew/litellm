@@ -848,6 +848,8 @@ class LiteLLMRoutes(enum.Enum):
         "/health/test_connection",
         # Invitation routes - org/team admins checked in endpoint via _user_has_admin_privileges
         "/invitation/new",
+        # Tokenin self-balance: the endpoint reads only the authenticated key's own user_id.
+        "/tokenin/account/me/balance",
         "/invitation/delete",
         # Team guardrail submission - requires team-scoped key; endpoint enforces team_id
         "/guardrails/register",

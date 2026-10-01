@@ -1252,3 +1252,40 @@ async def test_balance_http_route_is_service_only(store: FakeTx, monkeypatch: py
             "/tokenin/account/balance", params={"user_id": ACCOUNT}, headers=SERVICE_AUTH
         )
         assert disabled.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_my_balance_reads_only_the_authenticated_keys_account(
+    store: FakeTx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.proxy.auth.route_checks import RouteChecks
+    from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+    from litellm.proxy._types import LiteLLMRoutes
+
+    await _paid_months(0)
+    caller: dict[str, str | None] = {"user_id": ACCOUNT}
+    app: Final = FastAPI()
+    app.include_router(accounts.router)
+    app.dependency_overrides[user_api_key_auth] = lambda: UserAPIKeyAuth(user_id=caller["user_id"])
+    transport: Final = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        mine: Final = await client.get("/tokenin/account/me/balance", params={"user_id": "someone-else"})
+        assert mine.status_code == 200
+        assert mine.json()["user_id"] == ACCOUNT  # query user_id is ignored
+        assert mine.json() == (await client.get(
+            "/tokenin/account/balance", params={"user_id": ACCOUNT}, headers=SERVICE_AUTH
+        )).json()
+        caller["user_id"] = None
+        assert (await client.get("/tokenin/account/me/balance")).status_code == 404
+        caller["user_id"] = "nobody"
+        assert (await client.get("/tokenin/account/me/balance")).status_code == 404
+        caller["user_id"] = ACCOUNT
+        monkeypatch.setenv("TOKENIN_ACCOUNT_V2_ENABLED", "false")
+        assert (await client.get("/tokenin/account/me/balance")).status_code == 404
+    # Non-admin keys may reach the self route, but not the service-only one.
+    assert RouteChecks.check_route_access(
+        route="/tokenin/account/me/balance", allowed_routes=LiteLLMRoutes.self_managed_routes.value
+    )
+    assert not RouteChecks.check_route_access(
+        route="/tokenin/account/balance", allowed_routes=LiteLLMRoutes.self_managed_routes.value
+    )
