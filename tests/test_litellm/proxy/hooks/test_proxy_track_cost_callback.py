@@ -2066,11 +2066,13 @@ async def test_failure_hook_settles_account_hold_with_recovered_partial_stream_c
 
 
 @pytest.mark.asyncio
-async def test_failure_hook_without_recovered_cost_keeps_account_hold_uncertain():
+@pytest.mark.parametrize("metadata_bucket", ["metadata", "litellm_metadata"])
+async def test_failure_hook_without_recovered_cost_keeps_account_hold_uncertain(metadata_bucket: str) -> None:
     request_data = {
         "model": "gpt-4",
         "messages": [{"role": "user", "content": "Hello"}],
-        "metadata": {"user_api_key_tokenin_account_hold_id": "hold-1"},
+        "metadata": {"request_label": "client"},
+        metadata_bucket: {"request_label": "client", "user_api_key_tokenin_account_hold_id": "hold-1"},
     }
     with (
         patch(
@@ -2090,6 +2092,7 @@ async def test_failure_hook_without_recovered_cost_keeps_account_hold_uncertain(
             user_api_key_dict=UserAPIKeyAuth(api_key="test_api_key"),
         )
         mock_uncertain.assert_awaited_once()
+        assert mock_uncertain.await_args.kwargs["metadata"]["user_api_key_tokenin_account_hold_id"] == "hold-1"
         mock_settle.assert_not_awaited()
 
 

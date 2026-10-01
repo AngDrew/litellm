@@ -5,6 +5,7 @@ import os
 import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -6029,6 +6030,142 @@ async def test_add_litellm_data_to_request_agentic_cli_drop_params(
     )
 
     assert updated.get("drop_params") == expected_drop_params
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["/v1/responses", "/responses", "/v1/messages", "/v1/chat/completions"])
+@pytest.mark.parametrize("with_provider_metadata", [False, True])
+async def test_account_hold_stamp_stays_in_proxy_metadata(route: str, with_provider_metadata: bool) -> None:
+    from litellm.proxy.tokenin.enforcement import account_hold_id, hold_metadata_from_request_data
+
+    hold_key: Final = "user_api_key_tokenin_account_hold_id"
+    data: Final = {
+        "model": "model-a",
+        "input": "hello",
+        "litellm_metadata": {hold_key: "forged-hold"},
+        **({"metadata": {"request_label": "client", hold_key: "forged-hold"}} if with_provider_metadata else {}),
+    }
+    updated: Final = await add_litellm_data_to_request(
+        data=data,
+        request=_make_request_mock(route, {"Content-Type": "application/json"}),
+        user_api_key_dict=UserAPIKeyAuth(api_key="hashed-key", tokenin_account_hold_id="server-hold"),
+        proxy_config=MagicMock(),
+        general_settings={},
+    )
+
+    internal_key: Final = "metadata" if route == "/v1/chat/completions" else "litellm_metadata"
+    assert updated[internal_key][hold_key] == "server-hold"
+    assert account_hold_id(hold_metadata_from_request_data(updated)) == "server-hold"
+    if internal_key == "litellm_metadata":
+        if with_provider_metadata:
+            assert updated["metadata"] == {"request_label": "client"}
+        else:
+            assert "metadata" not in updated
+    else:
+        assert "litellm_metadata" not in updated
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_metadata", [None, {"request_label": "client"}])
+async def test_held_responses_call_preserves_settlement_without_injecting_provider_metadata(
+    monkeypatch: pytest.MonkeyPatch, client_metadata: dict[str, str] | None
+) -> None:
+    from uuid import uuid4
+
+    import httpx
+
+    from litellm.integrations.custom_logger import CustomLogger
+    from litellm.proxy import proxy_server
+    from litellm.proxy.hooks.proxy_track_cost_callback import _ProxyDBLogger
+    from litellm.proxy.tokenin.enforcement import account_hold_id
+
+    call_id: Final = str(uuid4())
+    captured: Final[asyncio.Future[dict[str, object]]] = asyncio.get_running_loop().create_future()
+
+    class HoldCapture(CustomLogger):
+        async def async_log_success_event(
+            self, kwargs: dict[str, object], response_obj: object, start_time: datetime, end_time: datetime
+        ) -> None:
+            if kwargs.get("litellm_call_id") != call_id or captured.done():
+                return
+            captured.set_result(kwargs)
+
+    for callback_registry in (
+        "success_callback",
+        "failure_callback",
+        "_async_success_callback",
+        "_async_failure_callback",
+    ):
+        monkeypatch.setattr(litellm, callback_registry, [])
+    monkeypatch.setattr(litellm, "callbacks", [HoldCapture()])
+    updated: Final = await add_litellm_data_to_request(
+        data={
+            "model": "model-a",
+            "input": "hello",
+            "litellm_call_id": call_id,
+            **({"metadata": client_metadata} if client_metadata else {}),
+        },
+        request=_make_request_mock("/v1/responses", {"Content-Type": "application/json"}),
+        user_api_key_dict=UserAPIKeyAuth(api_key="hashed-key", user_id="u-1", tokenin_account_hold_id="server-hold"),
+        proxy_config=MagicMock(),
+        general_settings={},
+    )
+    router: Final = litellm.Router(
+        model_list=[{"model_name": "model-a", "litellm_params": {"model": "openai/gpt-6-astra", "api_key": "test"}}],
+        num_retries=0,
+    )
+    with patch("litellm.llms.custom_httpx.http_handler.AsyncHTTPHandler.post", new_callable=AsyncMock) as post:
+        post.return_value = httpx.Response(
+            200,
+            request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+            json={
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "model": "gpt-6-astra",
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "m1",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hi", "annotations": []}],
+                    }
+                ],
+                "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            },
+        )
+        response: Final = await router.aresponses(**updated)
+    logged: Final = await asyncio.wait_for(captured, timeout=5)
+    wire: Final = post.call_args.kwargs["json"]
+    if client_metadata is None:
+        assert "metadata" not in wire
+    else:
+        assert wire["metadata"] == client_metadata
+    assert "server-hold" not in json.dumps(wire)
+    assert account_hold_id(get_litellm_metadata_from_kwargs(logged)) == "server-hold"
+
+    settle: Final = AsyncMock()
+    monkeypatch.setattr("litellm.proxy.hooks.proxy_track_cost_callback.settle_account_hold", settle)
+    monkeypatch.setattr(
+        "litellm.proxy.hooks.proxy_track_cost_callback._update_database_and_spend_counters", AsyncMock()
+    )
+    monkeypatch.setattr(proxy_server, "update_cache", MagicMock(), raising=False)
+    monkeypatch.setattr(proxy_server, "increment_spend_counters", AsyncMock())
+    monkeypatch.setattr(
+        proxy_server,
+        "proxy_logging_obj",
+        MagicMock(
+            db_spend_update_writer=MagicMock(update_database=AsyncMock(return_value="req-1")),
+            slack_alerting_instance=MagicMock(customer_spend_alert=AsyncMock()),
+            failed_tracking_alert=AsyncMock(),
+        ),
+    )
+    await _ProxyDBLogger()._PROXY_track_cost_callback(logged, response, datetime.now(), datetime.now())
+    settle.assert_awaited_once()
+    assert account_hold_id(settle.await_args.kwargs["metadata"]) == "server-hold"
+    assert settle.await_args.kwargs["actual_cost"] > 0
 
 
 @pytest.mark.asyncio
