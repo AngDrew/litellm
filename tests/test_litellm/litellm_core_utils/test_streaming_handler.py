@@ -1544,7 +1544,7 @@ def test_calculate_total_usage_preserves_anthropic_cache_creation_ttl_breakdown(
 
 
 @pytest.mark.asyncio
-async def test_openrouter_streaming_cost_after_finish_reason(logging_obj: Logging):
+async def test_openrouter_streaming_cost_after_finish_reason(logging_obj: Logging, monkeypatch):
     from litellm.utils import ModelResponseListIterator
 
     chunk1 = ModelResponseStream(
@@ -1591,14 +1591,16 @@ async def test_openrouter_streaming_cost_after_finish_reason(logging_obj: Loggin
         stream_options={"include_usage": True},
     )
 
+    monkeypatch.setattr(litellm, "include_cost_in_streaming_usage", True)
+    monkeypatch.setattr(logging_obj, "_response_cost_calculator", lambda result, **_: 0.00025)
     collected_chunks = []
     async for chunk in response:
         collected_chunks.append(chunk)
 
     usage_chunks = [c for c in collected_chunks if hasattr(c, "usage") and c.usage]
     assert len(usage_chunks) > 0
-    assert hasattr(usage_chunks[-1].usage, "cost")
     assert usage_chunks[-1].usage.cost == 0.00025
+    assert usage_chunks[-1]._hidden_params["response_cost"] == 0.00025
 
 
 @pytest.mark.asyncio

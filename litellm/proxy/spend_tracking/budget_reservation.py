@@ -12,6 +12,9 @@ from fastapi import HTTPException, status
 
 import litellm
 from litellm._logging import verbose_proxy_logger
+from litellm.cost_calculator import (
+    _apply_cost_margin,  # pyright: ignore[reportPrivateUsage]  # the one margin rule, shared with settled spend
+)
 from litellm.litellm_core_utils.duration_parser import duration_in_seconds
 from litellm.litellm_core_utils.llm_cost_calc.tiered_pricing import select_tier_for_input, tier_rate
 from litellm.proxy._types import (
@@ -1036,12 +1039,15 @@ def _estimate_request_input_cost_for_model(
     input_tokens: int | None = None,
 ) -> float | None:
     estimates: Final = [
-        _input_cost_for_cost_info(
-            request_body=request_body,
-            route=route,
-            model=model,
-            model_info=model_info,
-            input_tokens=input_tokens,
+        _with_cost_margin(
+            _input_cost_for_cost_info(
+                request_body=request_body,
+                route=route,
+                model=model,
+                model_info=model_info,
+                input_tokens=input_tokens,
+            ),
+            model_info,
         )
         for model_info in _get_model_cost_infos(model=model, llm_router=llm_router)
     ]
@@ -1076,6 +1082,17 @@ def _input_cost_for_cost_info(
     return estimated_input_tokens * input_cost_per_token
 
 
+def _with_cost_margin(estimate: float | None, model_info: Mapping[str, object]) -> float | None:
+    """Settled spend carries the configured cost margin, so what is held against it must too."""
+    if estimate is None or not litellm.cost_margin_config:
+        return estimate
+    provider: Final = model_info.get("litellm_provider")
+    return _apply_cost_margin(
+        base_cost=estimate,
+        custom_llm_provider=provider if isinstance(provider, str) else None,
+    )[0]
+
+
 def _estimate_request_max_cost_for_model(
     request_body: dict,
     route: str,
@@ -1084,12 +1101,15 @@ def _estimate_request_max_cost_for_model(
     input_tokens: int | None = None,
 ) -> float | None:
     estimates: Final = [
-        _max_cost_for_cost_info(
-            request_body=request_body,
-            route=route,
-            model=model,
-            model_info=model_info,
-            input_tokens=input_tokens,
+        _with_cost_margin(
+            _max_cost_for_cost_info(
+                request_body=request_body,
+                route=route,
+                model=model,
+                model_info=model_info,
+                input_tokens=input_tokens,
+            ),
+            model_info,
         )
         for model_info in _get_model_cost_infos(model=model, llm_router=llm_router)
     ]

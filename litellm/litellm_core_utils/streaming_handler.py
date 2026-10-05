@@ -1254,10 +1254,7 @@ class CustomStreamWrapper:
             and generic_chunk_has_all_required_fields(chunk=chunk)  # check if chunk is a generic streaming chunk
         ) or (
             self.custom_llm_provider
-            and (
-                self.custom_llm_provider in litellm._custom_providers
-                or self.custom_llm_provider == "neuralwatt"
-            )
+            and (self.custom_llm_provider in litellm._custom_providers or self.custom_llm_provider == "neuralwatt")
         ):
             if self.received_finish_reason is not None:
                 _chunk_has_content: Final = isinstance(chunk, dict) and (
@@ -1575,7 +1572,6 @@ class CustomStreamWrapper:
                 return dispatch_result.value
             response_obj = dispatch_result.response_obj
 
-
             model_response.model = self.model
             ## FUNCTION CALL PARSING
             original_chunk: Final = response_obj.get("original_chunk") if response_obj is not None else None
@@ -1889,6 +1885,22 @@ class CustomStreamWrapper:
         self.chunks.append(model_response.model_copy(update={"choices": []}))
 
     @staticmethod
+    def _show_cache_hit_usage_cost(response: "ModelResponseStream", cache_hit: bool) -> None:
+        usage: Final = getattr(response, "usage", None)
+        if not cache_hit or getattr(usage, "cost", None) is None:
+            return
+        if litellm.include_cost_in_streaming_usage:
+            setattr(usage, "cost", 0.0)
+        else:
+            delattr(usage, "cost")
+
+    @staticmethod
+    def _copy_response_cost(source: ModelResponse, target: "ModelResponseStream") -> None:
+        billed: Final = source._hidden_params.get("response_cost")
+        if isinstance(billed, (int, float)) and not isinstance(billed, bool):
+            target._hidden_params["response_cost"] = float(billed)
+
+    @staticmethod
     def _resolve_provider_reported_cost(usage_cost: object) -> float | None:
         """
         Providers report usage.cost either as a number or, for Perplexity, as a
@@ -1910,7 +1922,18 @@ class CustomStreamWrapper:
         If the assembled response carries a provider-reported cost on
         usage.cost, copy it into _hidden_params so litellm's cost
         calculator uses it instead of a token-based estimate.
+
+        The header must only ever hold the provider's own number, because the calculator adds the
+        margin to it. Once the response's final cost is set (``response_cost``, which can have been
+        written back into ``usage.cost``), or the provider's number is already in the header, there
+        is nothing to copy; copying a billed amount would be marked up a second time.
         """
+        _hidden: Final = response._hidden_params
+        _reported_headers: Final = _hidden.get("additional_headers")
+        if _hidden.get("response_cost") is not None or (
+            _reported_headers is not None and "llm_provider-x-litellm-response-cost" in _reported_headers
+        ):
+            return
         _usage: Final[Usage | None] = getattr(response, "usage", None)
         _cost: Final = CustomStreamWrapper._resolve_provider_reported_cost(getattr(_usage, "cost", None))
         if _cost is not None:
@@ -1990,7 +2013,7 @@ class CustomStreamWrapper:
                             continue
                     # add usage as hidden param
                     if self.sent_last_chunk is True and self.stream_options is None:
-                        usage = calculate_total_usage(chunks=self.chunks)
+                        usage = calculate_total_usage(chunks=self.chunks, keep_provider_cost=False)
                         response._hidden_params["usage"] = usage
                         self._last_returned_hidden_params = response._hidden_params
                         # Add MCP metadata to final chunk if present
@@ -2032,6 +2055,8 @@ class CustomStreamWrapper:
                         "usage",
                         getattr(complete_streaming_response, "usage"),
                     )
+                    self._copy_response_cost(complete_streaming_response, response)
+                    self._show_cache_hit_usage_cost(response, cache_hit)
                     try:
                         _cache_copy = complete_streaming_response.model_copy(deep=True)
                         _log_copy = complete_streaming_response.model_copy(deep=True)
@@ -2082,7 +2107,7 @@ class CustomStreamWrapper:
                 self.sent_last_chunk = True
                 processed_chunk: Final = self.finish_reason_handler()
                 if self.stream_options is None:  # add usage as hidden param
-                    usage = calculate_total_usage(chunks=self.chunks)
+                    usage = calculate_total_usage(chunks=self.chunks, keep_provider_cost=False)
                     processed_chunk._hidden_params["usage"] = usage
                 ## LOGGING
                 executor.submit(
@@ -2194,7 +2219,7 @@ class CustomStreamWrapper:
 
                     # add usage as hidden param
                     if self.sent_last_chunk is True and self.stream_options is None:
-                        usage = calculate_total_usage(chunks=self.chunks)
+                        usage = calculate_total_usage(chunks=self.chunks, keep_provider_cost=False)
                         processed_chunk._hidden_params["usage"] = usage
                         self._last_returned_hidden_params = processed_chunk._hidden_params
 
@@ -2282,6 +2307,8 @@ class CustomStreamWrapper:
                     "usage",
                     getattr(complete_streaming_response, "usage"),
                 )
+                self._copy_response_cost(complete_streaming_response, response)
+                self._show_cache_hit_usage_cost(response, cache_hit)
                 try:
                     _copy = complete_streaming_response.model_copy(deep=True)
                 except RuntimeError:
@@ -2549,7 +2576,7 @@ def _coerce_token_details(
     return details_type(**(raw if isinstance(raw, dict) else raw.model_dump()))
 
 
-def calculate_total_usage(chunks: list[ModelResponse]) -> Usage:
+def calculate_total_usage(chunks: list[ModelResponse], keep_provider_cost: bool = True) -> Usage:
     """Assume most recent usage chunk has total usage uptil then."""
     from litellm.litellm_core_utils.streaming_chunk_builder_utils import (
         attach_cache_creation_token_details,
@@ -2591,7 +2618,7 @@ def calculate_total_usage(chunks: list[ModelResponse]) -> Usage:
         completion_tokens_details=completion_tokens_details,
     )
 
-    if latest_usage_chunk is not None:
+    if latest_usage_chunk is not None and keep_provider_cost:
         latest_cost: Final = (
             latest_usage_chunk.get("cost")
             if isinstance(latest_usage_chunk, dict)

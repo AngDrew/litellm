@@ -1,6 +1,7 @@
 # What is this?
 ## File for 'response_cost' calculation in Logging
 import logging
+import math
 import time
 from collections.abc import Mapping, Sequence
 from functools import lru_cache
@@ -1782,6 +1783,76 @@ def get_response_cost_from_hidden_params(
     return None
 
 
+# Where a provider's own reported cost travels on the response, until the calculator bills it.
+PROVIDER_COST_HEADER: Final = "llm_provider-x-litellm-response-cost"
+
+
+def _cost_from_headers(response_object: BaseModel) -> float | None:
+    hidden_params: Final = getattr(response_object, "_hidden_params", None)
+    if hidden_params is None:
+        return None  # not every response type carries hidden params
+    try:
+        return get_response_cost_from_hidden_params(hidden_params)
+    except (TypeError, ValueError, AttributeError):
+        return None  # a garbage header is no cost at all; the call is priced from tokens instead
+
+
+def provider_reported_cost(response_object: BaseModel, custom_llm_provider: str | None) -> float | None:
+    """
+    The USD the provider itself says it charged for this response, or None when it did not say.
+
+    OpenRouter (and any provider whose cost reaches the response headers) reports it there.
+    DeepInfra reports it as ``usage.estimated_cost``.
+    """
+    header_cost: Final = _cost_from_headers(response_object)
+    if header_cost is not None or custom_llm_provider != "deepinfra":
+        return header_cost
+    estimated: Final = getattr(getattr(response_object, "usage", None), "estimated_cost", None)
+    if isinstance(estimated, (int, float)) and not isinstance(estimated, bool):
+        return float(estimated)
+    return None
+
+
+def _bill_provider_reported_cost(
+    provider_cost: float,
+    *,
+    custom_llm_provider: str | None,
+    litellm_logging_obj: LitellmLoggingObject | None,
+) -> float | None:
+    """
+    What to bill for a provider-reported cost: that cost plus the configured margin.
+
+    Returns None when the reported cost is negative or not finite, so the caller bills the
+    token-priced estimate instead. Zero is a valid cost.
+    """
+    if not math.isfinite(provider_cost) or provider_cost < 0:
+        verbose_logger.warning(
+            "provider-reported cost rejected, billing from token prices: provider=%s cost=%r",
+            custom_llm_provider,
+            provider_cost,
+        )
+        return None
+
+    margin: Final = (
+        _apply_cost_margin(base_cost=provider_cost, custom_llm_provider=custom_llm_provider)
+        if litellm.cost_margin_config
+        else (provider_cost, 0.0, 0.0, 0.0)
+    )
+    billed: Final = margin[0]
+    _store_cost_breakdown_in_logging_obj(
+        litellm_logging_obj=litellm_logging_obj,
+        prompt_tokens_cost_usd_dollar=0.0,  # the provider reports one total, not an input/output split
+        completion_tokens_cost_usd_dollar=0.0,
+        cost_for_built_in_tools_cost_usd_dollar=0.0,
+        total_cost_usd_dollar=billed,
+        original_cost=provider_cost,
+        margin_percent=margin[1],
+        margin_fixed_amount=margin[2],
+        margin_total_amount=margin[3],
+    )
+    return billed
+
+
 def response_cost_calculator(
     response_object: ModelResponse
     | EmbeddingResponse
@@ -1837,6 +1908,7 @@ def response_cost_calculator(
     Returns
     - float or None: cost of response
     """
+
     try:
         response_cost: float = 0.0
         if cache_hit is not None and cache_hit is True:
@@ -1845,9 +1917,15 @@ def response_cost_calculator(
             if isinstance(response_object, BaseModel):
                 if hasattr(response_object, "_hidden_params"):
                     response_object._hidden_params["optional_params"] = optional_params
-                    provider_response_cost: Final = get_response_cost_from_hidden_params(response_object._hidden_params)
+                    provider_response_cost: Final = provider_reported_cost(response_object, custom_llm_provider)
                     if provider_response_cost is not None:
-                        return provider_response_cost
+                        billed_provider_cost: Final = _bill_provider_reported_cost(
+                            provider_response_cost,
+                            custom_llm_provider=custom_llm_provider,
+                            litellm_logging_obj=litellm_logging_obj,
+                        )
+                        if billed_provider_cost is not None:
+                            return billed_provider_cost
 
             response_cost = completion_cost(
                 completion_response=response_object,

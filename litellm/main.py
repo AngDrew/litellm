@@ -14,6 +14,7 @@ import contextvars
 import datetime
 import inspect
 import json
+import math
 import os
 import random
 import sys
@@ -167,6 +168,7 @@ from litellm.utils import (
 
 from ._logging import verbose_logger
 from .caching.caching import disable_cache, enable_cache, update_cache
+from .cost_calculator import PROVIDER_COST_HEADER, provider_reported_cost
 from .litellm_core_utils.core_helpers import safe_deep_copy
 from .litellm_core_utils.fallback_utils import (
     async_completion_with_fallbacks,
@@ -8611,7 +8613,80 @@ def stream_chunk_builder_text_completion(chunks: list, messages: list | None = N
     return TextCompletionResponse(**response)
 
 
+def _streaming_cost_provider(response: ModelResponse, logging_obj: Optional["Logging"]) -> str | None:
+    if logging_obj is not None:
+        provider: Final = logging_obj.model_call_details.get("custom_llm_provider")
+        if isinstance(provider, str):
+            return provider
+    hinted: Final = response._hidden_params.get(  # pyright: ignore[reportPrivateUsage]  # no public accessor
+        "custom_llm_provider"
+    )
+    return hinted if isinstance(hinted, str) else None
+
+
+def _chunk_response_cost(chunks: Sequence[Any]) -> float | None:
+    for chunk in reversed(chunks):
+        hidden: Final = (
+            chunk.get("_hidden_params") if isinstance(chunk, dict) else getattr(chunk, "_hidden_params", None)
+        )
+        billed: Final = hidden.get("response_cost") if isinstance(hidden, dict) else None
+        if isinstance(billed, (int, float)) and not isinstance(billed, bool) and math.isfinite(billed):
+            return float(billed)
+    return None
+
+
+def _attach_streamed_provider_cost(
+    response: ModelResponse, chunks: Sequence[Any], logging_obj: Optional["Logging"]
+) -> None:
+    """
+    Hand the cost a provider reported while streaming to the cost calculator.
+
+    The calculator prices it, margin included, exactly once. It must see the provider's own number
+    here, before ``usage.cost`` can be overwritten with a billed (marked-up) amount.
+    """
+    billed: Final = _chunk_response_cost(chunks)
+    if billed is not None:
+        response._hidden_params["response_cost"] = billed  # pyright: ignore[reportPrivateUsage]  # no public accessor
+        return
+    CustomStreamWrapper._propagate_usage_cost_to_hidden_params(  # pyright: ignore[reportPrivateUsage]  # sibling helper of the stream wrapper
+        response
+    )
+    if _streaming_cost_provider(response, logging_obj) != "deepinfra":
+        return
+    hidden: Final = response._hidden_params  # pyright: ignore[reportPrivateUsage]  # no public accessor
+    reported_headers: Final = hidden.get("additional_headers")
+    if reported_headers is not None and PROVIDER_COST_HEADER in reported_headers:
+        return
+    estimates: Final = (
+        getattr(
+            ChunkProcessor._extract_usage_chunk(chunk),  # pyright: ignore[reportPrivateUsage]  # same package, no public accessor
+            "estimated_cost",
+            None,
+        )
+        for chunk in reversed(chunks)
+    )
+    estimated: Final = next((e for e in estimates if isinstance(e, (int, float)) and not isinstance(e, bool)), None)
+    if estimated is not None:
+        # In the hidden header, not on response.usage: usage is what the client receives.
+        hidden.setdefault("additional_headers", {})[  # mutable-ok: provider headers dict on the hidden params
+            PROVIDER_COST_HEADER
+        ] = float(estimated)
+
+
+def _withhold_provider_cost_from_stream_usage(response: ModelResponse, logging_obj: Optional["Logging"]) -> None:
+    usage: Final = getattr(response, "usage", None)
+    if logging_obj is None or litellm.include_cost_in_streaming_usage or getattr(usage, "cost", None) is None:
+        return
+    delattr(usage, "cost")
+
+
 def _stream_builder_response_cost(response: ModelResponse, logging_obj: Optional["Logging"]) -> float | None:
+    if (
+        logging_obj is not None
+        and provider_reported_cost(response, _streaming_cost_provider(response, logging_obj)) is not None
+    ):
+        # usage.cost is the provider's raw number here; only the calculator turns it into what we bill.
+        return logging_obj._response_cost_calculator(result=response)  # pyright: ignore[reportPrivateUsage]  # the logging object's own cost calculation
     usage_cost: Final = getattr(getattr(response, "usage", None), "cost", None)
     if isinstance(usage_cost, (int, float)):
         return float(usage_cost)
@@ -8746,6 +8821,7 @@ def stream_chunk_builder(
                     )
                     break
 
+            _attach_streamed_provider_cost(response, chunks, logging_obj)
             if litellm.include_cost_in_streaming_usage and logging_obj is not None:
                 setattr(
                     usage,
@@ -8753,6 +8829,7 @@ def stream_chunk_builder(
                     logging_obj._response_cost_calculator(result=response),
                 )
             _set_stream_builder_response_cost(response, logging_obj)
+            _withhold_provider_cost_from_stream_usage(response, logging_obj)
 
             processor.apply_provider_assembled_streaming_metadata(response, chunks, logging_obj)
             return response
@@ -8930,11 +9007,13 @@ def stream_chunk_builder(
                 )
                 break
 
+        _attach_streamed_provider_cost(response, chunks, logging_obj)
         # Add cost to usage object if include_cost_in_streaming_usage is True
         if litellm.include_cost_in_streaming_usage and logging_obj is not None:
             setattr(usage, "cost", logging_obj._response_cost_calculator(result=response))
 
         _set_stream_builder_response_cost(response, logging_obj)
+        _withhold_provider_cost_from_stream_usage(response, logging_obj)
 
         processor.apply_provider_assembled_streaming_metadata(response, chunks, logging_obj)
         return response

@@ -29,6 +29,7 @@ or an explicit `JEV_DECISIONS_URL`.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -36,6 +37,8 @@ from typing import Any, Final
 
 import httpx
 
+import litellm
+from litellm.cost_calculator import _apply_cost_margin  # pyright: ignore[reportPrivateUsage]
 from litellm.llms.custom_llm import CustomLLM, CustomLLMError
 from litellm.types.utils import ModelResponse, Usage
 
@@ -106,10 +109,19 @@ def _usage(answer: Mapping[str, Any]) -> Usage:
 
 
 def _reported_cost(answer: Mapping[str, Any]) -> float | None:
-    """OpenRouter's exact charge, or None to let LiteLLM price the call from the deployment."""
+    """
+    OpenRouter's exact charge plus the configured cost margin, like every other model's spend.
+
+    None lets LiteLLM price the call from the deployment instead (which carries the margin too);
+    that is also what a missing, negative or non-finite cost gets.
+    """
     usage = answer.get("usage")
     cost = usage.get("cost") if isinstance(usage, Mapping) else None
-    return float(cost) if isinstance(cost, (int, float)) else None
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)) or not math.isfinite(cost) or cost < 0:
+        return None
+    if not litellm.cost_margin_config:
+        return float(cost)
+    return _apply_cost_margin(base_cost=float(cost), custom_llm_provider=PROVIDER)[0]
 
 
 def build_model_response(

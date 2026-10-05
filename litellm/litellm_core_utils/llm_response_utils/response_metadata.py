@@ -1,6 +1,7 @@
 import datetime
 from typing import Any, Final
 
+import litellm
 from litellm.constants import LITELLM_DETAILED_TIMING
 from litellm.litellm_core_utils.core_helpers import process_response_headers
 from litellm.litellm_core_utils.llm_response_utils.get_api_base import get_api_base
@@ -51,6 +52,29 @@ class ResponseMetadata:
             "litellm_model_name": model,
         }
         self._update_hidden_params(new_params)
+        self._show_billed_cost(new_params["response_cost"])
+
+    def _show_billed_cost(self, billed: object) -> None:
+        """
+        The client sees the cost it is billed, never the provider's own number.
+
+        A provider's ``usage.cost`` (OpenRouter) becomes the billed amount and DeepInfra's
+        ``usage.estimated_cost`` is dropped. A cache hit bills 0, so its ``usage.cost`` is 0 when
+        cost inclusion is enabled and absent otherwise; cached results can lack the provider hint.
+        """
+        usage: Final = getattr(self.result, "usage", None)
+        if usage is None or isinstance(billed, bool) or not isinstance(billed, (int, float)):
+            return
+        cache_hit: Final = self._get_value_from_hidden_params("cache_hit") is True
+        if cache_hit and not litellm.include_cost_in_streaming_usage:
+            if getattr(usage, "cost", None) is not None:
+                delattr(usage, "cost")
+        elif isinstance(getattr(usage, "cost", None), (int, float)):
+            setattr(usage, "cost", 0.0 if cache_hit else billed)
+        if cache_hit or self._get_value_from_hidden_params("custom_llm_provider") == "deepinfra":
+            extra: Final = getattr(usage, "__pydantic_extra__", None)
+            if extra:
+                extra.pop("estimated_cost", None)
 
     def _update_hidden_params(self, new_params: dict) -> None:
         """

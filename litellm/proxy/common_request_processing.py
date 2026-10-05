@@ -32,6 +32,7 @@ from litellm.constants import (
     STREAM_SSE_KEEPALIVE_PING_BYTES,
     UNSAFE_PROXY_RESPONSE_HEADERS,
 )
+from litellm.cost_calculator import PROVIDER_COST_HEADER
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.litellm_core_utils.core_helpers import get_or_create_metadata_bucket, is_expected_client_error
 from litellm.litellm_core_utils.dd_tracing import NullTracer, tracer
@@ -1499,6 +1500,8 @@ class ProxyBaseLLMRequestProcessing:
     ) -> dict:
         exclude_values: Final = {"", None, "None"}
         hidden_params = hidden_params or {}
+        # The provider's own cost is not what the caller is billed (that is x-litellm-response-cost).
+        kwargs.pop(PROVIDER_COST_HEADER, None)
 
         cost_breakdown: Final = _get_cost_breakdown_from_logging_obj(
             litellm_logging_obj=litellm_logging_obj, response_cost=response_cost
@@ -3760,14 +3763,18 @@ class ProxyBaseLLMRequestProcessing:
         if stream_usage is None:
             return None
         service_tier: Final = obj.get("service_tier")
+        reported_cost: Final = usage.get("cost")
+        priced_response: Final = ModelResponse(usage=stream_usage)
+        if isinstance(reported_cost, (int, float)) and not isinstance(reported_cost, bool):
+            priced_response._hidden_params["additional_headers"] = {PROVIDER_COST_HEADER: reported_cost}
         cost_val: Final = ProxyBaseLLMRequestProcessing._streamed_usage_cost(
-            ModelResponse(usage=stream_usage),
+            priced_response,
             model_name,
             service_tier if isinstance(service_tier, str) else None,
             litellm_logging_obj,
         )
         if cost_val is None:
-            return None
+            return {**obj, "usage": {k: v for k, v in usage.items() if k != "cost"}} if "cost" in usage else None
         return {**obj, "usage": {**usage, "cost": cost_val}}
 
     def maybe_get_model_id(self, _logging_obj: LiteLLMLoggingObj | None) -> str | None:
