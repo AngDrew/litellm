@@ -42,6 +42,7 @@ from typing import Any, Final
 from litellm import verbose_logger
 from litellm.litellm_core_utils.internal_call_metadata import forwarded_internal_call_metadata
 from litellm.router_strategy.complexity_router.complexity_router import _CLASSIFICATION_TIER_CRITERIA
+from litellm.router_strategy.complexity_router.config import TIER_SEVERITY_ORDER
 from litellm.types.router import RoutingContext
 from litellm.types.utils import AUTOROUTER_CLASSIFIER_CALL_ORIGIN, ModelResponse
 
@@ -132,8 +133,9 @@ def build_payload(messages: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
                     ),
                 },
                 # The router's own tier criteria, so a Jev verdict means what the heuristic and LLM
-                # classifier paths mean by the same tier name.
-                "criteria": {tier.value: criteria for tier, criteria in _CLASSIFICATION_TIER_CRITERIA.items()},
+                # classifier paths mean by the same tier name. NON_REASONING is left out: a router
+                # without that pool treats it as a failed classification.
+                "criteria": {tier.value: _CLASSIFICATION_TIER_CRITERIA[tier] for tier in TIER_SEVERITY_ORDER},
             }
         },
     }

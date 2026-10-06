@@ -14,13 +14,24 @@ sys.path.insert(0, os.path.abspath("./"))
 
 from typing import Final
 
+import click
+from litellm_proxy_extras.prisma_toolchain import resolve_prisma_argv
+
 from litellm._logging import verbose_proxy_logger
 from litellm.proxy.proxy_cli import run_server
-from litellm.secret_managers.main import str_to_bool
+
+
+def _enforce_prisma_migration_check(raw: str | None) -> bool:
+    if raw is None or not raw.strip():
+        return True
+    try:
+        return bool(click.BOOL(raw))
+    except click.BadParameter:
+        return True
 
 
 def main() -> int:
-    enforce_prisma_migration_check: Final = str_to_bool(os.getenv("ENFORCE_PRISMA_MIGRATION_CHECK")) is not False
+    enforce_prisma_migration_check: Final = _enforce_prisma_migration_check(os.getenv("ENFORCE_PRISMA_MIGRATION_CHECK"))
     run_server_args: Final = (
         ("--skip_server_startup", "--enforce_prisma_migration_check")
         if enforce_prisma_migration_check
@@ -29,7 +40,7 @@ def main() -> int:
     run_server(run_server_args, standalone_mode=False)
 
     verbose_proxy_logger.info("Running 'prisma generate'...")
-    result: Final = subprocess.run(("prisma", "generate"), capture_output=True, text=True)
+    result: Final = subprocess.run(resolve_prisma_argv(("prisma", "generate")), capture_output=True, text=True)
     verbose_proxy_logger.info("'prisma generate' stdout: %s", result.stdout)
 
     if result.returncode != 0:

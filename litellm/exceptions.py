@@ -10,12 +10,15 @@
 ## LiteLLM versions of the OpenAI Exception Types
 
 import enum
+from collections.abc import Sequence
 from typing import Any, Final
 
 import httpx
 import openai
 
+import litellm
 from litellm.types.utils import LiteLLMCommonStrings
+from litellm.types.vector_stores import VectorStoreSearchFailure
 
 
 class RateLimitErrorCategory(str, enum.Enum):
@@ -85,7 +88,7 @@ _RATE_LIMIT_CATEGORY_VALUES: Final = frozenset(c.value for c in RateLimitErrorCa
 _RATE_LIMIT_TYPE_VALUES: Final = frozenset(t.value for t in RateLimitType)
 
 
-def validate_rate_limit_category(value: Any) -> str | None:
+def validate_rate_limit_category(value: object) -> str | None:
     """Return ``value`` only if it matches a known :class:`RateLimitErrorCategory`.
 
     Used at duck-typed read sites (StandardLoggingPayload extraction, Prometheus
@@ -100,7 +103,7 @@ def validate_rate_limit_category(value: Any) -> str | None:
     return None
 
 
-def validate_rate_limit_type(value: Any) -> str | None:
+def validate_rate_limit_type(value: object) -> str | None:
     """Return ``value`` only if it matches a known :class:`RateLimitType`.
 
     See :func:`validate_rate_limit_category` for the rationale.
@@ -288,6 +291,29 @@ class ImageFetchError(BadRequestError):
         )
 
 
+VECTOR_STORE_SEARCH_FAILED_CODE: Final = "vector_store_search_failed"
+
+
+class VectorStoreSearchError(BadRequestError):
+    def __init__(
+        self,
+        failures: Sequence[VectorStoreSearchFailure],
+        model: str | None = None,
+        llm_provider: str | None = None,
+    ) -> None:
+        self.failures: Final[tuple[VectorStoreSearchFailure, ...]] = tuple(failures)
+        detail: Final = "; ".join(f"{failure['vector_store_id']}: {failure['error']}" for failure in self.failures)
+        super().__init__(
+            message=(
+                "The request could not be grounded in every configured vector store. "
+                f"{len(self.failures)} vector store search(es) failed: {detail}"
+            ),
+            model=model,
+            llm_provider=llm_provider,
+            body={"type": "invalid_request_error", "code": VECTOR_STORE_SEARCH_FAILED_CODE},
+        )
+
+
 class UnprocessableEntityError(openai.UnprocessableEntityError):
     def __init__(
         self,
@@ -338,6 +364,7 @@ class Timeout(openai.APITimeoutError):
         num_retries: int | None = None,
         headers: dict | None = None,
         exception_status_code: int | None = None,
+        response: httpx.Response | None = None,
     ):
         request: Final = httpx.Request(
             method="POST",
@@ -352,6 +379,8 @@ class Timeout(openai.APITimeoutError):
         self.max_retries = max_retries
         self.num_retries = num_retries
         self.headers = headers
+        if response is not None:
+            self.response = response
 
     # custom function to convert to str
     def __str__(self):
@@ -436,6 +465,7 @@ class RateLimitError(openai.RateLimitError):
         rate_limit_type: str | RateLimitType | None = None,
         headers: dict[str, str] | None = None,
         detail: Any = None,
+        body: object | None = None,
     ):
         self.status_code = 429
         self.message = f"litellm.RateLimitError: {message}"
@@ -472,13 +502,14 @@ class RateLimitError(openai.RateLimitError):
         self.response = httpx.Response(
             status_code=429,
             headers=_response_headers,
+            content=response.content if response is not None else None,
             request=httpx.Request(
                 method="POST",
                 url=" https://cloud.google.com/vertex-ai/",
             ),
         )
         super().__init__(
-            self.message, response=self.response, body=None
+            self.message, response=self.response, body=body
         )  # Call the base class constructor with the parameters it needs
         self.code = "429"
         self.type = "throttling_error"
@@ -498,37 +529,6 @@ class RateLimitError(openai.RateLimitError):
         if self.max_retries:
             _message += f", LiteLLM Max Retries: {self.max_retries}"
         return _message
-
-
-class MaxParallelRequestsError(RateLimitError):
-    """
-    Raised by the router when a deployment's ``max_parallel_requests`` /
-    ``provider_max_parallel_requests`` semaphore is saturated and the request
-    would otherwise have to block waiting for a slot.
-
-    The router deliberately does NOT block here: a blocking acquire lets
-    requests pile up behind the cap and silently multiplies effective
-    concurrency. Raising a ``RateLimitError`` subclass instead means the
-    standard fallback machinery diverts the request to another deployment /
-    model group (``default_fallbacks``), and the proxy surfaces a clean 429
-    when no capacity exists anywhere.
-    """
-
-    def __init__(
-        self,
-        message,
-        model,
-        llm_provider="",
-        **kwargs,
-    ):
-        super().__init__(
-            message=message,
-            llm_provider=llm_provider,
-            model=model,
-            category=RateLimitErrorCategory.LITELLM_RATE_LIMIT,
-            rate_limit_type=RateLimitType.CONCURRENT_REQUESTS,
-            **kwargs,
-        )
 
 
 # sub class of rate limit error - meant to give more granularity for error handling context window exceeded errors
@@ -767,6 +767,7 @@ class InternalServerError(openai.InternalServerError):
         litellm_debug_info: str | None = None,
         max_retries: int | None = None,
         num_retries: int | None = None,
+        body: object | None = None,
     ):
         self.status_code = 500
         self.message = f"litellm.InternalServerError: {message}"
@@ -785,8 +786,9 @@ class InternalServerError(openai.InternalServerError):
             ),
         )
         super().__init__(
-            self.message, response=self.response, body=None
+            self.message, response=self.response, body=body
         )  # Call the base class constructor with the parameters it needs
+        self.type = "internal_server_error"
 
     def __str__(self):
         _message = self.message
@@ -817,6 +819,7 @@ class APIError(openai.APIError):
         litellm_debug_info: str | None = None,
         max_retries: int | None = None,
         num_retries: int | None = None,
+        body: object | None = None,
     ):
         self.status_code = status_code
         self.message = f"litellm.APIError: {message}"
@@ -827,7 +830,7 @@ class APIError(openai.APIError):
         self.num_retries = num_retries
         if request is None:
             request = httpx.Request(method="POST", url="https://api.openai.com/v1")
-        super().__init__(self.message, request=request, body=None)
+        super().__init__(self.message, request=request, body=body)
 
     def __str__(self):
         _message = self.message
@@ -973,7 +976,6 @@ LITELLM_EXCEPTION_TYPES: Final = [
     Timeout,
     PermissionDeniedError,
     RateLimitError,
-    MaxParallelRequestsError,
     ContextWindowExceededError,
     RejectedRequestError,
     ContentPolicyViolationError,
@@ -989,6 +991,10 @@ LITELLM_EXCEPTION_TYPES: Final = [
 ]
 
 
+class ModelNotMappedError(Exception):
+    pass
+
+
 class BudgetExceededError(Exception):
     def __init__(
         self,
@@ -1001,7 +1007,7 @@ class BudgetExceededError(Exception):
     ):
         self.current_cost = current_cost
         self.max_budget = max_budget
-        self.status_code = 429
+        self.status_code = litellm.budget_exceeded_status_code
         self.llm_provider = llm_provider or ""
         self.entity_type = entity_type
         self.entity_id = entity_id

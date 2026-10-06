@@ -783,7 +783,9 @@ async def test_managed_model_lists_are_request_local_policy_scopes(store: FakeTx
         get_model_access_groups=lambda: {},
         get_fully_blocked_model_names=lambda: set(),
         get_model_list=lambda: [],
-        get_configured_token_limits=lambda model: (None, None),
+        model_group_alias={},
+        get_model_listing_info=lambda model: None,
+        get_configured_mode=lambda model: None,
     )
     token: Final = UserAPIKeyAuth(user_id=ACCOUNT, team_id=FLAT_TEAM_ID, models=[*KEY_MODELS], team_models=[])
     request: Final = Request({"type": "http", "method": "GET", "path": "/v1/models", "headers": []})
@@ -849,7 +851,9 @@ async def test_managed_model_detail_filters_to_policy_without_admin_model_info(
         get_model_access_groups=lambda: {},
         get_fully_blocked_model_names=lambda: set(),
         get_model_list=lambda: [],
-        get_configured_token_limits=lambda model: (None, None),
+        model_group_alias={},
+        get_model_listing_info=lambda model: None,
+        get_configured_mode=lambda model: None,
         get_deployment_by_model_group_name=lambda model: SimpleNamespace(
             litellm_params=SimpleNamespace(model=f"openai/{model}"), model_info={}
         ),

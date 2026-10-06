@@ -212,7 +212,7 @@ class TestHeaderOnlyEverHoldsTheProvidersNumber:
 
     @staticmethod
     def _propagate(response: ModelResponse) -> None:
-        CustomStreamWrapper._propagate_usage_cost_to_hidden_params(response)  # pyright: ignore[reportPrivateUsage]
+        CustomStreamWrapper._propagate_usage_cost_to_hidden_params(response, "openrouter")  # pyright: ignore[reportPrivateUsage]
 
     def test_the_providers_usage_cost_is_copied_to_the_header(self) -> None:
         response = _response()
@@ -455,12 +455,20 @@ class TestCostVisibleOnCacheHits:
 
 
 class TestStreamingUsageCostVisibility:
-    async def test_the_provider_cost_is_not_shown_when_cost_is_not_included(
+    async def test_the_billed_cost_replaces_the_provider_cost_even_when_cost_is_not_included(
         self, capture: _Capture, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(litellm, "include_cost_in_streaming_usage", False)
         usage = await _client_usage(OR_MODEL, OR_URL, {"cost": PROVIDER_COST}, stream=True)
-        assert getattr(usage, "cost", None) is None
+        assert usage.cost == pytest.approx(PROVIDER_COST * 1.30)  # type: ignore[attr-defined]
+
+    async def test_a_token_priced_stream_shows_the_billed_cost_and_bills_it_once(
+        self, capture: _Capture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(litellm, "include_cost_in_streaming_usage", False)
+        usage = await _client_usage(OR_MODEL, OR_URL, {}, stream=True)
+        assert usage.cost == pytest.approx(TOKEN_COST * 1.30)  # type: ignore[attr-defined]
+        assert capture.costs == [pytest.approx(TOKEN_COST * 1.30)]
 
     async def test_a_zero_provider_cost_is_shown_as_the_billed_zero(
         self, capture: _Capture, monkeypatch: pytest.MonkeyPatch

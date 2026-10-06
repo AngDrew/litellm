@@ -5,14 +5,18 @@ from pydantic import ValidationError
 
 from litellm.proxy._types import (
     ROLES_WITHIN_ORG,
+    ChangePasswordRequest,
     GenerateKeyRequest,
     KeyRequest,
     LiteLLM_AuditLogs,
     LiteLLM_TeamMembership,
     LitellmUserRoles,
+    NewMCPServerRequest,
+    NewUserRequest,
     OrganizationMemberUpdateRequest,
     ResetSpendRequest,
     UpdateKeyRequest,
+    UpdateMCPServerRequest,
     UpdateUserRequest,
     UserAPIKeyAuth,
 )
@@ -277,3 +281,162 @@ def test_team_membership_budget_table_present_still_works():
     }
     result = LiteLLM_TeamMembership.model_validate(data)
     assert result.litellm_budget_table is None
+
+
+def test_a_jwt_issuer_can_override_the_virtual_key_claim_field_while_other_issuers_keep_the_global_one():
+    from litellm.proxy._types import LiteLLM_JWTAuth, UnregisteredJWTClientBehavior
+
+    jwt_auth = LiteLLM_JWTAuth(
+        virtual_key_claim_field="client_id",
+        issuers=[
+            {
+                "issuer": "https://team-idp.example.com",
+                "jwks_url": "https://team-idp.example.com/keys",
+                "audience": "litellm",
+                "team_id_jwt_field": "sub",
+            },
+            {
+                "issuer": "https://service-idp.example.com",
+                "jwks_url": "https://service-idp.example.com/keys",
+                "audience": "litellm",
+                "virtual_key_claim_field": "sub",
+                "unregistered_jwt_client_behavior": "reject",
+            },
+        ],
+    )
+
+    assert jwt_auth.get_virtual_key_claim_field("https://service-idp.example.com") == "sub"
+    assert jwt_auth.get_unregistered_jwt_client_behavior("https://service-idp.example.com") is (
+        UnregisteredJWTClientBehavior.REJECT
+    )
+    assert jwt_auth.get_virtual_key_claim_field("https://team-idp.example.com") == "client_id"
+    assert jwt_auth.get_unregistered_jwt_client_behavior("https://team-idp.example.com") is (
+        UnregisteredJWTClientBehavior.FALLBACK_TEAM_MAPPING
+    )
+    assert jwt_auth.get_virtual_key_claim_field(None) == "client_id"
+    assert jwt_auth.get_virtual_key_claim_field("https://unknown-idp.example.com") == "client_id"
+
+
+@pytest.mark.parametrize(
+    ("global_field", "issuer_field", "is_configured"),
+    ((None, None, False), ("sub", None, True), (None, "sub", True)),
+)
+def test_virtual_key_mapping_counts_as_configured_when_any_issuer_sets_the_claim_field(
+    global_field, issuer_field, is_configured
+):
+    from litellm.proxy._types import LiteLLM_JWTAuth
+
+    jwt_auth = LiteLLM_JWTAuth(
+        virtual_key_claim_field=global_field,
+        issuers=[
+            {
+                "issuer": "https://idp.example.com",
+                "jwks_url": "https://idp.example.com/keys",
+                "audience": "litellm",
+                "virtual_key_claim_field": issuer_field,
+            }
+        ],
+    )
+
+    assert jwt_auth.is_virtual_key_mapping_configured() is is_configured
+
+
+def test_new_user_request_loudly_rejects_a_password():
+    """
+    /user/new has never persisted a password (the field used to be silently
+    dropped). Sending one must now fail visibly so the dead path cannot be
+    revived without going through the password policy.
+    """
+    with pytest.raises(ValidationError, match="invitation link"):
+        NewUserRequest(user_email="alice@example.com", password="hunter2hunter2")
+
+
+def test_new_user_request_without_password_still_works():
+    request = NewUserRequest(user_email="alice@example.com")
+    assert request.password is None
+
+
+def test_update_user_request_accepts_a_password():
+    """Admins set user passwords through /user/update; the value must survive
+    model validation so the endpoint can policy-check and hash it."""
+    request = UpdateUserRequest(user_id="user-123", password="hunter2hunter2")
+    assert request.password == "hunter2hunter2"
+
+
+def test_update_user_request_password_hidden_from_repr():
+    """management_endpoint_wrapper string-formats endpoint kwargs into Slack
+    alerts, so the model's repr/str must never contain the plaintext password."""
+    request = UpdateUserRequest(user_id="user-123", password="hunter2hunter2")
+    assert "hunter2hunter2" not in repr(request)
+    assert "hunter2hunter2" not in str(request)
+
+
+def test_change_password_request_passwords_hidden_from_repr():
+    """Any accidental str()/repr() of the request model (debug logs, exception
+    handlers, a future management_endpoint_wrapper) must never contain either
+    plaintext password."""
+    request = ChangePasswordRequest(current_password="hunter2hunter2", new_password="NewP@ssw0rd-2026")
+    for rendered in (repr(request), str(request)):
+        assert "hunter2hunter2" not in rendered
+        assert "NewP@ssw0rd-2026" not in rendered
+
+
+MCP_SERVER_REQUESTS = (NewMCPServerRequest, UpdateMCPServerRequest)
+STDIO_SERVER_FIELDS = {"server_id": "stdio-1", "transport": "stdio", "command": "python", "args": ["server.py"]}
+
+
+@pytest.mark.parametrize("request_model", MCP_SERVER_REQUESTS)
+def test_a_stdio_mcp_server_is_refused_while_stdio_is_not_enabled(monkeypatch, request_model):
+    monkeypatch.delenv("LITELLM_ENABLE_MCP_STDIO", raising=False)
+
+    with pytest.raises(ValidationError, match="LITELLM_ENABLE_MCP_STDIO=true"):
+        request_model(**STDIO_SERVER_FIELDS)
+
+
+@pytest.mark.parametrize("request_model", MCP_SERVER_REQUESTS)
+@pytest.mark.parametrize("flag", ["true", "TRUE", " True "])
+def test_a_stdio_mcp_server_is_accepted_once_stdio_is_enabled(monkeypatch, request_model, flag):
+    monkeypatch.setenv("LITELLM_ENABLE_MCP_STDIO", flag)
+
+    assert request_model(**STDIO_SERVER_FIELDS).command == "python"
+
+
+@pytest.mark.parametrize("request_model", MCP_SERVER_REQUESTS)
+@pytest.mark.parametrize("flag", ["false", "1", "yes", ""])
+def test_only_an_explicit_true_enables_stdio_mcp_servers(monkeypatch, request_model, flag):
+    monkeypatch.setenv("LITELLM_ENABLE_MCP_STDIO", flag)
+
+    with pytest.raises(ValidationError, match="LITELLM_ENABLE_MCP_STDIO=true"):
+        request_model(**STDIO_SERVER_FIELDS)
+
+
+@pytest.mark.parametrize("request_model", MCP_SERVER_REQUESTS)
+def test_a_stdio_command_outside_the_allowlist_is_refused_even_when_stdio_is_enabled(monkeypatch, request_model):
+    monkeypatch.setenv("LITELLM_ENABLE_MCP_STDIO", "true")
+
+    with pytest.raises(ValidationError, match="not in the allowed commands list"):
+        request_model(**{**STDIO_SERVER_FIELDS, "command": "/bin/sh"})
+
+
+@pytest.mark.parametrize("request_model", MCP_SERVER_REQUESTS)
+@pytest.mark.parametrize("missing", ["command", "args"])
+def test_an_enabled_stdio_mcp_server_still_needs_a_command_and_args(monkeypatch, request_model, missing):
+    monkeypatch.setenv("LITELLM_ENABLE_MCP_STDIO", "true")
+
+    with pytest.raises(ValidationError, match=f"{missing} is required for stdio transport"):
+        request_model(**{k: v for k, v in STDIO_SERVER_FIELDS.items() if k != missing})
+
+
+@pytest.mark.parametrize("request_model", MCP_SERVER_REQUESTS)
+def test_an_http_mcp_server_is_unaffected_by_the_stdio_flag(monkeypatch, request_model):
+    monkeypatch.delenv("LITELLM_ENABLE_MCP_STDIO", raising=False)
+
+    assert request_model(server_id="http-1", transport="http", url="https://mcp.example.com").url == "https://mcp.example.com"
+    with pytest.raises(ValidationError, match="url or spec_path is required"):
+        request_model(server_id="http-1", transport="http")
+
+
+@pytest.mark.parametrize("request_model", MCP_SERVER_REQUESTS)
+def test_a_non_mapping_mcp_server_payload_gets_a_validation_error(request_model):
+    with pytest.raises(ValidationError, match="valid dictionary"):
+        request_model.model_validate("not-a-server")

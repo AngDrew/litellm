@@ -1,20 +1,30 @@
+import inspect
 import json
 import re
 import traceback
-from typing import Any, Final, Protocol, cast
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import Final, Protocol, TypeVar, cast
+
+_ScrubbedText = TypeVar("_ScrubbedText")
 
 
-def _scrub_provider_name(text: Any) -> Any:
+def _scrub_provider_name(text: _ScrubbedText) -> _ScrubbedText:
     # ponytail: hide upstream provider name from any user-facing error text.
     # Generic so future provider names are covered by the same hook.
     if not isinstance(text, str):
         return text
-    return re.sub(r"(?i)neuralwatt", "provider", text)
+    return cast(_ScrubbedText, re.sub(r"(?i)neuralwatt", "provider", text))  # cast-ok: str in, str out
 
 import httpx
 
 import litellm
 from litellm._logging import _ENABLE_SECRET_REDACTION, _redact_string, verbose_logger
+from litellm.litellm_core_utils.bug_report import (
+    bug_report_notice,
+    build_bug_report,
+    should_report_bug,
+)
 from litellm.litellm_core_utils.secret_redaction import redact_string
 from litellm.types.utils import LlmProviders
 
@@ -199,7 +209,7 @@ def _get_response_headers(original_exception: Exception) -> httpx.Headers | None
     _response_headers: httpx.Headers | None = None
     try:
         _response_headers = getattr(original_exception, "headers", None)
-        error_response: Final = getattr(original_exception, "response", None)
+        error_response: Final[object] = getattr(original_exception, "response", None)
         if not _response_headers and error_response:
             _response_headers = getattr(error_response, "headers", None)
         if not _response_headers:
@@ -210,11 +220,17 @@ def _get_response_headers(original_exception: Exception) -> httpx.Headers | None
     return _response_headers
 
 
+def _accepted_init_kwargs(exception_class: type[Exception], candidates: Mapping[str, object]) -> Mapping[str, object]:
+    accepted: Final = inspect.signature(exception_class).parameters
+    return MappingProxyType({name: value for name, value in candidates.items() if name in accepted})
+
+
 def extract_and_raise_litellm_exception(
-    response: Any | None,
+    response: object | None,
     error_str: str,
     model: str,
     custom_llm_provider: str,
+    body: object | None = None,
 ):
     """
     Covers scenario where litellm sdk calling proxy.
@@ -224,32 +240,19 @@ def extract_and_raise_litellm_exception(
     Relevant Issue: https://github.com/BerriAI/litellm/issues/7259
     """
     pattern: Final = r"litellm\.\w+Error"
-
-    # Search for the exception in the error string
     match: Final = re.search(pattern, error_str)
-
-    # Extract the exception if found
-    if match:
-        exception_name = match.group(0)
-        exception_name = exception_name.strip().replace("litellm.", "")
-        raised_exception_obj: Final = getattr(litellm, exception_name, None)
-        if raised_exception_obj:
-            # Try with response parameter first, fall back to without it
-            # Some exceptions (e.g., APIConnectionError) don't accept response param
-            try:
-                raise raised_exception_obj(
-                    message=error_str,
-                    llm_provider=custom_llm_provider,
-                    model=model,
-                    response=response,
-                )
-            except TypeError:
-                # Exception doesn't accept response parameter
-                raise raised_exception_obj(
-                    message=error_str,
-                    llm_provider=custom_llm_provider,
-                    model=model,
-                )
+    if match is None:
+        return
+    exception_name: Final = match.group(0).removeprefix("litellm.")
+    raised_exception_obj: Final = getattr(litellm, exception_name, None)
+    if not raised_exception_obj:
+        return
+    raise raised_exception_obj(
+        message=error_str,
+        llm_provider=custom_llm_provider,
+        model=model,
+        **_accepted_init_kwargs(raised_exception_obj, MappingProxyType({"response": response, "body": body})),
+    )
 
 
 class _ProviderHTTPException(Protocol):
@@ -260,6 +263,23 @@ class _ProviderHTTPException(Protocol):
     body: object
     code: str
     llm_provider: str
+
+
+def _litellm_proxy_response(
+    original_exception: _ProviderHTTPException, custom_llm_provider: str
+) -> httpx.Response | None:
+    response: Final = getattr(original_exception, "response", None)
+    if custom_llm_provider != "litellm_proxy" or not isinstance(response, httpx.Response) or response.headers:
+        return response
+    headers: Final = getattr(original_exception, "headers", None)
+    if not isinstance(headers, Mapping) or not headers:
+        return response
+    pairs: Final = headers.multi_items() if isinstance(headers, httpx.Headers) else headers.items()
+    return httpx.Response(
+        status_code=response.status_code,
+        headers=[(str(k), str(v)) for k, v in pairs],
+        request=getattr(original_exception, "request", None),
+    )
 
 
 def _map_openai_exception(
@@ -273,6 +293,7 @@ def _map_openai_exception(
     extra_information: str,
     hide_provider: bool = False,
 ) -> None:
+    response: Final = _litellm_proxy_response(original_exception, custom_llm_provider)
     # custom_llm_provider is openai, make it OpenAI
     message = get_error_message(error_obj=original_exception)
     if message is None:
@@ -305,14 +326,15 @@ def _map_openai_exception(
             message=f"RateLimitError: {exception_provider} - {message}",
             model=model,
             llm_provider=custom_llm_provider,
-            response=getattr(original_exception, "response", None),
+            response=response,
+            body=getattr(original_exception, "body", None),
         )
     elif ExceptionCheckers.is_error_str_context_window_exceeded(error_str):
         raise ContextWindowExceededError(
             message=f"ContextWindowExceededError: {exception_provider} - {message}",
             llm_provider=custom_llm_provider,
             model=model,
-            response=getattr(original_exception, "response", None),
+            response=response,
             litellm_debug_info=extra_information,
         )
     elif "invalid_request_error" in error_str and "model_not_found" in error_str:
@@ -320,7 +342,7 @@ def _map_openai_exception(
             message=f"{exception_provider} - {message}",
             llm_provider=custom_llm_provider,
             model=model,
-            response=getattr(original_exception, "response", None),
+            response=response,
             litellm_debug_info=extra_information,
         )
     elif "A timeout occurred" in error_str:
@@ -339,8 +361,9 @@ def _map_openai_exception(
             message=f"ContentPolicyViolationError: {exception_provider} - {message}",
             llm_provider=custom_llm_provider,
             model=model,
-            response=getattr(original_exception, "response", None),
+            response=response,
             litellm_debug_info=extra_information,
+            body=getattr(original_exception, "body", None),
         )
     elif "invalid_encrypted_content" in error_str or "could not be verified" in error_str:
         helpful_message: Final = (
@@ -358,7 +381,7 @@ def _map_openai_exception(
             message=helpful_message,
             llm_provider=custom_llm_provider,
             model=model,
-            response=getattr(original_exception, "response", None),
+            response=response,
             litellm_debug_info=extra_information,
             body=getattr(original_exception, "body", None),
         )
@@ -367,7 +390,7 @@ def _map_openai_exception(
             message=f"{exception_provider} - {message}",
             llm_provider=custom_llm_provider,
             model=model,
-            response=getattr(original_exception, "response", None),
+            response=response,
             litellm_debug_info=extra_information,
             body=getattr(original_exception, "body", None),
         )
@@ -379,14 +402,16 @@ def _map_openai_exception(
             message=f"{exception_provider} - {message}",
             model=model,
             llm_provider=custom_llm_provider,
+            body=getattr(original_exception, "body", None),
         )
     elif "Request too large" in error_str:
         raise RateLimitError(
             message=f"RateLimitError: {exception_provider} - {message}",
             model=model,
             llm_provider=custom_llm_provider,
-            response=getattr(original_exception, "response", None),
+            response=response,
             litellm_debug_info=extra_information,
+            body=getattr(original_exception, "body", None),
         )
     elif (
         "The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable"
@@ -396,7 +421,7 @@ def _map_openai_exception(
             message=f"AuthenticationError: {exception_provider} - {message}",
             llm_provider=custom_llm_provider,
             model=model,
-            response=getattr(original_exception, "response", None),
+            response=response,
             litellm_debug_info=extra_information,
         )
     elif "Mistral API raised a streaming error" in error_str:
@@ -415,15 +440,16 @@ def _map_openai_exception(
                 message=f"{exception_provider} - {message}",
                 llm_provider=custom_llm_provider,
                 model=model,
-                response=getattr(original_exception, "response", None),
+                response=response,
                 litellm_debug_info=extra_information,
+                body=getattr(original_exception, "body", None),
             )
         elif original_exception.status_code == 401:
             raise AuthenticationError(
                 message=f"AuthenticationError: {exception_provider} - {message}",
                 llm_provider=custom_llm_provider,
                 model=model,
-                response=getattr(original_exception, "response", None),
+                response=response,
                 litellm_debug_info=extra_information,
             )
         elif original_exception.status_code == 404:
@@ -431,7 +457,7 @@ def _map_openai_exception(
                 message=f"NotFoundError: {exception_provider} - {message}",
                 model=model,
                 llm_provider=custom_llm_provider,
-                response=getattr(original_exception, "response", None),
+                response=response,
                 litellm_debug_info=extra_information,
             )
         elif original_exception.status_code == 408:
@@ -446,7 +472,7 @@ def _map_openai_exception(
                 message=f"{exception_provider} - {message}",
                 model=model,
                 llm_provider=custom_llm_provider,
-                response=getattr(original_exception, "response", None),
+                response=response,
                 litellm_debug_info=extra_information,
                 body=getattr(original_exception, "body", None),
             )
@@ -455,23 +481,25 @@ def _map_openai_exception(
                 message=f"RateLimitError: {exception_provider} - {message}",
                 model=model,
                 llm_provider=custom_llm_provider,
-                response=getattr(original_exception, "response", None),
+                response=response,
                 litellm_debug_info=extra_information,
+                body=getattr(original_exception, "body", None),
             )
         elif original_exception.status_code == 500:
             raise InternalServerError(
                 message=f"InternalServerError: {exception_provider} - {message}",
                 model=model,
                 llm_provider=custom_llm_provider,
-                response=getattr(original_exception, "response", None),
+                response=response,
                 litellm_debug_info=extra_information,
+                body=getattr(original_exception, "body", None),
             )
         elif original_exception.status_code == 502:
             raise BadGatewayError(
                 message=f"BadGatewayError: {exception_provider} - {message}",
                 model=model,
                 llm_provider=custom_llm_provider,
-                response=getattr(original_exception, "response", None),
+                response=response,
                 litellm_debug_info=extra_information,
             )
         elif original_exception.status_code == 503:
@@ -479,7 +507,7 @@ def _map_openai_exception(
                 message=f"ServiceUnavailableError: {exception_provider} - {message}",
                 model=model,
                 llm_provider=custom_llm_provider,
-                response=getattr(original_exception, "response", None),
+                response=response,
                 litellm_debug_info=extra_information,
             )
         elif original_exception.status_code == 504:  # gateway timeout error
@@ -873,6 +901,7 @@ def _map_bedrock_exception(
                 message=mantle_context_window_message,
                 model=model,
                 llm_provider=custom_llm_provider,
+                response=getattr(original_exception, "response", None),
             )
     if (
         "too many tokens" in error_str
@@ -886,6 +915,7 @@ def _map_bedrock_exception(
             message=f"BedrockException: Context Window Error - {error_str}",
             model=model,
             llm_provider="bedrock",
+            response=getattr(original_exception, "response", None),
         )
     elif "Conversation blocks and tool result blocks cannot be provided in the same turn." in error_str:
         raise BadRequestError(
@@ -937,12 +967,14 @@ def _map_bedrock_exception(
             message=f"BedrockException: Timeout Error - {error_str}",
             model=model,
             llm_provider="bedrock",
+            response=getattr(original_exception, "response", None),
         )
     elif "Could not process image" in error_str:
         raise litellm.InternalServerError(
             message=f"BedrockException - {error_str}",
             model=model,
             llm_provider="bedrock",
+            response=getattr(original_exception, "response", None),
         )
     elif hasattr(original_exception, "status_code"):
         if original_exception.status_code == 500:
@@ -950,10 +982,7 @@ def _map_bedrock_exception(
                 message=f"BedrockException - {original_exception.message}",
                 llm_provider="bedrock",
                 model=model,
-                response=httpx.Response(
-                    status_code=500,
-                    request=httpx.Request(method="POST", url="https://api.openai.com/v1/"),
-                ),
+                response=getattr(original_exception, "response", None),
             )
         elif original_exception.status_code == 401:
             raise AuthenticationError(
@@ -982,6 +1011,7 @@ def _map_bedrock_exception(
                 model=model,
                 llm_provider=custom_llm_provider,
                 litellm_debug_info=extra_information,
+                response=getattr(original_exception, "response", None),
             )
         elif original_exception.status_code == 422:
             raise BadRequestError(
@@ -1014,6 +1044,7 @@ def _map_bedrock_exception(
                 llm_provider=custom_llm_provider,
                 litellm_debug_info=extra_information,
                 exception_status_code=original_exception.status_code,
+                response=getattr(original_exception, "response", None),
             )
 
 
@@ -2447,10 +2478,11 @@ def exception_type(
                 custom_llm_provider == "litellm_proxy"
             ):  # handle special case where calling litellm proxy + exception str contains error message
                 extract_and_raise_litellm_exception(
-                    response=getattr(original_exception, "response", None),
+                    response=_litellm_proxy_response(mappable_exception, custom_llm_provider),
                     error_str=error_str,
                     model=model,
                     custom_llm_provider=custom_llm_provider,
+                    body=getattr(original_exception, "body", None),
                 )
             if (
                 custom_llm_provider == "openai"
@@ -2655,61 +2687,6 @@ def exception_type(
                 llm_provider=custom_llm_provider,
                 response=getattr(original_exception, "response", None),
             )
-        elif (
-            custom_llm_provider == "neuralwatt"
-            and hasattr(original_exception, "status_code")
-        ):
-            exception_mapping_worked = True
-            if original_exception.status_code == 400:
-                raise BadRequestError(
-                    message=f"{exception_provider} - {error_str}",
-                    llm_provider=custom_llm_provider,
-                    model=model,
-                    response=getattr(original_exception, "response", None),
-                    litellm_debug_info=extra_information,
-                    body=getattr(original_exception, "body", None),
-                )
-            elif original_exception.status_code == 401:
-                raise AuthenticationError(
-                    message=f"{exception_provider} AuthenticationError - {error_str}",
-                    llm_provider=custom_llm_provider,
-                    model=model,
-                    response=getattr(original_exception, "response", None),
-                    litellm_debug_info=extra_information,
-                )
-            elif original_exception.status_code == 429:
-                raise RateLimitError(
-                    message=f"{exception_provider} RateLimitError - {error_str}",
-                    model=model,
-                    llm_provider=custom_llm_provider,
-                    response=getattr(original_exception, "response", None),
-                    litellm_debug_info=extra_information,
-                )
-            elif original_exception.status_code == 503:
-                raise ServiceUnavailableError(
-                    message=f"{exception_provider} ServiceUnavailableError - {error_str}",
-                    model=model,
-                    llm_provider=custom_llm_provider,
-                    response=getattr(original_exception, "response", None),
-                    litellm_debug_info=extra_information,
-                )
-            elif original_exception.status_code == 500:
-                raise InternalServerError(
-                    message=f"{exception_provider} InternalServerError - {error_str}",
-                    model=model,
-                    llm_provider=custom_llm_provider,
-                    response=getattr(original_exception, "response", None),
-                    litellm_debug_info=extra_information,
-                )
-            else:
-                raise APIError(
-                    status_code=original_exception.status_code,
-                    message=f"APIError: {exception_provider} - {error_str}",
-                    llm_provider=custom_llm_provider,
-                    model=model,
-                    request=getattr(original_exception, "request", None),
-                    litellm_debug_info=extra_information,
-                )
         else:  # ensure generic errors always return APIConnectionError=
             """
             For unmapped exceptions - raise the exception with traceback - https://github.com/BerriAI/litellm/issues/4201
@@ -2731,8 +2708,20 @@ def exception_type(
                     request=getattr(original_exception, "request", None),
                 )
             else:
+                unmapped_message: Final = f"{original_exception}\n{_redact_string(traceback.format_exc())}" + (
+                    "\n"
+                    + bug_report_notice(
+                        build_bug_report(
+                            original_exception,
+                            surface="sdk",
+                            custom_llm_provider=custom_llm_provider,
+                        )
+                    )
+                    if should_report_bug(original_exception)
+                    else ""
+                )
                 raise APIConnectionError(
-                    message=f"{_scrub_provider_name(str(original_exception)) if _hide_provider else str(original_exception)}\n{_scrub_provider_name(_redact_string(traceback.format_exc())) if _hide_provider else _redact_string(traceback.format_exc())}",
+                    message=_scrub_provider_name(unmapped_message) if _hide_provider else unmapped_message,
                     llm_provider=custom_llm_provider,
                     model=model,
                     request=httpx.Request(method="POST", url="https://api.openai.com/v1/"),  # stub the request

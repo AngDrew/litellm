@@ -311,6 +311,35 @@ def test_neuralwatt_503_maps_to_service_unavailable():
     assert mapped_exc_info.value.response.headers["retry-after"] == "5"
 
 
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [
+        (400, litellm.BadRequestError),
+        (403, litellm.PermissionDeniedError),
+        (404, litellm.NotFoundError),
+        (422, litellm.BadRequestError),
+        (429, litellm.RateLimitError),
+        (500, litellm.InternalServerError),
+    ],
+)
+def test_neuralwatt_errors_map_by_status_without_naming_the_provider(status_code, expected):
+    response = MockErrorResponse(
+        status_code,
+        {"error": {"message": "NeuralWatt rejected the call at api.neuralwatt.com"}},
+    )
+    with pytest.raises(CustomLLMError) as exc_info:
+        _raise_for_status(response)
+
+    with pytest.raises(expected) as mapped_exc_info:
+        exception_type(
+            model="neuralwatt/glm-5.2",
+            original_exception=exc_info.value,
+            custom_llm_provider="neuralwatt",
+        )
+
+    assert "neuralwatt" not in str(mapped_exc_info.value).lower()
+
+
 def test_neuralwatt_private_financial_headers_are_not_forwarded():
     response = MockErrorResponse(
         429,

@@ -1,5 +1,6 @@
 import React from "react";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import MCPServerCard from "./MCPServerCard";
 import type { MCPServer } from "@/components/mcp_tools/types";
@@ -65,5 +66,83 @@ describe("MCPServerCard logo", () => {
     renderCard({ mcp_info: { server_name: "demo_server" } });
     expect(screen.queryByAltText("demo_server logo")).not.toBeInTheDocument();
     expect(screen.getByText("DE")).toBeInTheDocument();
+  });
+});
+
+describe("MCPServerCard per-user credentials", () => {
+  const renderUserFields = (props: { missingUserFields?: string[]; hasUserFields?: boolean }) => {
+    const onOpenFillFields = vi.fn();
+    const onClick = vi.fn();
+    render(<MCPServerCard server={baseServer} onClick={onClick} onOpenFillFields={onOpenFillFields} {...props} />);
+    return { onOpenFillFields, onClick };
+  };
+
+  it("offers Set while a field is missing", () => {
+    const { onOpenFillFields, onClick } = renderUserFields({ missingUserFields: ["USER_TOKEN"], hasUserFields: true });
+    expect(screen.getByText("1 user field missing")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Update" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Set" }));
+    expect(onOpenFillFields).toHaveBeenCalledTimes(1);
+    expect(onClick).not.toHaveBeenCalled();
+  });
+
+  it("keeps an Update entry point once every field is set", () => {
+    const { onOpenFillFields, onClick } = renderUserFields({ missingUserFields: [], hasUserFields: true });
+    expect(screen.getByText("Per-user credentials")).toBeInTheDocument();
+    expect(screen.getByText("Set")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Set" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/user field/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+    expect(onOpenFillFields).toHaveBeenCalledTimes(1);
+    expect(onClick).not.toHaveBeenCalled();
+  });
+
+  it("keeps Enter on the Update button away from the card's open handler", () => {
+    const { onClick } = renderUserFields({ missingUserFields: [], hasUserFields: true });
+    const update = screen.getByRole("button", { name: "Update" });
+    expect(fireEvent.keyDown(update, { key: "Enter" }), "default activation must survive").toBe(true);
+    expect(onClick).not.toHaveBeenCalled();
+    fireEvent.keyDown(screen.getAllByRole("button")[0], { key: "Enter" });
+    expect(onClick).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders no credential row for a server without per-user fields", () => {
+    renderUserFields({ missingUserFields: [], hasUserFields: false });
+    expect(screen.queryByText("Per-user credentials")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Update" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Set" })).not.toBeInTheDocument();
+  });
+});
+
+describe("MCPServerCard stdio availability", () => {
+  const stdioServer = { transport: "stdio", url: undefined, command: "python", args: ["server.py"], auth_type: "none" };
+
+  it("flags a stdio server with how to enable stdio when the proxy has it off", async () => {
+    const user = userEvent.setup();
+    render(
+      <MCPServerCard server={{ ...baseServer, ...stdioServer } as MCPServer} onClick={vi.fn()} stdioEnabled={false} />,
+    );
+
+    await user.hover(screen.getByText("stdio disabled"));
+
+    expect(
+      await screen.findByText(
+        "stdio MCP servers are disabled on this proxy. Set LITELLM_ENABLE_MCP_STDIO=true on the proxy and restart to enable them",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("does not flag a stdio server when the proxy has stdio on", () => {
+    render(<MCPServerCard server={{ ...baseServer, ...stdioServer } as MCPServer} onClick={vi.fn()} stdioEnabled />);
+
+    expect(screen.getByText("STDIO")).toBeInTheDocument();
+    expect(screen.queryByText("stdio disabled")).not.toBeInTheDocument();
+  });
+
+  it("does not flag a non-stdio server when the proxy has stdio off", () => {
+    render(<MCPServerCard server={baseServer} onClick={vi.fn()} stdioEnabled={false} />);
+
+    expect(screen.getByText("HTTP")).toBeInTheDocument();
+    expect(screen.queryByText("stdio disabled")).not.toBeInTheDocument();
   });
 });

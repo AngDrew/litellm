@@ -1,4 +1,6 @@
 import os
+import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -34,6 +36,32 @@ class TestPrismaMigration:
 
         mock_run_server.assert_called_once_with(("--skip_server_startup",), standalone_mode=False)
 
+    @pytest.mark.parametrize(
+        ("value", "enforces"),
+        [
+            ("0", False),
+            ("no", False),
+            ("off", False),
+            ("FALSE", False),
+            ("1", True),
+            ("yes", True),
+            ("", True),
+            ("maybe", True),
+        ],
+    )
+    @patch("litellm.proxy.prisma_migration.subprocess.run")
+    @patch("litellm.proxy.prisma_migration.run_server")
+    def test_main_reads_the_same_opt_out_values_as_the_proxy_flag(
+        self, mock_run_server: MagicMock, mock_subprocess_run: MagicMock, value: str, enforces: bool
+    ) -> None:
+        mock_subprocess_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.dict(os.environ, {"ENFORCE_PRISMA_MIGRATION_CHECK": value}, clear=True):
+            assert prisma_migration.main() == 0
+
+        passed: tuple[str, ...] = mock_run_server.call_args.args[0]
+        assert ("--enforce_prisma_migration_check" in passed) is enforces
+
     @pytest.mark.parametrize("env", [{}, {"ENFORCE_PRISMA_MIGRATION_CHECK": "false"}])
     @patch("litellm.proxy.prisma_migration.subprocess.run")
     @patch("litellm.proxy.prisma_migration.run_server")
@@ -64,3 +92,38 @@ class TestPrismaMigration:
                 prisma_migration.main()
 
         mock_subprocess_run.assert_not_called()
+
+    @patch(
+        "litellm.proxy.prisma_migration.subprocess.run"
+    )  # test-quality-ok: the spawned argv is the behavior under test
+    @patch("litellm.proxy.prisma_migration.run_server")  # test-quality-ok: run_server boots the whole proxy
+    def test_prisma_generate_runs_through_the_module_when_the_cli_is_not_on_path(
+        self, mock_run_server: MagicMock, mock_subprocess_run: MagicMock, tmp_path: Path
+    ) -> None:
+        mock_subprocess_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        empty_bin: Path = tmp_path / "emptybin"
+        empty_bin.mkdir()
+
+        with patch.dict(os.environ, {"PATH": str(empty_bin)}, clear=True):
+            assert prisma_migration.main() == 0
+
+        assert mock_subprocess_run.call_args.args[0] == (sys.executable, "-m", "prisma", "generate")
+
+    @patch(
+        "litellm.proxy.prisma_migration.subprocess.run"
+    )  # test-quality-ok: the spawned argv is the behavior under test
+    @patch("litellm.proxy.prisma_migration.run_server")  # test-quality-ok: run_server boots the whole proxy
+    def test_prisma_generate_runs_the_console_script_when_it_is_on_path(
+        self, mock_run_server: MagicMock, mock_subprocess_run: MagicMock, tmp_path: Path
+    ) -> None:
+        mock_subprocess_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        bin_dir: Path = tmp_path / "bin"
+        bin_dir.mkdir()
+        script: Path = bin_dir / "prisma"
+        script.write_text("#!/bin/sh\nexit 0\n")
+        script.chmod(0o755)
+
+        with patch.dict(os.environ, {"PATH": str(bin_dir)}, clear=True):
+            assert prisma_migration.main() == 0
+
+        assert mock_subprocess_run.call_args.args[0] == ("prisma", "generate")
