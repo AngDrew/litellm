@@ -726,6 +726,7 @@ from litellm.proxy.middleware.request_size_limit_middleware import (
 from litellm.proxy.middleware.security_headers_middleware import (
     SecurityHeadersMiddleware,
 )
+from litellm.proxy.middleware.system_one_adapter_middleware import SystemOneAdapterMiddleware
 from litellm.proxy.ocr_endpoints.endpoints import router as ocr_router
 from litellm.proxy.openai_files_endpoints.files_endpoints import (
     router as openai_files_router,
@@ -2418,6 +2419,10 @@ app.add_middleware(
 app.add_middleware(BudgetReservationReleaseMiddleware, release=release_unbound_budget_reservation)
 app.add_middleware(InFlightRequestsMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
+# Last of this group, so it is the outermost: it turns `POST /v1/systemone` into a chat completion
+# before anything below reads the path or the body, which is what lets managed-account admission,
+# holds and the spend log treat a System One call like any other Jev chat call.
+app.add_middleware(SystemOneAdapterMiddleware)
 
 
 def mount_swagger_ui():
