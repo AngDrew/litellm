@@ -1,4 +1,5 @@
 import json
+import math
 from collections.abc import Mapping
 from typing import Final
 
@@ -12,6 +13,8 @@ SYSTEM_ONE_MODEL_PREFIX: Final = "jev-"
 # A System One body is a state string plus a handful of questions. Jev's context is 32k tokens,
 # so a megabyte is already far past anything the model could read.
 MAX_BODY_BYTES: Final = 1024 * 1024
+# The final charge for the call, margin included, which the proxy stamps on every priced reply.
+RESPONSE_COST_HEADER: Final = b"x-litellm-response-cost"
 
 
 class _BodyTooLarge(Exception):
@@ -37,6 +40,11 @@ class SystemOneAdapterMiddleware:
     account holds and settlement, tier budgets, cost margins and the spend log all run on the
     request exactly as they do for any chat call. A separate handler would have to re-implement
     each of those against a body they do not understand, and a gap in any one is unbilled spend.
+
+    The `usage.cost` Jev reports is the provider's raw charge. The client is billed more than that
+    (the configured margin), so the reply carries the amount actually charged for the call, read
+    from the proxy's own `x-litellm-response-cost` header, in its place. When that header is absent
+    or unusable the field is dropped rather than left showing a price the account was not charged.
 
     Errors (auth, budget, model access, upstream failures) are passed through untouched in the
     proxy's usual error shape.
@@ -159,7 +167,7 @@ def _unwrapping_send(send: Send) -> Send:
             return
         start: Final = held_start
         held_start = None
-        answers: Final = _answers_from_completion(b"".join(chunks))
+        answers: Final = _answers_from_completion(b"".join(chunks), _billed_cost(start["headers"]))
         if answers is None:
             await _send_error(send, 502, "Jev returned an unreadable System One answer")
             return
@@ -180,7 +188,19 @@ def _unwrapping_send(send: Send) -> Send:
     return unwrap_send
 
 
-def _answers_from_completion(body: bytes) -> bytes | None:
+def _billed_cost(headers: list[tuple[bytes, bytes]]) -> float | None:
+    for name, value in headers:
+        if name.lower() != RESPONSE_COST_HEADER:
+            continue
+        try:
+            cost: Final = float(value)
+        except ValueError:
+            return None
+        return cost if math.isfinite(cost) and cost >= 0 else None
+    return None
+
+
+def _answers_from_completion(body: bytes, billed_cost: float | None) -> bytes | None:
     """The System One body a chat completion carries as its message content, or None."""
     try:
         completion: object = json.loads(body)
@@ -191,7 +211,17 @@ def _answers_from_completion(body: bytes) -> bytes | None:
         return None
     if not isinstance(answers, Mapping) or not isinstance(answers.get("answers"), Mapping):
         return None
-    return json.dumps(answers, separators=(",", ":")).encode("utf-8")
+    return json.dumps(_with_billed_cost(answers, billed_cost), separators=(",", ":")).encode("utf-8")
+
+
+def _with_billed_cost(answers: Mapping[str, object], billed_cost: float | None) -> dict[str, object]:
+    usage: Final = answers.get("usage")
+    if not isinstance(usage, Mapping):
+        return dict(answers)
+    priced: Final = {key: value for key, value in usage.items() if key != "cost"}
+    if billed_cost is not None:
+        priced["cost"] = billed_cost
+    return {**answers, "usage": priced}
 
 
 async def _send_error(send: Send, status: int, message: str) -> None:

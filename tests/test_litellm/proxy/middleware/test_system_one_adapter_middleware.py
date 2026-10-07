@@ -48,6 +48,17 @@ def _completion(content: str) -> dict[str, Any]:
     }
 
 
+# Jev reports the provider's raw charge (ANSWERS["usage"]["cost"]); the proxy stamps what the account
+# was actually charged, margin included, on the reply. Clients must see the second figure.
+BILLED_COST: Final = 1.5e-05
+BILLED_HEADERS: Final = {"x-litellm-response-cost": repr(BILLED_COST)}
+EXPECTED: Final = {**ANSWERS, "usage": {**ANSWERS["usage"], "cost": BILLED_COST}}
+
+
+def _completion_response(answers: Mapping[str, Any], headers: Mapping[str, str] | None = None) -> JSONResponse:
+    return JSONResponse(_completion(json.dumps(answers)), headers=dict(BILLED_HEADERS if headers is None else headers))
+
+
 def _client(reply: Response | None = None) -> tuple[TestClient, list[dict[str, Any]]]:
     """An app that records what reached it, standing in for the chat endpoint and everything above it."""
     seen: Final[list[dict[str, Any]]] = []  # mutable-ok: test recorder
@@ -63,7 +74,7 @@ def _client(reply: Response | None = None) -> tuple[TestClient, list[dict[str, A
                 "authorization": request.headers.get("authorization"),
             }
         )
-        return reply if reply is not None else JSONResponse(_completion(json.dumps(ANSWERS)))
+        return reply if reply is not None else _completion_response(ANSWERS)
 
     async def other(request: Request) -> Response:
         seen.append({"path": request.url.path, "method": request.method, "body": (await request.body()).decode()})
@@ -118,7 +129,7 @@ def test_reply_is_the_unwrapped_answers_body() -> None:
     response: Final = client.post("/v1/systemone", json=REQUEST)
 
     assert response.headers["content-type"] == "application/json"
-    assert response.json() == ANSWERS
+    assert response.json() == EXPECTED
     assert int(response.headers["content-length"]) == len(response.content)
 
 
@@ -128,7 +139,7 @@ def test_both_paths_are_served(path: str) -> None:
 
     response: Final = client.post(path, json=REQUEST)
 
-    assert response.json() == ANSWERS
+    assert response.json() == EXPECTED
     assert seen[0]["path"] == "/v1/chat/completions"
 
 
@@ -196,6 +207,42 @@ def test_an_unreadable_answer_is_a_bad_gateway(content: str) -> None:
     assert response.json()["error"]["type"] == "api_error"
 
 
+def test_the_client_sees_the_billed_cost_not_the_providers() -> None:
+    client, _ = _client()
+
+    usage: Final = client.post("/v1/systemone", json=REQUEST).json()["usage"]
+
+    assert usage["cost"] == BILLED_COST
+    assert usage["cost"] != ANSWERS["usage"]["cost"]
+    assert (usage["input_tokens"], usage["output_tokens"]) == (308, 31)
+
+
+def test_a_free_call_is_reported_as_free() -> None:
+    # a response-cache hit is billed nothing, and the reply must say so
+    client, _ = _client(_completion_response(ANSWERS, {"x-litellm-response-cost": "0.0"}))
+
+    assert client.post("/v1/systemone", json=REQUEST).json()["usage"]["cost"] == 0.0
+
+
+@pytest.mark.parametrize("header", [None, "", "abc", "nan", "inf", "-1e-05"])
+def test_cost_is_dropped_rather_than_showing_the_raw_price_when_billing_is_unknown(header: str | None) -> None:
+    headers: Final = {} if header is None else {"x-litellm-response-cost": header}
+    client, _ = _client(_completion_response(ANSWERS, headers))
+
+    body: Final = client.post("/v1/systemone", json=REQUEST).json()
+
+    assert "cost" not in body["usage"]
+    assert body["usage"]["input_tokens"] == 308
+    assert body["answers"] == ANSWERS["answers"]
+
+
+def test_an_answer_without_usage_is_returned_as_it_is() -> None:
+    answers: Final = {k: v for k, v in ANSWERS.items() if k != "usage"}
+    client, _ = _client(_completion_response(answers))
+
+    assert client.post("/v1/systemone", json=REQUEST).json() == answers
+
+
 def test_a_reply_that_is_not_a_completion_is_a_bad_gateway() -> None:
     client, _ = _client(JSONResponse({"choices": []}))
 
@@ -255,7 +302,13 @@ async def test_a_chunked_body_is_reassembled() -> None:
         reached.append((scope["path"], scope["raw_path"], json.loads(first["body"])["model"], first["more_body"]))
         assert (await inner_receive())["type"] == "http.disconnect"
         content: Final = json.dumps(_completion(json.dumps(ANSWERS))).encode()
-        await inner_send({"type": "http.response.start", "status": 200, "headers": [(b"x-keep", b"1")]})
+        await inner_send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"x-keep", b"1"), (b"x-litellm-response-cost", b"1.5e-05")],
+            }
+        )
         await inner_send({"type": "http.response.body", "body": content[:10], "more_body": True})
         await inner_send({"type": "http.response.body", "body": content[10:], "more_body": False})
 
@@ -265,6 +318,6 @@ async def test_a_chunked_body_is_reassembled() -> None:
     assert reached == [("/v1/chat/completions", b"/v1/chat/completions", "jev-1.13", False)]
     assert sent[0]["status"] == 200
     assert (b"x-keep", b"1") in sent[0]["headers"]
-    assert json.loads(sent[1]["body"]) == ANSWERS
+    assert json.loads(sent[1]["body"]) == EXPECTED
     assert sent[1]["more_body"] is False
     assert len(sent) == 2
