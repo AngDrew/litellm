@@ -15,6 +15,9 @@ SYSTEM_ONE_MODEL_PREFIX: Final = "jev-"
 MAX_BODY_BYTES: Final = 1024 * 1024
 # The final charge for the call, margin included, which the proxy stamps on every priced reply.
 RESPONSE_COST_HEADER: Final = b"x-litellm-response-cost"
+# Present only on a reply served from the response cache. That reply still carries the cost of the
+# call that originally filled the cache, but nothing is charged for serving it.
+CACHE_HIT_HEADER: Final = b"x-litellm-cache-key"
 
 
 class _BodyTooLarge(Exception):
@@ -43,8 +46,10 @@ class SystemOneAdapterMiddleware:
 
     The `usage.cost` Jev reports is the provider's raw charge. The client is billed more than that
     (the configured margin), so the reply carries the amount actually charged for the call, read
-    from the proxy's own `x-litellm-response-cost` header, in its place. When that header is absent
-    or unusable the field is dropped rather than left showing a price the account was not charged.
+    from the proxy's own `x-litellm-response-cost` header, in its place. A reply served from the
+    response cache is charged nothing, so it reports 0 even though the header still carries the
+    original call's price. When the cost is unknown the field is dropped rather than left showing a
+    price the account was not charged.
 
     Errors (auth, budget, model access, upstream failures) are passed through untouched in the
     proxy's usual error shape.
@@ -189,15 +194,21 @@ def _unwrapping_send(send: Send) -> Send:
 
 
 def _billed_cost(headers: list[tuple[bytes, bytes]]) -> float | None:
+    """What the account was charged for this reply, or None when the proxy did not say."""
+    reported: bytes | None = None
     for name, value in headers:
-        if name.lower() != RESPONSE_COST_HEADER:
-            continue
-        try:
-            cost: Final = float(value)
-        except ValueError:
-            return None
-        return cost if math.isfinite(cost) and cost >= 0 else None
-    return None
+        lowered: Final = name.lower()
+        if lowered == CACHE_HIT_HEADER and value.strip():
+            return 0.0
+        if lowered == RESPONSE_COST_HEADER:
+            reported = value
+    if reported is None:
+        return None
+    try:
+        cost: Final = float(reported)
+    except ValueError:
+        return None
+    return cost if math.isfinite(cost) and cost >= 0 else None
 
 
 def _answers_from_completion(body: bytes, billed_cost: float | None) -> bytes | None:

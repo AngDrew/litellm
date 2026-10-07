@@ -217,11 +217,33 @@ def test_the_client_sees_the_billed_cost_not_the_providers() -> None:
     assert (usage["input_tokens"], usage["output_tokens"]) == (308, 31)
 
 
-def test_a_free_call_is_reported_as_free() -> None:
-    # a response-cache hit is billed nothing, and the reply must say so
+def test_a_zero_cost_reply_is_reported_as_free() -> None:
     client, _ = _client(_completion_response(ANSWERS, {"x-litellm-response-cost": "0.0"}))
 
     assert client.post("/v1/systemone", json=REQUEST).json()["usage"]["cost"] == 0.0
+
+
+def test_a_response_cache_hit_is_reported_as_free_even_though_the_header_keeps_the_original_price() -> None:
+    # the cached reply still carries the price of the call that filled the cache; serving it is not charged
+    headers: Final = {**BILLED_HEADERS, "x-litellm-cache-key": "bd2fa04f9372"}
+    client, _ = _client(_completion_response(ANSWERS, headers))
+
+    usage: Final = client.post("/v1/systemone", json=REQUEST).json()["usage"]
+
+    assert usage["cost"] == 0.0
+    assert (usage["input_tokens"], usage["output_tokens"]) == (308, 31)
+
+
+def test_a_cache_hit_is_free_even_when_the_cost_header_is_missing() -> None:
+    client, _ = _client(_completion_response(ANSWERS, {"x-litellm-cache-key": "bd2fa04f9372"}))
+
+    assert client.post("/v1/systemone", json=REQUEST).json()["usage"]["cost"] == 0.0
+
+
+def test_an_empty_cache_key_header_is_not_a_cache_hit() -> None:
+    client, _ = _client(_completion_response(ANSWERS, {**BILLED_HEADERS, "x-litellm-cache-key": ""}))
+
+    assert client.post("/v1/systemone", json=REQUEST).json()["usage"]["cost"] == BILLED_COST
 
 
 @pytest.mark.parametrize("header", [None, "", "abc", "nan", "inf", "-1e-05"])
