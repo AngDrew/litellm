@@ -116,11 +116,15 @@ def _reported_cost(answer: Mapping[str, Any], provider: str = PROVIDER) -> float
     OpenRouter's exact charge plus the configured cost margin, like every other model's spend.
 
     None lets LiteLLM price the call from the deployment instead (which carries the margin too);
-    that is also what a missing, negative or non-finite cost gets.
+    that is also what a missing, negative or non-finite cost gets. A reported 0 for a call that used
+    input tokens gets it too: OpenRouter has returned 0 for a priced model, and trusting it would
+    record the call as free.
     """
     usage = answer.get("usage")
     cost = usage.get("cost") if isinstance(usage, Mapping) else None
     if isinstance(cost, bool) or not isinstance(cost, (int, float)) or not math.isfinite(cost) or cost < 0:
+        return None
+    if cost == 0 and isinstance(usage, Mapping) and int(usage.get("input_tokens") or 0) > 0:
         return None
     if not litellm.cost_margin_config:
         return float(cost)

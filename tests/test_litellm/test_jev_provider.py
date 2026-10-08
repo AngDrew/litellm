@@ -184,3 +184,10 @@ async def test_generic_handler_uses_the_full_id_and_margin_provider(monkeypatch:
     )
     assert seen["model"] == "perplexity/pplx-decider-v1.1-27b"
     assert response.choices
+
+
+def test_a_reported_zero_cost_for_used_tokens_falls_back_to_the_deployment_price() -> None:
+    from callbacks.jev_provider import _reported_cost
+
+    assert _reported_cost({"usage": {"input_tokens": 162, "output_tokens": 0, "cost": 0}}, "or_decisions") is None
+    assert _reported_cost({"usage": {"input_tokens": 0, "output_tokens": 0, "cost": 0}}, "or_decisions") == 0
