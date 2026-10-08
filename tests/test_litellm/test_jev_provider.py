@@ -160,3 +160,27 @@ async def test_streaming_refusal_is_an_eager_400(
             )
             await router.acompletion(model="jev", messages=messages, stream=True)
     assert rejected.value.status_code == 400
+
+
+def test_generic_provider_posts_the_model_id_as_written() -> None:
+    messages: Final = [{"role": "user", "content": json.dumps(DECISIONS_BODY)}]
+    assert decisions_request(messages, "cloudflare/clef", "or_decisions")["model"] == "cloudflare/clef"
+    assert decisions_request(messages, "jev-1.13")["model"] == MODEL
+
+
+async def test_generic_handler_uses_the_full_id_and_margin_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen["model"] = json.loads(request.content)["model"]
+        return httpx.Response(200, json=ANSWER)
+
+    monkeypatch.setattr(litellm, "cost_margin_config", {"global": 0.30})
+    handler: Final = TypeSafeDecisions(transport=httpx.MockTransport(respond), provider="or_decisions")
+    response = await handler.acompletion(
+        "perplexity/pplx-decider-v1.1-27b",
+        [{"role": "user", "content": json.dumps(DECISIONS_BODY)}],
+        "https://openrouter.ai/api/v1", {}, ModelResponse(), None, None, "test-key", None, {},
+    )
+    assert seen["model"] == "perplexity/pplx-decider-v1.1-27b"
+    assert response.choices

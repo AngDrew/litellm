@@ -43,6 +43,9 @@ from litellm.llms.custom_llm import CustomLLM, CustomLLMError
 from litellm.types.utils import ModelResponse, Usage
 
 PROVIDER: Final = "typesafe"
+# Any other OpenRouter decisions model (cloudflare/clef, perplexity/..., openai/...): the deployment's
+# `model` is the full OpenRouter id and is posted exactly as written.
+GENERIC_PROVIDER: Final = "or_decisions"
 DEFAULT_BASE_URL: Final = "https://openrouter.ai/api/v1"
 DECISIONS_PATH: Final = "/alpha/decisions"
 DEFAULT_TIMEOUT_SECONDS: Final = 10.0
@@ -75,7 +78,7 @@ def openrouter_model(model: str) -> str:
     return model if model.startswith(f"{PROVIDER}/") else f"{PROVIDER}/{model}"
 
 
-def decisions_request(messages: list, model: str) -> dict[str, Any]:
+def decisions_request(messages: list, model: str, provider: str = PROVIDER) -> dict[str, Any]:
     """The decisions body to POST: the caller's JSON plus the model this deployment names."""
     if len(messages) != 1 or not isinstance(messages[0], Mapping):
         raise CustomLLMError(status_code=400, message=_TRANSPORT_CONTRACT)
@@ -88,7 +91,7 @@ def decisions_request(messages: list, model: str) -> dict[str, Any]:
         raise CustomLLMError(status_code=400, message=_TRANSPORT_CONTRACT) from None
     if not isinstance(body, dict) or "state" not in body or "questions" not in body:
         raise CustomLLMError(status_code=400, message=_TRANSPORT_CONTRACT)
-    return {**body, "model": openrouter_model(model)}
+    return {**body, "model": openrouter_model(model) if provider == PROVIDER else model}
 
 
 def _request_headers(api_key: Any, headers: Mapping[str, Any]) -> dict[str, str]:
@@ -108,7 +111,7 @@ def _usage(answer: Mapping[str, Any]) -> Usage:
     )
 
 
-def _reported_cost(answer: Mapping[str, Any]) -> float | None:
+def _reported_cost(answer: Mapping[str, Any], provider: str = PROVIDER) -> float | None:
     """
     OpenRouter's exact charge plus the configured cost margin, like every other model's spend.
 
@@ -121,7 +124,7 @@ def _reported_cost(answer: Mapping[str, Any]) -> float | None:
         return None
     if not litellm.cost_margin_config:
         return float(cost)
-    return _apply_cost_margin(base_cost=float(cost), custom_llm_provider=PROVIDER)[0]
+    return _apply_cost_margin(base_cost=float(cost), custom_llm_provider=provider)[0]
 
 
 def build_model_response(
@@ -157,7 +160,9 @@ def record_response_cost(logging_obj: Any, cost: float | None) -> None:
         model_call_details["response_cost"] = cost
 
 
-def _answer_from_response(response: httpx.Response, model: str, logging_obj: Any, model_response: Any) -> ModelResponse:
+def _answer_from_response(
+    response: httpx.Response, model: str, logging_obj: Any, model_response: Any, provider: str = PROVIDER
+) -> ModelResponse:
     if response.status_code >= 400:
         raise CustomLLMError(status_code=response.status_code, message=response.text[:500])
     try:
@@ -166,7 +171,7 @@ def _answer_from_response(response: httpx.Response, model: str, logging_obj: Any
         raise CustomLLMError(status_code=502, message="Decisions endpoint returned a non-JSON body") from None
     if not isinstance(answer, Mapping):
         raise CustomLLMError(status_code=502, message="Decisions endpoint returned an unexpected body")
-    cost: Final = _reported_cost(answer)
+    cost: Final = _reported_cost(answer, provider)
     record_response_cost(logging_obj, cost)
     return build_model_response(answer, model, cost, model_response)
 
@@ -176,8 +181,11 @@ class TypeSafeDecisions(CustomLLM):
 
     provider = PROVIDER
 
-    def __init__(self, transport: httpx.AsyncBaseTransport | httpx.BaseTransport | None = None) -> None:
+    def __init__(
+        self, transport: httpx.AsyncBaseTransport | httpx.BaseTransport | None = None, provider: str = PROVIDER
+    ) -> None:
         self._transport = transport
+        self.provider = provider
 
     def _timeout(self, timeout: Any) -> Any:
         return timeout if timeout is not None else DEFAULT_TIMEOUT_SECONDS
@@ -201,7 +209,7 @@ class TypeSafeDecisions(CustomLLM):
         timeout: Any = None,
         client: Any = None,
     ) -> ModelResponse:
-        body: Final = decisions_request(messages, model)
+        body: Final = decisions_request(messages, model, self.provider)
         async with httpx.AsyncClient(
             timeout=self._timeout(timeout),
             transport=self._transport,  # type: ignore[arg-type]  # mock transports implement both halves
@@ -209,7 +217,7 @@ class TypeSafeDecisions(CustomLLM):
             response: Final = await http_client.post(
                 decisions_url(api_base), json=body, headers=_request_headers(api_key, headers)
             )
-        return _answer_from_response(response, model, logging_obj, model_response)
+        return _answer_from_response(response, model, logging_obj, model_response, self.provider)
 
     def completion(
         self,
@@ -249,7 +257,7 @@ class TypeSafeDecisions(CustomLLM):
                 timeout,
                 client,
             )
-        body: Final = decisions_request(messages, model)
+        body: Final = decisions_request(messages, model, self.provider)
         with httpx.Client(
             timeout=self._timeout(timeout),
             transport=self._transport,  # type: ignore[arg-type]  # same halves as above
@@ -257,7 +265,7 @@ class TypeSafeDecisions(CustomLLM):
             response: Final = http_client.post(
                 decisions_url(api_base), json=body, headers=_request_headers(api_key, headers)
             )
-        return _answer_from_response(response, model, logging_obj, model_response)
+        return _answer_from_response(response, model, logging_obj, model_response, self.provider)
 
     def streaming(self, *args: Any, **kwargs: Any) -> Any:
         raise CustomLLMError(status_code=400, message="decisions answers are typed, not streamed")
@@ -267,3 +275,4 @@ class TypeSafeDecisions(CustomLLM):
 
 
 handler: Final = TypeSafeDecisions()
+generic_handler: Final = TypeSafeDecisions(provider=GENERIC_PROVIDER)
